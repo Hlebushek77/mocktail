@@ -174,6 +174,19 @@ target_include_directories(vulkan_etc2_caps_test PRIVATE
 target_link_libraries(vulkan_etc2_caps_test PRIVATE GTest::gtest_main)
 mocktail_apply_compile_options(vulkan_etc2_caps_test)
 
+add_executable(vulkan_call_stats_test
+  vulkan_call_stats_test.cc
+  ${PROJECT_SOURCE_DIR}/src/graphics/vulkan_call_stats.cc
+)
+target_include_directories(vulkan_call_stats_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/include
+)
+target_link_libraries(vulkan_call_stats_test PRIVATE
+  Vulkan::Headers
+  GTest::gtest_main
+)
+mocktail_apply_compile_options(vulkan_call_stats_test)
+
 add_executable(host_gpu_selection_test host_gpu_selection_test.cc)
 target_link_libraries(host_gpu_selection_test PRIVATE
   Mocktail::Runtime
@@ -1251,6 +1264,7 @@ gtest_discover_tests(compatibility_catalog_test)
 gtest_discover_tests(support_bundle_runtime_test)
 gtest_discover_tests(vulkan_icd_selection_test)
 gtest_discover_tests(vulkan_etc2_caps_test)
+gtest_discover_tests(vulkan_call_stats_test)
 gtest_discover_tests(host_gpu_selection_test)
 gtest_discover_tests(session_log_test)
 gtest_discover_tests(failure_dialog_test)
