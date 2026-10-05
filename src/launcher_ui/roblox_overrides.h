@@ -226,6 +226,33 @@ ShaderLoadingState ResolveShaderLoading(const MachineProfile& machine,
                                         std::string_view gpu_preference,
                                         std::string_view value);
 
+// ---- ETC2 texture conversion (engine.etc2_to_bc)
+
+// Where engine.etc2_to_bc can act (vulkan_etc2_emulation.cc: Mocktail's
+// Vulkan adapter emulates ETC2/EAC only on a device without
+// textureCompressionETC2, and only direct Vulkan goes through it).
+enum class Etc2ConversionState {
+  // Another backend than direct Vulkan: OpenGL ES drivers and ANGLE handle
+  // ETC2 themselves, so the setting is never read.
+  kNotVulkan,
+  // Direct Vulkan renders on an NVIDIA card, whose driver has no ETC2: the
+  // setting decides how its textures are kept.
+  kNvidia,
+  // Direct Vulkan renders on another vendor's card: the setting acts only
+  // if its driver lacks ETC2, which only the game's Vulkan device tells.
+  kOtherCard,
+  // Direct Vulkan, but the card is not known (detection has not finished,
+  // the user's VK_DRIVER_FILES, or cards of both kinds without a pinned
+  // driver).
+  kUnknown,
+};
+
+// `backend` and `gpu_preference` are the config.yaml values of
+// graphics.backend and engine.gpu.
+Etc2ConversionState ResolveEtc2Conversion(const MachineProfile& machine,
+                                          std::string_view backend,
+                                          std::string_view gpu_preference);
+
 }  // namespace mocktail::launcher_ui
 
 #endif  // MOCKTAIL_LAUNCHER_UI_ROBLOX_OVERRIDES_H_

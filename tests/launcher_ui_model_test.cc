@@ -1755,5 +1755,58 @@ TEST_F(MachineProfileTest, ExplainsNvidiaShaderLoading) {
       ShaderLoadingState::kOtherCard);
 }
 
+TEST_F(MachineProfileTest, ExplainsEtc2Conversion) {
+  // Only direct Vulkan goes through Mocktail's ETC2 emulation, detected or
+  // not; until detection finishes the card is unknown.
+  for (const char* backend :
+       {"opengl", "gles", "system", "auto", "angle-vulkan",
+        "angle-swiftshader"}) {
+    EXPECT_EQ(ResolveEtc2Conversion(MachineProfile{}, backend, "auto"),
+              Etc2ConversionState::kNotVulkan)
+        << backend;
+  }
+  EXPECT_EQ(ResolveEtc2Conversion(MachineProfile{}, "", ""),
+            Etc2ConversionState::kUnknown);
+
+  // AMD only: converts only if its driver lacks ETC2.
+  AddPciGpu(0, "pci0000:00/0000:00:01.1/0000:0a:00.0", "0x1002", "0x73df");
+  root_.Write("usr/share/vulkan/icd.d/radeon_icd.x86_64.json", "{}");
+  MachineProfile profile = DetectMachineProfile(MapEnvironment(), Probe());
+  EXPECT_EQ(ResolveEtc2Conversion(profile, "", ""),
+            Etc2ConversionState::kOtherCard);
+  EXPECT_EQ(ResolveEtc2Conversion(profile, "opengl", ""),
+            Etc2ConversionState::kNotVulkan);
+
+  // An Intel + NVIDIA laptop: the card engine.gpu picks decides.
+  std::filesystem::remove_all(root_.path() / "sys");
+  AddPciGpu(0, "pci0000:00/0000:00:02.0", "0x8086", "0x9a49");
+  AddPciGpu(1, "pci0000:00/0000:00:01.0/0000:01:00.0", "0x10de", "0x2520");
+  root_.Write("usr/share/vulkan/icd.d/intel_icd.x86_64.json", "{}");
+  root_.Write("usr/share/vulkan/icd.d/nvidia_icd.json", "{}");
+  profile = DetectMachineProfile(MapEnvironment(), Probe());
+  EXPECT_EQ(ResolveEtc2Conversion(profile, "", ""),
+            Etc2ConversionState::kNvidia);
+  EXPECT_EQ(ResolveEtc2Conversion(profile, "vulkan", "discrete"),
+            Etc2ConversionState::kNvidia);
+  EXPECT_EQ(ResolveEtc2Conversion(profile, "direct-vulkan", "integrated"),
+            Etc2ConversionState::kOtherCard);
+  EXPECT_EQ(ResolveEtc2Conversion(profile, "angle-vulkan", "discrete"),
+            Etc2ConversionState::kNotVulkan);
+  // The user's own driver list: Mocktail does not pick, and both kinds are
+  // here.
+  profile = DetectMachineProfile(
+      MapEnvironment({{"VK_DRIVER_FILES", "/opt/vk/my_icd.json"}}), Probe());
+  EXPECT_EQ(ResolveEtc2Conversion(profile, "", ""),
+            Etc2ConversionState::kUnknown);
+
+  // NVIDIA alone keeps its answer behind the user's driver list.
+  std::filesystem::remove_all(root_.path() / "sys");
+  AddPciGpu(1, "pci0000:00/0000:00:01.0/0000:01:00.0", "0x10de", "0x2520");
+  profile = DetectMachineProfile(
+      MapEnvironment({{"VK_DRIVER_FILES", "/opt/vk/my_icd.json"}}), Probe());
+  EXPECT_EQ(ResolveEtc2Conversion(profile, "", ""),
+            Etc2ConversionState::kNvidia);
+}
+
 }  // namespace
 }  // namespace mocktail::launcher_ui

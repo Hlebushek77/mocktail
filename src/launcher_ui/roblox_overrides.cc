@@ -299,4 +299,35 @@ ShaderLoadingState ResolveShaderLoading(const MachineProfile& machine,
                           : ShaderLoadingState::kMultithreaded;
 }
 
+Etc2ConversionState ResolveEtc2Conversion(const MachineProfile& machine,
+                                          std::string_view backend,
+                                          std::string_view gpu_preference) {
+  // bionic_vulkan_loader_adapter.cc creates the emulation; only direct
+  // Vulkan (any spelling, RuntimeConfig::ParseGraphicsBackend) loads it.
+  if (backend.empty()) backend = "direct-vulkan";
+  if (backend != "direct-vulkan" && backend != "vulkan" &&
+      backend != "native-vulkan") {
+    return Etc2ConversionState::kNotVulkan;
+  }
+  if (!machine.detected) return Etc2ConversionState::kUnknown;
+  if (gpu_preference.empty()) gpu_preference = "auto";
+  const VulkanDriverSelection driver = machine.VulkanDriver(gpu_preference);
+  if (driver.gpu.has_value()) {
+    return driver.gpu->vendor == kNvidiaPciVendor
+               ? Etc2ConversionState::kNvidia
+               : Etc2ConversionState::kOtherCard;
+  }
+  // Mocktail does not pick the card here (the user's VK_DRIVER_FILES, no
+  // driver it recognizes), but with cards of one kind the game still
+  // renders on that kind.
+  const bool other_vendor = machine.gpu.amd || machine.gpu.intel;
+  if (machine.gpu.nvidia && !other_vendor) {
+    return Etc2ConversionState::kNvidia;
+  }
+  if (!machine.gpu.nvidia && other_vendor) {
+    return Etc2ConversionState::kOtherCard;
+  }
+  return Etc2ConversionState::kUnknown;
+}
+
 }  // namespace mocktail::launcher_ui
