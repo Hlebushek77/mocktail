@@ -637,6 +637,20 @@ target_include_directories(etc2_decode_totals_test PRIVATE
 target_link_libraries(etc2_decode_totals_test PRIVATE GTest::gtest_main)
 mocktail_apply_compile_options(etc2_decode_totals_test)
 
+add_executable(chunk_arena_test
+  chunk_arena_test.cc
+  ${PROJECT_SOURCE_DIR}/src/graphics/chunk_arena.cc
+)
+target_include_directories(chunk_arena_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/include
+)
+target_link_libraries(chunk_arena_test PRIVATE
+  Vulkan::Headers
+  GTest::gtest_main
+  Threads::Threads
+)
+mocktail_apply_compile_options(chunk_arena_test)
+
 add_executable(video_driver_policy_test
   video_driver_policy_test.cc
 )
@@ -1176,6 +1190,7 @@ gtest_discover_tests(vulkan_surface_recovery_gate_test)
 gtest_discover_tests(vulkan_present_progress_gate_test)
 gtest_discover_tests(vulkan_text_overlay_compositor_test)
 gtest_discover_tests(etc2_decode_totals_test)
+gtest_discover_tests(chunk_arena_test)
 gtest_discover_tests(video_driver_policy_test)
 gtest_discover_tests(wayland_global_probe_test)
 gtest_discover_tests(wayland_surface_commit_guard_test)
