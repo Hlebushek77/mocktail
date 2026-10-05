@@ -4,6 +4,8 @@
 
 #include <cstdlib>
 #include <initializer_list>
+#include <iterator>
+#include <map>
 #include <optional>
 #include <tuple>
 #include <utility>
@@ -362,6 +364,144 @@ TEST(PerformancePolicyTest, DescribesActiveKnobsForTheStartupLog) {
             "texture budgets left to Roblox "
             "(MOCKTAIL_TEXTURE_BUDGET_MB=roblox), texture-compression flags "
             "left out (MOCKTAIL_PRESET_TEXTURE_COMPRESSION=off)");
+}
+
+// What Roblox does with each key of the default preset, from a scan of the
+// flag registrations in libroblox.so of Roblox 3092 (plus.2 research,
+// roblox-churn section 3). Roblox looks a client-settings key up only under
+// the prefix it registered the variable with, so FInt/FFlag spellings of a
+// DFInt/DFFlag variable are ignored, and so is a name the build does not
+// contain. The preset still sends every key: these lists only document the
+// finding so a later release can drop, respell or keep each key on purpose.
+// A key added to or removed from the preset must be classified here.
+
+// Registered with the prefix the preset uses: Roblox reads these.
+constexpr const char* kPresetKeysRobloxReads[] = {
+    "FIntTaskSchedulerThreadMin",
+    "FIntTaskSchedulerAsyncTasksMinimumThreadCount",
+    "FIntTaskSchedulerAutoThreadLimit",
+    "DFIntSimMidPhaseContactPipelineBatchSize",
+    "FIntSmoothClusterTaskQueueMaxParallelTasks",
+    "FIntOcclusionWorkerThreadCount",
+    "FFlagMovePrerenderV2",
+    "FIntTerrainArraySliceSize",
+    "FFlagGpuVoxelCompression",
+    "FFlagMeshLodApplyGeomMeshOptimizer",
+    "FIntDefaultMeshCacheSizeMB",
+    "FIntRenderMeshOrphanBudgetMB",
+    "FIntSmoothTerrainPhysicsCacheSize",
+    "FIntRenderTextureTotalBudgetMB",
+    "FIntRenderTextureOrphanBudgetMB",
+    "FFlagDebugTerrainVTCompressedTextures",
+    "FFlagStreamingObserverMemoryOptimization",
+    "FFlagEnableMultiVETextureManagerSharing",
+    "FFlagDeduplicateLodRemovalRegions",
+    "FFlagCurlUsePools",
+    "FIntTextureCompositorLowResFactor",
+    "FFlagContentProviderMmapAssets",
+    "FFlagEnableSlimAvatarsDefaultEnabled",
+    "FIntRenderShadowMapDepthCacheMemLimit",
+    "FIntDebugForceMSAASamples",
+    "FFlagLuauStartupGcSuppression",
+    "FIntLuauGcGoalCore",
+    "FIntLuauGcStartupWorkingSetMb",
+    "FIntTaskSchedulerMaxTempArenaSizeBytes",
+    "FIntAudioMetadataCacheSizeKB",
+    "FIntDefaultAudioDecodeBufferSizeMs",
+};
+
+// No-ops: registered as DFInt/DFFlag, sent without the D. Among them the
+// FRM quality level that engine.graphics_quality sets, and the mip bias.
+constexpr const char* kPresetKeysRegisteredWithDf[] = {
+    "FIntRenderTextureMipBias",
+    "FFlagUITextureCompressionDesktop",
+    "FFlagTCTextureCompressionDesktop",
+    "FFlagUITextureUncompressed",
+    "FFlagMeshCompression",
+    "FIntTerrainGpuMeshMemoryTargetMib",
+    "FIntNetworkStreamingGCMaxMicroSecondLimit",
+    "FFlagCSGPublishDedupSolidMesh",
+    "FIntTextureCompositorActiveJobs",
+    "FIntAssetProviderAssetCacheReadThreadCount",
+    "FIntAssetProviderAssetCacheWriteThreadCount",
+    "FIntInitialAudioAssetCacheSize",
+    "FIntLuauGcStepMul",
+    "FIntLuaGcMaxKb",
+    "FFlagLocalStorageArenaOptimization",
+    "FIntProjectedMaxBytesUsedForSoundsMB",
+    "FIntMaxAudibleSoundChannels",
+    "FIntDebugFRMQualityLevelOverride",
+};
+
+// No-ops: the name exists, but not as an integer variable.
+// RenderTextureCompositorBudget is an FLog channel and AvatarTextureMemoryMax
+// a telemetry key.
+constexpr const char* kPresetKeysThatAreNotVariables[] = {
+    "FIntRenderTextureCompositorBudget",
+    "FIntAvatarTextureMemoryMax",
+};
+
+// No-ops: the name does not occur anywhere in libroblox.so of Roblox 3092.
+constexpr const char* kPresetKeysUnknownToRoblox[] = {
+    "FFlagGcInParallelWithRenderPrepare3",
+    "FFlagSimRuntimeContentTranscodeBlockingCall",
+    "FFlagRenderEnableLowEndLOD",
+    "FFlagFastGPULightGrid",
+    "FFlagRenderOptimizeLightGrid",
+    "FFlagRenderFixParticlesCulling",
+    "FFlagLuauIncrementalGC",
+    "FIntLuauGcStepMultiplier",
+    "FIntLuauGcGoalRatio",
+    "FIntAssetProviderThreads",
+    "FFlagMeshLOD",
+    "FFlagAdaptiveMeshCacheSizeForAndroid",
+    "FIntTextureCompositorMeshCache",
+};
+
+// Registered, but the scan could not tell with which prefix.
+constexpr const char* kPresetKeysWithUnknownScope[] = {
+    "FFlagPhysicsMeshCompression",
+    "FFlagSupportMeshLOD",
+    "FIntAvatarMeshMemoryMax",
+    "FFlagfeatureFastClusterCacheEnabled",
+    "FFlagVulkanCompressedTextureAliasing",
+    "FFlagEnableSLIMAvatars",
+    "FFlagLayeredClothingCacheOptimizations",
+    "FFlagRenderAllocateShadowMapResourcesOnDemand",
+    "FIntTM2ShadowMapMaxMips",
+};
+
+TEST(PerformancePolicyTest, ClassifiesEveryPresetKeyByWhetherRobloxReadsIt) {
+  const PresetEnvironment environment;
+  const nlohmann::json preset = MergeDefault(DefaultThroughputPolicy());
+  std::map<std::string, int> classified;
+  const auto classify = [&](const auto& keys) {
+    for (const char* key : keys) {
+      EXPECT_TRUE(preset.contains(key)) << key << " is no longer sent";
+      ++classified[key];
+    }
+  };
+  classify(kPresetKeysRobloxReads);
+  classify(kPresetKeysRegisteredWithDf);
+  classify(kPresetKeysThatAreNotVariables);
+  classify(kPresetKeysUnknownToRoblox);
+  classify(kPresetKeysWithUnknownScope);
+  for (const auto& [key, value] : preset.items()) {
+    (void)value;
+    EXPECT_EQ(classified[key], 1) << key;
+  }
+  EXPECT_EQ(classified.size(), preset.size());
+  // 33 of the 73 keys do nothing today.
+  EXPECT_EQ(std::size(kPresetKeysRegisteredWithDf) +
+                std::size(kPresetKeysThatAreNotVariables) +
+                std::size(kPresetKeysUnknownToRoblox),
+            33U);
+
+  // The DF spelling Roblox would read is not sent, so these stay no-ops
+  // until a release changes them on purpose.
+  for (const char* key : kPresetKeysRegisteredWithDf) {
+    EXPECT_FALSE(preset.contains(std::string("D") + key)) << key;
+  }
 }
 
 TEST(PerformancePolicyTest, ParsesDisabledByDefaultAndExplicitTrueValues) {
