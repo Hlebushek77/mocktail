@@ -2,6 +2,9 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdlib>
+#include <optional>
+
 #define JSON_NOEXCEPTION 1
 #include <nlohmann/json.hpp>
 #include <string>
@@ -9,6 +12,147 @@
 namespace mocktail {
 namespace runtime {
 namespace {
+
+// Sets (or, with nullptr, unsets) one variable for the scope of a test and
+// restores the previous value afterwards.
+class ScopedEnvironmentVariable final {
+ public:
+  ScopedEnvironmentVariable(const char* name, const char* value)
+      : name_(name) {
+    if (const char* previous = std::getenv(name); previous != nullptr) {
+      previous_ = previous;
+    }
+    if (value != nullptr) {
+      setenv(name, value, 1);
+    } else {
+      unsetenv(name);
+    }
+  }
+  ~ScopedEnvironmentVariable() {
+    if (previous_.has_value()) {
+      setenv(name_, previous_->c_str(), 1);
+    } else {
+      unsetenv(name_);
+    }
+  }
+  ScopedEnvironmentVariable(const ScopedEnvironmentVariable&) = delete;
+  ScopedEnvironmentVariable& operator=(const ScopedEnvironmentVariable&) =
+      delete;
+
+ private:
+  const char* name_;
+  std::optional<std::string> previous_;
+};
+
+// The default startup configuration: throughput physics workers (the
+// runtime-config default), multithreaded rendering off, quality unset.
+PerformancePolicy DefaultThroughputPolicy() {
+  PerformancePolicy policy;
+  policy.physical_core_count = 8;
+  policy.physics_worker_mode = PhysicsWorkerMode::kThroughput;
+  return policy;
+}
+
+// Every key and value the default configuration sends, frozen from
+// v1.0.4-plus.1, so a change to the preset is always a deliberate one.
+nlohmann::json Plus1DefaultPreset() {
+  return {
+      {"FIntTaskSchedulerThreadMin", "0"},
+      {"FIntTaskSchedulerAsyncTasksMinimumThreadCount", "3"},
+      {"FIntTaskSchedulerAutoThreadLimit", "8"},
+      {"DFIntSimMidPhaseContactPipelineBatchSize", "128"},
+      {"FIntSmoothClusterTaskQueueMaxParallelTasks", "8"},
+      {"FIntOcclusionWorkerThreadCount", "4"},
+      {"FFlagMovePrerenderV2", "True"},
+      {"FFlagGcInParallelWithRenderPrepare3", "True"},
+      {"FIntRenderTextureMipBias", "1"},
+      {"FFlagSimRuntimeContentTranscodeBlockingCall", "False"},
+      {"FFlagRenderEnableLowEndLOD", "True"},
+      {"FIntTerrainArraySliceSize", "4"},
+      {"FFlagFastGPULightGrid", "True"},
+      {"FFlagRenderOptimizeLightGrid", "True"},
+      {"FFlagRenderFixParticlesCulling", "True"},
+      {"FFlagLuauIncrementalGC", "True"},
+      {"FIntLuauGcStepMultiplier", "100"},
+      {"FIntLuauGcGoalRatio", "200"},
+      {"FIntAssetProviderThreads", "2"},
+      {"FFlagUITextureCompressionDesktop", "True"},
+      {"FFlagTCTextureCompressionDesktop", "True"},
+      {"FFlagUITextureUncompressed", "False"},
+      {"FFlagGpuVoxelCompression", "True"},
+      {"FFlagMeshCompression", "True"},
+      {"FFlagPhysicsMeshCompression", "True"},
+      {"FFlagSupportMeshLOD", "True"},
+      {"FFlagMeshLOD", "True"},
+      {"FFlagMeshLodApplyGeomMeshOptimizer", "False"},
+      {"FFlagAdaptiveMeshCacheSizeForAndroid", "True"},
+      {"FIntDefaultMeshCacheSizeMB", "64"},
+      {"FIntRenderMeshOrphanBudgetMB", "8"},
+      {"FIntTerrainGpuMeshMemoryTargetMib", "32"},
+      {"FIntAvatarMeshMemoryMax", "33554432"},
+      {"FIntSmoothTerrainPhysicsCacheSize", "32"},
+      {"FIntRenderTextureTotalBudgetMB", "128"},
+      {"FIntRenderTextureOrphanBudgetMB", "8"},
+      {"FFlagDebugTerrainVTCompressedTextures", "True"},
+      {"FFlagStreamingObserverMemoryOptimization", "True"},
+      {"FIntNetworkStreamingGCMaxMicroSecondLimit", "5000"},
+      {"FFlagfeatureFastClusterCacheEnabled", "True"},
+      {"FFlagEnableMultiVETextureManagerSharing", "True"},
+      {"FFlagVulkanCompressedTextureAliasing", "True"},
+      {"FFlagCSGPublishDedupSolidMesh", "True"},
+      {"FFlagDeduplicateLodRemovalRegions", "True"},
+      {"FFlagCurlUsePools", "True"},
+      {"FIntRenderTextureCompositorBudget", "32"},
+      {"FIntTextureCompositorActiveJobs", "1"},
+      {"FIntTextureCompositorLowResFactor", "2"},
+      {"FIntTextureCompositorMeshCache", "16"},
+      {"FFlagContentProviderMmapAssets", "True"},
+      {"FIntAssetProviderAssetCacheReadThreadCount", "1"},
+      {"FIntAssetProviderAssetCacheWriteThreadCount", "1"},
+      {"FIntInitialAudioAssetCacheSize", "32"},
+      {"FIntAvatarTextureMemoryMax", "33554432"},
+      {"FFlagEnableSLIMAvatars", "True"},
+      {"FFlagEnableSlimAvatarsDefaultEnabled", "True"},
+      {"FFlagLayeredClothingCacheOptimizations", "True"},
+      {"FFlagRenderAllocateShadowMapResourcesOnDemand", "True"},
+      {"FIntRenderShadowMapDepthCacheMemLimit", "16"},
+      {"FIntTM2ShadowMapMaxMips", "1"},
+      {"FIntDebugForceMSAASamples", "1"},
+      {"FFlagLuauStartupGcSuppression", "False"},
+      {"FIntLuauGcStepMul", "300"},
+      {"FIntLuauGcGoalCore", "120"},
+      {"FIntLuauGcStartupWorkingSetMb", "64"},
+      {"FIntLuaGcMaxKb", "262144"},
+      {"FIntTaskSchedulerMaxTempArenaSizeBytes", "16777216"},
+      {"FFlagLocalStorageArenaOptimization", "True"},
+      {"FIntProjectedMaxBytesUsedForSoundsMB", "32"},
+      {"FIntAudioMetadataCacheSizeKB", "2048"},
+      {"FIntDefaultAudioDecodeBufferSizeMs", "50"},
+      {"FIntMaxAudibleSoundChannels", "32"},
+      {"FIntDebugFRMQualityLevelOverride", "3"},
+  };
+}
+
+nlohmann::json MergeDefault(const PerformancePolicy& policy) {
+  std::string merged;
+  std::string error;
+  EXPECT_TRUE(
+      MergePerformanceClientSettingsOverrides(policy, "{}", &merged, &error))
+      << error;
+  return nlohmann::json::parse(merged, nullptr, false, true);
+}
+
+TEST(PerformancePolicyTest, DefaultPresetIsUnchangedFromPlus1) {
+  const ScopedEnvironmentVariable quality("MOCKTAIL_GRAPHICS_QUALITY",
+                                          nullptr);
+  const nlohmann::json merged = MergeDefault(DefaultThroughputPolicy());
+  const nlohmann::json expected = Plus1DefaultPreset();
+  EXPECT_EQ(merged, expected);
+  EXPECT_EQ(merged.size(), 73U);
+  for (const auto& [name, value] : expected.items()) {
+    EXPECT_EQ(merged.value(name, nlohmann::json()), value) << name;
+  }
+}
 
 TEST(PerformancePolicyTest, ParsesDisabledByDefaultAndExplicitTrueValues) {
   EXPECT_FALSE(ParsePerformancePolicy("").multithreaded_rendering);
