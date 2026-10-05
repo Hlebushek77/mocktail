@@ -4,6 +4,9 @@
 #include <vulkan/vulkan.h>
 
 #include <cstdint>
+#include <functional>
+#include <string>
+#include <vector>
 
 #include "mocktail/graphics/etc2_decoder.h"
 
@@ -30,21 +33,124 @@ inline constexpr std::uint32_t kSmallTextureMaxExtent = 64;
 inline constexpr std::uint32_t kDefaultSmallTextureUpscale = 4;
 std::uint32_t SmallTextureUpscale(const char* value);
 
+enum class Etc2StagingMemory { kCached, kCoherent };
+
+// Everything the emulation reads from the environment, read once. Tests
+// construct the emulation with explicit options instead.
+struct Etc2EmulationOptions {
+  std::uint32_t upscale = kDefaultSmallTextureUpscale;  // MOCKTAIL_SMALL_TEXTURE_UPSCALE (1..8)
+  bool fast_path = true;          // MOCKTAIL_ETC2_FAST_PATH (development only)
+  bool gpu = true;                // MOCKTAIL_ETC2_GPU
+  bool to_bc = false;             // MOCKTAIL_ETC2_TO_BC
+  unsigned workers = 0;           // MOCKTAIL_ETC2_WORKERS, 0: min(8, cores / 2)
+  std::uint64_t gpu_arena_bytes = 0;  // MOCKTAIL_ETC2_GPU_ARENA_MB, 0: automatic
+  Etc2StagingMemory staging_memory = Etc2StagingMemory::kCached;  // MOCKTAIL_ETC2_STAGING_MEMORY
+  bool frame_stats = false;       // MOCKTAIL_FRAME_STATS
+  std::string trace_path;         // MOCKTAIL_ETC2_TRACE: one CSV line per upload
+  std::string trace_blocks_dir;   // MOCKTAIL_ETC2_TRACE_BLOCKS: compressed uploads
+
+  static Etc2EmulationOptions FromEnvironment();
+  // Reads the same variables through `lookup`, which returns null for an
+  // unset one. Switches take 1/true/on and 0/false/off; anything else keeps
+  // the default.
+  static Etc2EmulationOptions FromLookup(
+      const std::function<const char*(const char*)>& lookup);
+};
+
+// A batch that only Mocktail's work is in, submitted by the caller through
+// the host vkQueueSubmit right before Roblox's batches (the GPU route's
+// selftest, or its decode pass for a protected or device-group batch).
+struct Etc2PreSubmit {
+  VkSubmitInfo info{};
+  VkFence fence = VK_NULL_HANDLE;  // the selftest's only
+};
+
+// What a vkQueueSubmit hook submits after PrepareSubmit(2). Until the GPU
+// route rewrites anything, these are Roblox's own arrays and fence.
+struct Etc2SubmitPlan {
+  bool modified = false;
+  VkQueue queue = VK_NULL_HANDLE;
+  VkDevice device = VK_NULL_HANDLE;
+  std::uint32_t queue_family = UINT32_MAX;
+  // The rewritten batches (one of the two) and the arrays they point into.
+  // Fill the arrays completely before pointing into them.
+  std::vector<VkSubmitInfo> submit_infos;
+  std::vector<VkSubmitInfo2> submit_infos2;
+  std::vector<VkCommandBuffer> command_buffers;
+  std::vector<VkCommandBufferSubmitInfo> command_buffer_infos;
+  std::vector<Etc2PreSubmit> pre_submit_batches;
+  // Used for Roblox's batches when Roblox passed no fence.
+  VkFence substitute_fence = VK_NULL_HANDLE;
+  // Signalled by a fence-only submit after Roblox's, when Roblox passed one.
+  VkFence trailing_fence = VK_NULL_HANDLE;
+  void* gpu_slot = nullptr;  // the GPU route's own bookkeeping
+
+  std::uint32_t count(std::uint32_t original) const {
+    if (!modified) {
+      return original;
+    }
+    return static_cast<std::uint32_t>(submit_infos2.empty()
+                                          ? submit_infos.size()
+                                          : submit_infos2.size());
+  }
+  const VkSubmitInfo* submits(const VkSubmitInfo* original) const {
+    return modified && !submit_infos.empty() ? submit_infos.data() : original;
+  }
+  const VkSubmitInfo2* submits2(const VkSubmitInfo2* original) const {
+    return modified && !submit_infos2.empty() ? submit_infos2.data()
+                                              : original;
+  }
+  VkFence fence(VkFence original) const {
+    return original == VK_NULL_HANDLE && substitute_fence != VK_NULL_HANDLE
+               ? substitute_fence
+               : original;
+  }
+  const std::vector<Etc2PreSubmit>& pre_submits() const {
+    return pre_submit_batches;
+  }
+};
+
 class VulkanEtc2Emulation final {
  public:
-  VulkanEtc2Emulation();
+  explicit VulkanEtc2Emulation(
+      Etc2EmulationOptions options = Etc2EmulationOptions::FromEnvironment());
   ~VulkanEtc2Emulation();
   VulkanEtc2Emulation(const VulkanEtc2Emulation&) = delete;
   VulkanEtc2Emulation& operator=(const VulkanEtc2Emulation&) = delete;
 
+  const Etc2EmulationOptions& options() const;
+
   bool PhysicalDeviceNeedsEmulation(VkPhysicalDevice physical_device,
                                     PFN_vkGetPhysicalDeviceFeatures host);
 
+  // `properties` and `queue_families` are the physical device's;
+  // `create_info` is what Roblox passed to vkCreateDevice and is only read
+  // during the call (it logs the queues Roblox asked for). Mocktail's own
+  // Vulkan calls go through `get_device_proc_addr`, and physical-device
+  // queries through `get_instance_proc_addr` and `instance` when given:
+  // both must be the host loader's, never the adapter's hooks.
   void RegisterDevice(VkDevice device, VkPhysicalDevice physical_device,
                       bool emulated,
                       const VkPhysicalDeviceMemoryProperties& memory,
-                      PFN_vkGetDeviceProcAddr get_device_proc_addr);
+                      const VkPhysicalDeviceProperties& properties,
+                      const std::vector<VkQueueFamilyProperties>& queue_families,
+                      const VkDeviceCreateInfo& create_info,
+                      PFN_vkGetDeviceProcAddr get_device_proc_addr,
+                      PFN_vkGetInstanceProcAddr get_instance_proc_addr = nullptr,
+                      VkInstance instance = VK_NULL_HANDLE);
   void DestroyDevice(VkDevice device);
+  void RegisterQueue(VkDevice device, VkQueue queue, std::uint32_t family,
+                     std::uint32_t index);
+  void RegisterCommandPool(VkDevice device, VkCommandPool pool,
+                           std::uint32_t family,
+                           VkCommandPoolCreateFlags flags);
+  // After the pool's command buffers were released.
+  void ForgetCommandPool(VkDevice device, VkCommandPool pool);
+  // Releases what the command buffer recorded before and starts a new
+  // recording. `pool` is the one the command buffer was allocated from; the
+  // adapter's command-buffer bindings are the only record of that.
+  void BeginCommandBuffer(VkCommandBuffer command_buffer, VkCommandPool pool,
+                          VkCommandBufferUsageFlags flags);
 
   VkResult CreateImage(VkDevice device, const VkImageCreateInfo* create_info,
                        const VkAllocationCallbacks* allocator, VkImage* image);
@@ -54,10 +160,20 @@ class VulkanEtc2Emulation final {
                            const VkImageViewCreateInfo* create_info,
                            const VkAllocationCallbacks* allocator,
                            VkImageView* view);
+  VkResult AllocateMemory(VkDevice device, const VkMemoryAllocateInfo* info,
+                          const VkAllocationCallbacks* allocator,
+                          VkDeviceMemory* memory);
+  // Telemetry: which memory type an allocation has (source memory types).
+  void NoteAllocateMemory(VkDevice device, VkDeviceMemory memory,
+                          std::uint32_t type_index, VkDeviceSize size);
   VkResult BindBufferMemory(VkDevice device, VkBuffer buffer,
                             VkDeviceMemory memory, VkDeviceSize offset);
   VkResult BindBufferMemory2(VkDevice device, std::uint32_t count,
                              const VkBindBufferMemoryInfo* infos);
+  VkResult BindImageMemory(VkDevice device, VkImage image,
+                           VkDeviceMemory memory, VkDeviceSize offset);
+  VkResult BindImageMemory2(VkDevice device, std::uint32_t count,
+                            const VkBindImageMemoryInfo* infos);
   VkResult MapMemory(VkDevice device, VkDeviceMemory memory,
                      VkDeviceSize offset, VkDeviceSize size,
                      VkMemoryMapFlags flags, void** data);
@@ -84,12 +200,30 @@ class VulkanEtc2Emulation final {
   void CmdExecuteCommands(VkDevice device, VkCommandBuffer command_buffer,
                           std::uint32_t count,
                           const VkCommandBuffer* secondaries);
+  // Roblox recorded a dispatch into `command_buffer` (only reported with
+  // MOCKTAIL_VK_CALL_STATS=1): uploads recorded after it may read what the
+  // dispatch writes, which no route sees.
+  void NoteDispatch(VkCommandBuffer command_buffer);
 
-  // Resubmission must reread the source bytes.
-  void PrepareSubmit(const VkCommandBuffer* command_buffers,
-                     std::uint32_t count);
+  // Inside Roblox's vkQueueSubmit(2): decodes the CPU route's uploads of the
+  // batches (resubmission rereads the source bytes) and fills `plan` with
+  // what the caller submits instead. The caller first submits
+  // plan->pre_submits() with the host vkQueueSubmit, then
+  // plan->count/submits/fence, then calls FinishSubmit with the result;
+  // `submit_fence_only` submits (queue, 0, nullptr, fence) the same way.
+  void PrepareSubmit(VkQueue queue, std::uint32_t count,
+                     const VkSubmitInfo* submits, VkFence fence,
+                     Etc2SubmitPlan* plan);
+  void PrepareSubmit2(VkQueue queue, std::uint32_t count,
+                      const VkSubmitInfo2* submits, VkFence fence,
+                      Etc2SubmitPlan* plan);
+  void FinishSubmit(Etc2SubmitPlan* plan, VkResult host_result,
+                    const std::function<VkResult(VkFence)>& submit_fence_only);
   // Call only after the command buffer is no longer pending.
   void ReleaseCommandBuffer(VkCommandBuffer command_buffer);
+  // After every vkQueuePresentKHR: the two-second "[perf] etc2_window" line
+  // with MOCKTAIL_FRAME_STATS=1.
+  void OnPresent();
 
   struct State;
 
