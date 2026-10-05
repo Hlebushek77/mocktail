@@ -3,7 +3,10 @@
 #include <gtest/gtest.h>
 
 #include <cstdlib>
+#include <initializer_list>
 #include <optional>
+#include <tuple>
+#include <utility>
 
 #define JSON_NOEXCEPTION 1
 #include <nlohmann/json.hpp>
@@ -142,9 +145,33 @@ nlohmann::json MergeDefault(const PerformancePolicy& policy) {
   return nlohmann::json::parse(merged, nullptr, false, true);
 }
 
+// Unsets the quality level and both rendering-preset knobs, or sets the
+// knobs to the given spellings.
+class PresetEnvironment final {
+ public:
+  explicit PresetEnvironment(const char* texture_budget_mb = nullptr,
+                             const char* texture_compression = nullptr)
+      : quality_("MOCKTAIL_GRAPHICS_QUALITY", nullptr),
+        budget_("MOCKTAIL_TEXTURE_BUDGET_MB", texture_budget_mb),
+        compression_("MOCKTAIL_PRESET_TEXTURE_COMPRESSION",
+                     texture_compression) {}
+
+ private:
+  ScopedEnvironmentVariable quality_;
+  ScopedEnvironmentVariable budget_;
+  ScopedEnvironmentVariable compression_;
+};
+
+nlohmann::json Without(nlohmann::json object,
+                       std::initializer_list<const char*> names) {
+  for (const char* name : names) {
+    EXPECT_EQ(object.erase(name), 1U) << name;
+  }
+  return object;
+}
+
 TEST(PerformancePolicyTest, DefaultPresetIsUnchangedFromPlus1) {
-  const ScopedEnvironmentVariable quality("MOCKTAIL_GRAPHICS_QUALITY",
-                                          nullptr);
+  const PresetEnvironment environment;
   const nlohmann::json merged = MergeDefault(DefaultThroughputPolicy());
   const nlohmann::json expected = Plus1DefaultPreset();
   EXPECT_EQ(merged, expected);
@@ -152,6 +179,189 @@ TEST(PerformancePolicyTest, DefaultPresetIsUnchangedFromPlus1) {
   for (const auto& [name, value] : expected.items()) {
     EXPECT_EQ(merged.value(name, nlohmann::json()), value) << name;
   }
+}
+
+TEST(PerformancePolicyTest, KnobsAtTheirDefaultsKeepEveryModeIdentical) {
+  PerformancePolicy multithreaded;
+  multithreaded.multithreaded_rendering = true;
+  multithreaded.physical_core_count = 14;
+  PerformancePolicy latency = multithreaded;
+  latency.physics_worker_mode = PhysicsWorkerMode::kLatency;
+  const PerformancePolicy disabled;
+  for (const PerformancePolicy& policy :
+       {DefaultThroughputPolicy(), multithreaded, latency, disabled}) {
+    std::string unset_json;
+    std::string error;
+    {
+      const PresetEnvironment environment;
+      ASSERT_TRUE(MergePerformanceClientSettingsOverrides(
+          policy, R"({"FFlagDebugDisplayFPS":"True"})", &unset_json, &error))
+          << error;
+    }
+    for (const auto& [budget, compression] :
+         std::initializer_list<std::pair<const char*, const char*>>{
+             {"", ""}, {nullptr, "on"}, {"", "on"}}) {
+      const PresetEnvironment environment(budget, compression);
+      std::string spelled_json;
+      ASSERT_TRUE(MergePerformanceClientSettingsOverrides(
+          policy, R"({"FFlagDebugDisplayFPS":"True"})", &spelled_json,
+          &error))
+          << error;
+      EXPECT_EQ(spelled_json, unset_json);
+    }
+  }
+}
+
+TEST(PerformancePolicyTest, ParsesRenderingPresetKnobs) {
+  RenderingPresetKnobs knobs;
+  std::string error;
+  ASSERT_TRUE(ParseRenderingPresetKnobs(nullptr, nullptr, &knobs, &error));
+  EXPECT_TRUE(knobs.is_default());
+  ASSERT_TRUE(ParseRenderingPresetKnobs("", "", &knobs, &error));
+  EXPECT_TRUE(knobs.is_default());
+  ASSERT_TRUE(ParseRenderingPresetKnobs(nullptr, "on", &knobs, &error));
+  EXPECT_TRUE(knobs.is_default());
+
+  for (const auto& [text, value] :
+       std::initializer_list<std::pair<const char*, int>>{
+           {"16", 16}, {"128", 128}, {"512", 512}, {"0320", 320},
+           {"4095", 4095}}) {
+    ASSERT_TRUE(ParseRenderingPresetKnobs(text, nullptr, &knobs, &error))
+        << text;
+    EXPECT_EQ(knobs.texture_budget_mb, value) << text;
+    EXPECT_FALSE(knobs.roblox_texture_budget);
+    EXPECT_TRUE(knobs.texture_compression_flags);
+    EXPECT_FALSE(knobs.is_default());
+  }
+
+  ASSERT_TRUE(ParseRenderingPresetKnobs("roblox", "off", &knobs, &error));
+  EXPECT_EQ(knobs.texture_budget_mb, 0);
+  EXPECT_TRUE(knobs.roblox_texture_budget);
+  EXPECT_FALSE(knobs.texture_compression_flags);
+
+  for (const char* invalid : {"0", "15", "4096", "-1", "+512", " 512",
+                              "512MB", "1e3", "Roblox", "auto",
+                              "99999999999"}) {
+    RenderingPresetKnobs untouched;
+    untouched.texture_budget_mb = 77;
+    error.clear();
+    EXPECT_FALSE(
+        ParseRenderingPresetKnobs(invalid, nullptr, &untouched, &error))
+        << invalid;
+    EXPECT_EQ(untouched.texture_budget_mb, 77) << invalid;
+    EXPECT_NE(error.find("MOCKTAIL_TEXTURE_BUDGET_MB"), std::string::npos)
+        << invalid;
+  }
+  for (const char* invalid : {"0", "1", "false", "true", "OFF", "no"}) {
+    error.clear();
+    EXPECT_FALSE(ParseRenderingPresetKnobs(nullptr, invalid, &knobs, &error))
+        << invalid;
+    EXPECT_NE(error.find("MOCKTAIL_PRESET_TEXTURE_COMPRESSION"),
+              std::string::npos)
+        << invalid;
+  }
+  EXPECT_FALSE(ParseRenderingPresetKnobs(nullptr, nullptr, nullptr, &error));
+}
+
+TEST(PerformancePolicyTest, TextureBudgetKnobReplacesOnlyTheTotalBudget) {
+  const PresetEnvironment environment("512");
+  nlohmann::json expected = Plus1DefaultPreset();
+  expected["FIntRenderTextureTotalBudgetMB"] = "512";
+  EXPECT_EQ(MergeDefault(DefaultThroughputPolicy()), expected);
+}
+
+TEST(PerformancePolicyTest, RobloxTextureBudgetLeavesBothBudgetsToRoblox) {
+  {
+    const PresetEnvironment environment("roblox");
+    EXPECT_EQ(MergeDefault(DefaultThroughputPolicy()),
+              Without(Plus1DefaultPreset(),
+                      {"FIntRenderTextureTotalBudgetMB",
+                       "FIntRenderTextureOrphanBudgetMB"}));
+
+    // The budgets are no longer the preset's, so fflags.json may set them.
+    std::string merged;
+    std::string error;
+    ASSERT_TRUE(MergePerformanceClientSettingsOverrides(
+        DefaultThroughputPolicy(),
+        R"({"FIntRenderTextureTotalBudgetMB":"1024"})", &merged, &error))
+        << error;
+    EXPECT_EQ(nlohmann::json::parse(merged).at(
+                  "FIntRenderTextureTotalBudgetMB"),
+              "1024");
+  }
+  const PresetEnvironment environment;
+  std::string merged;
+  std::string error;
+  EXPECT_FALSE(MergePerformanceClientSettingsOverrides(
+      DefaultThroughputPolicy(),
+      R"({"FIntRenderTextureTotalBudgetMB":"1024"})", &merged, &error));
+  EXPECT_NE(error.find("FIntRenderTextureTotalBudgetMB"), std::string::npos);
+}
+
+TEST(PerformancePolicyTest, TextureCompressionOffLeavesOutOnlyItsFiveFlags) {
+  const PresetEnvironment environment(nullptr, "off");
+  EXPECT_EQ(MergeDefault(DefaultThroughputPolicy()),
+            Without(Plus1DefaultPreset(),
+                    {"FFlagUITextureCompressionDesktop",
+                     "FFlagTCTextureCompressionDesktop",
+                     "FFlagUITextureUncompressed",
+                     "FFlagDebugTerrainVTCompressedTextures",
+                     "FFlagVulkanCompressedTextureAliasing"}));
+}
+
+TEST(PerformancePolicyTest, CombinesBothKnobs) {
+  const PresetEnvironment environment("320", "off");
+  nlohmann::json expected =
+      Without(Plus1DefaultPreset(),
+              {"FFlagUITextureCompressionDesktop",
+               "FFlagTCTextureCompressionDesktop", "FFlagUITextureUncompressed",
+               "FFlagDebugTerrainVTCompressedTextures",
+               "FFlagVulkanCompressedTextureAliasing"});
+  expected["FIntRenderTextureTotalBudgetMB"] = "320";
+  EXPECT_EQ(MergeDefault(DefaultThroughputPolicy()), expected);
+}
+
+TEST(PerformancePolicyTest, InvalidKnobFailsTheStartAndNamesTheVariable) {
+  for (const auto& [budget, compression, variable] :
+       std::initializer_list<std::tuple<const char*, const char*, const char*>>{
+           {"lots", nullptr, "MOCKTAIL_TEXTURE_BUDGET_MB"},
+           {nullptr, "disabled", "MOCKTAIL_PRESET_TEXTURE_COMPRESSION"}}) {
+    const PresetEnvironment environment(budget, compression);
+    // Invalid even where the preset is not applied, so a typo never passes
+    // silently.
+    for (const PerformancePolicy& policy :
+         {DefaultThroughputPolicy(), PerformancePolicy{}}) {
+      std::string merged = "unchanged";
+      std::string error;
+      EXPECT_FALSE(
+          MergePerformanceClientSettingsOverrides(policy, "{}", &merged,
+                                                  &error));
+      EXPECT_EQ(merged, "unchanged");
+      EXPECT_NE(error.find(variable), std::string::npos) << error;
+    }
+    std::string merged = "unchanged";
+    std::string error;
+    EXPECT_FALSE(MergeRuntimeClientSettingsOverrides(
+        ParseFrameRatePolicy("60"), DefaultThroughputPolicy(), "{}", &merged,
+        &error));
+    EXPECT_EQ(merged, "unchanged");
+    EXPECT_NE(error.find(variable), std::string::npos) << error;
+  }
+}
+
+TEST(PerformancePolicyTest, DescribesActiveKnobsForTheStartupLog) {
+  RenderingPresetKnobs knobs;
+  EXPECT_EQ(DescribeRenderingPresetKnobs(knobs), "");
+  knobs.texture_budget_mb = 512;
+  EXPECT_EQ(DescribeRenderingPresetKnobs(knobs),
+            "FIntRenderTextureTotalBudgetMB=512 (MOCKTAIL_TEXTURE_BUDGET_MB)");
+  knobs.texture_budget_mb = 0;
+  knobs.roblox_texture_budget = true;
+  knobs.texture_compression_flags = false;
+  EXPECT_EQ(DescribeRenderingPresetKnobs(knobs),
+            "texture budgets left to Roblox "
+            "(MOCKTAIL_TEXTURE_BUDGET_MB=roblox), texture-compression flags "
+            "left out (MOCKTAIL_PRESET_TEXTURE_COMPRESSION=off)");
 }
 
 TEST(PerformancePolicyTest, ParsesDisabledByDefaultAndExplicitTrueValues) {

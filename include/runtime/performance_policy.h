@@ -46,6 +46,40 @@ PerformancePolicy ParsePerformancePolicy(
     std::string_view memory_limit_mb = "0", std::string_view game_mode = "auto",
     std::string_view physics_worker_mode = "auto");
 
+// Development knobs for the rendering preset, for A/B runs, not settings:
+// fflags.json cannot change a preset key, a different value fails the start.
+//   MOCKTAIL_TEXTURE_BUDGET_MB=16..4095 replaces the preset's 128 MiB
+//   FIntRenderTextureTotalBudgetMB; =roblox leaves it and
+//   FIntRenderTextureOrphanBudgetMB to Roblox.
+//   MOCKTAIL_PRESET_TEXTURE_COMPRESSION=off leaves out the preset's
+//   texture-compression flags.
+// Unset or empty, they change nothing.
+struct RenderingPresetKnobs {
+  int texture_budget_mb = 0;  // 0 keeps the preset's budget
+  bool roblox_texture_budget = false;
+  bool texture_compression_flags = true;
+
+  bool is_default() const {
+    return texture_budget_mb == 0 && !roblox_texture_budget &&
+           texture_compression_flags;
+  }
+};
+
+inline constexpr int kMinimumTextureBudgetKnobMb = 16;
+inline constexpr int kMaximumTextureBudgetKnobMb = 4095;
+
+// nullptr stands for an unset variable. An invalid value fails with an
+// error that names its variable.
+bool ParseRenderingPresetKnobs(const char* texture_budget_mb,
+                               const char* texture_compression,
+                               RenderingPresetKnobs* knobs,
+                               std::string* error);
+bool RenderingPresetKnobsFromEnvironment(RenderingPresetKnobs* knobs,
+                                         std::string* error);
+
+// What the knobs change, for the startup log; empty for the defaults.
+std::string DescribeRenderingPresetKnobs(const RenderingPresetKnobs& knobs);
+
 // Respects CPU affinity and falls back to the available logical count.
 int DetectAvailablePhysicalCoreCount();
 
