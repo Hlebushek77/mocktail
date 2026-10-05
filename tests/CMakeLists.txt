@@ -166,6 +166,14 @@ target_link_libraries(vulkan_icd_selection_test PRIVATE
   GTest::gtest_main
 )
 
+# ETC2 capability selection and Vulkan call statistics (plus.2 WP5).
+add_executable(vulkan_etc2_caps_test vulkan_etc2_caps_test.cc)
+target_include_directories(vulkan_etc2_caps_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/include
+)
+target_link_libraries(vulkan_etc2_caps_test PRIVATE GTest::gtest_main)
+mocktail_apply_compile_options(vulkan_etc2_caps_test)
+
 add_executable(host_gpu_selection_test host_gpu_selection_test.cc)
 target_link_libraries(host_gpu_selection_test PRIVATE
   Mocktail::Runtime
@@ -1242,6 +1250,7 @@ gtest_discover_tests(native_update_test)
 gtest_discover_tests(compatibility_catalog_test)
 gtest_discover_tests(support_bundle_runtime_test)
 gtest_discover_tests(vulkan_icd_selection_test)
+gtest_discover_tests(vulkan_etc2_caps_test)
 gtest_discover_tests(host_gpu_selection_test)
 gtest_discover_tests(session_log_test)
 gtest_discover_tests(failure_dialog_test)
