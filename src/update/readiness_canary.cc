@@ -329,6 +329,13 @@ CanaryResult RunReadinessCanary(const CanaryOptions& options) {
            // engine.nvidia_shader_mt, published by ApplyGraphicsLaunchPolicy,
            // so a canary loads Roblox's shaders the way the game will.
            "MOCKTAIL_NVIDIA_SHADER_MT",
+           // engine.etc2_to_bc, published there too, and the switch that
+           // keeps ETC2 decoding off the graphics card: BC mode changes the
+           // format of every emulated image, so a payload must pass the
+           // canary with the texture path the game will use, and a user's
+           // workaround must not fail a payload that works for them.
+           "MOCKTAIL_ETC2_TO_BC",
+           "MOCKTAIL_ETC2_GPU",
            // Dynamic-library search state and graphics library overrides
            // must reach the isolated runtime so that distributions which
            // resolve shared libraries through the launcher environment

@@ -1754,6 +1754,7 @@ TEST(GraphicsLaunchLogTest, KeepsTheVulkanCardForTheSessionLog) {
   const ScopedEnvironment scoped({
       "MOCKTAIL_GRAPHICS_BACKEND",
       "MOCKTAIL_NVIDIA_SHADER_MT",
+      "MOCKTAIL_ETC2_TO_BC",
       "MOCKTAIL_PRELOAD_VULKAN_SHIM",
       "MOCKTAIL_REQUIRE_REAL_GRAPHICS",
       "MOCKTAIL_DISABLE_AUTO_ANGLE_FALLBACK",
