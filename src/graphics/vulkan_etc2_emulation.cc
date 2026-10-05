@@ -1241,6 +1241,7 @@ void VulkanEtc2Emulation::PrepareSubmit(const VkCommandBuffer* command_buffers,
   }
 
   std::lock_guard<std::mutex> scratch_lock(state_->scratch_mutex);
+  const auto copy_start = std::chrono::steady_clock::now();
   std::vector<std::uint8_t>& scratch_source = state_->scratch_source;
   std::vector<std::uint8_t>& scratch_decoded = state_->scratch_decoded;
   if (scratch_source.size() < compressed_total) {
@@ -1298,7 +1299,9 @@ void VulkanEtc2Emulation::PrepareSubmit(const VkCommandBuffer* command_buffers,
       mapping.dev->unmap_memory(mapping.dev->device, memory);
     }
   }
+  const auto jobs_start = std::chrono::steady_clock::now();
   DecodeEtcJobs(jobs.data(), jobs.size(), DecodeWorkerCount());
+  const auto jobs_end = std::chrono::steady_clock::now();
   for (const EtcDecodeJob& job : jobs) {
     if (!job.ok) {
       LogFailure("could not decode an upload layer");
@@ -1314,6 +1317,7 @@ void VulkanEtc2Emulation::PrepareSubmit(const VkCommandBuffer* command_buffers,
     decoded_offset += upload->decoded;
     host_total += upload->target_bytes;
   }
+  const auto emit_end = std::chrono::steady_clock::now();
   ReleaseOversizedEtc2Scratch(&scratch_source);
   ReleaseOversizedEtc2Scratch(&scratch_decoded);
   if (copied_uploads.empty()) {
@@ -1323,6 +1327,25 @@ void VulkanEtc2Emulation::PrepareSubmit(const VkCommandBuffer* command_buffers,
       std::chrono::duration_cast<std::chrono::nanoseconds>(
           std::chrono::steady_clock::now() - decode_start)
           .count());
+  // MOCKTAIL_FRAME_STATS=1: name each submit that held the render thread.
+  static const bool log_stalls = [] {
+    const char* value = std::getenv("MOCKTAIL_FRAME_STATS");
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+  }();
+  if (log_stalls && decode_ns >= 20000000ULL) {
+    std::fprintf(stderr,
+                 "  [vulkan] ETC2 decode stall %llu ms: %zu uploads, "
+                 "%.1f MiB compressed, %.1f MiB written "
+                 "(prepare %lld, copy %lld, decode %lld, write %lld ms)\n",
+                 static_cast<unsigned long long>(decode_ns / 1000000ULL),
+                 copied_uploads.size(),
+                 static_cast<double>(compressed_total) / 1048576.0,
+                 static_cast<double>(host_total) / 1048576.0,
+                 static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(copy_start - decode_start).count()),
+                 static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(jobs_start - copy_start).count()),
+                 static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(jobs_end - jobs_start).count()),
+                 static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(emit_end - jobs_end).count()));
+  }
   bool milestone = false;
   {
     std::lock_guard<std::mutex> lock(state_->totals_mutex);

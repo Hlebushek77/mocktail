@@ -6,6 +6,7 @@
 #include <dlfcn.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -14,6 +15,7 @@
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <utility>
@@ -233,6 +235,47 @@ bool WindowTraceEnabled() {
                               TraceFlagEnabled("MOCKTAIL_TRACE_ALL") ||
                               TraceFlagEnabled("MOCKTAIL_FULL_TRACE");
   return enabled;
+}
+
+// MOCKTAIL_FRAME_STATS=1 logs, every two seconds, how evenly frames reached
+// the host: the average rate hides the long frames a player feels as stutter.
+void RecordFrameInterval(uint64_t now_ns) {
+  static const bool enabled = TraceFlagEnabled("MOCKTAIL_FRAME_STATS");
+  if (!enabled) {
+    return;
+  }
+  static std::mutex mutex;
+  static uint64_t window_start_ns = 0;
+  static uint64_t last_ns = 0;
+  static std::vector<uint32_t> intervals_us;
+  std::lock_guard<std::mutex> lock(mutex);
+  if (last_ns == 0) {
+    window_start_ns = now_ns;
+  } else if (now_ns > last_ns) {
+    intervals_us.push_back(static_cast<uint32_t>(
+        std::min<uint64_t>((now_ns - last_ns) / 1000U, UINT32_MAX)));
+  }
+  last_ns = now_ns;
+  if (intervals_us.empty() || now_ns - window_start_ns < 2000000000ULL) {
+    return;
+  }
+  std::vector<uint32_t> sorted = intervals_us;
+  std::sort(sorted.begin(), sorted.end());
+  const auto over = [&](uint32_t ms) {
+    return sorted.end() - std::upper_bound(sorted.begin(), sorted.end(),
+                                           ms * 1000U);
+  };
+  const double seconds = static_cast<double>(now_ns - window_start_ns) / 1e9;
+  fprintf(stderr,
+          "  [perf] frame_stats frames=%zu fps=%.1f median=%.1fms "
+          "p99=%.1fms max=%.1fms over33=%td over50=%td over100=%td\n",
+          sorted.size(), static_cast<double>(sorted.size()) / seconds,
+          sorted[sorted.size() / 2] / 1000.0,
+          sorted[std::min(sorted.size() - 1, sorted.size() * 99 / 100)] /
+              1000.0,
+          sorted.back() / 1000.0, over(33), over(50), over(100));
+  intervals_us.clear();
+  window_start_ns = now_ns;
 }
 
 bool SdlEventTraceEnabled() {
@@ -1923,6 +1966,7 @@ void NoteVulkanPresent() {
   g_vulkan_present_progress_gate.NotifyFramePresented(
       now_ticks_ns, static_cast<uint64_t>(present_count),
       SDL_GetCurrentThreadID());
+  RecordFrameInterval(now_ticks_ns);
   WindowResizeReadinessState resize_state_before =
       WindowResizeReadinessState::kDisabled;
   if (g_resize_readiness_gate != nullptr) {
