@@ -536,6 +536,12 @@ RuntimeConfig RuntimeConfig::FromEnvironment(const Environment& environment) {
   } else {
     config.engine_.nvidia_shader_mt_valid = false;
   }
+  if (const std::optional<bool> etc2_to_bc = ParseEnvironmentSwitch(
+          environment.GetOr("MOCKTAIL_ETC2_TO_BC", "0"))) {
+    config.engine_.etc2_to_bc = *etc2_to_bc;
+  } else {
+    config.engine_.etc2_to_bc_valid = false;
+  }
   if (const std::optional<bool> show_on_start = ParseEnvironmentSwitch(
           environment.GetOr("MOCKTAIL_LAUNCHER_SHOW_ON_START", "1"))) {
     config.launcher_.show_on_start = *show_on_start;

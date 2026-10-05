@@ -15,6 +15,12 @@ namespace mocktail {
 namespace runtime {
 namespace {
 
+// config/mocktail.example.yaml is a copy of this text (a test compares
+// them). engine.etc2_to_bc's loading sentence is provisional until BC
+// mode's loading time is measured in a real game: converting on the
+// graphics card may cost nothing, since BC uploads are 4 to 8 times
+// smaller, while converting on the processor costs several times the work
+// of unpacking. Keep it in step with the Graphics page's hint for the key.
 constexpr std::string_view kDefaultRuntimeConfig =
     R"yaml(# Mocktail configuration.
 # The file is created once with mode 0600. Mocktail never replaces your edits.
@@ -174,6 +180,13 @@ engine:
   # false makes Roblox load it on one thread there, as Mocktail did before
   # this setting existed; use it only if shader loading fails on NVIDIA.
   nvidia_shader_mt: true
+  # Boolean (default: false): on graphics cards that cannot read ETC2
+  # textures (NVIDIA, some others), convert Roblox's ETC2 textures to BC
+  # instead of unpacking them, so they take 4 to 8 times less video memory.
+  # Fine detail can lose some quality, and loading can take longer when the
+  # conversion runs on the processor instead of the graphics card. Only the
+  # Vulkan backend reads it.
+  etc2_to_bc: false
 
 launcher:
   # Boolean (default: true): show the Mocktail settings window before Roblox
