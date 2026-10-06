@@ -783,8 +783,9 @@ target_link_libraries(etc2_emulation_gpu_test PRIVATE
 )
 mocktail_apply_compile_options(etc2_emulation_gpu_test)
 
-# ETC2 CPU fast path (plus.2 WP1): the persistent worker pool, and the
-# streaming copy out of mapped memory.
+# ETC2 CPU fast path (plus.2 WP1): the persistent worker pool, the streaming
+# copy out of mapped memory, and the manual etc2_cpu_perf benchmark (not a
+# test: it needs a GPU and an idle machine, and prints timings).
 add_executable(worker_pool_test worker_pool_test.cc)
 target_link_libraries(worker_pool_test PRIVATE
   mocktail_etc2_emulation_for_tests
@@ -798,6 +799,10 @@ target_link_libraries(mapped_memory_copy_test PRIVATE
   GTest::gtest_main
 )
 mocktail_apply_compile_options(mapped_memory_copy_test)
+
+add_executable(etc2_cpu_perf etc2_cpu_perf.cc)
+target_link_libraries(etc2_cpu_perf PRIVATE mocktail_etc2_test_support)
+mocktail_apply_compile_options(etc2_cpu_perf)
 
 add_executable(video_driver_policy_test
   video_driver_policy_test.cc
