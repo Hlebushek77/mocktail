@@ -1,0 +1,135 @@
+#version 450
+// ETC2/EAC -> BC transcoding for ETC2->BC mode (MOCKTAIL_ETC2_TO_BC=1), one
+// invocation per 4x4 block: the block is decoded in registers and encoded
+// at once, bit-identical to the CPU route's encoder (src/graphics/
+// bc_encoder.cc, both ported from plus2-design/harness/bc_ref.h):
+//   RGB8 -> BC1 (opaque)       RGB8A1 -> BC1 with 1-bit alpha
+//   RGBA8 -> BC3               R11 -> BC4, RG11 -> BC5 (unsigned/signed)
+// The jobs are etc2_decode.comp's, with `flags`; the output is tightly
+// packed BC blocks of the job's size (dst_row_words = blocks_wide * 2 or 4,
+// a block per ETC2/EAC block in the same order), which the rewritten
+// vkCmdCopyBufferToImage reads with bufferRowLength = 4 * blocks_wide.
+#include "etc2_common.glsl"
+#include "bc_common.glsl"
+
+layout(local_size_x = 64) in;
+
+struct Job {
+  uint format;
+  uint src_word;         // first block, in 32-bit words of `src`
+  uint src_row_words;    // words per source block row
+  uint src_layer_words;  // words per source layer
+  uint blocks_wide;
+  uint blocks_high;
+  uint block_count;      // blocks_wide * blocks_high * layers
+  uint dst_word;         // first output word
+  uint dst_row_words;    // words per output block row
+  uint dst_layer_words;  // words per output layer
+  uint group_begin;      // first workgroup of this job in the dispatch
+  uint flags;            // bit 0: BC1 least-squares endpoint refinement
+  uint pad1;
+  uint pad2;
+  uint pad3;
+  uint pad4;
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer Source { uint src[]; };
+layout(std430, set = 0, binding = 1) readonly buffer Jobs { Job jobs[]; };
+// The output, seen as 8- and 16-byte blocks: each invocation writes its
+// block with one store, so a subgroup's stores cover whole cache lines
+// (as in etc2_decode.comp, this matters when the output lives in system
+// memory). Blocks start on their size: output ranges are 256-byte aligned
+// and hold whole blocks.
+layout(std430, set = 1, binding = 0) writeonly buffer Destination2 { uvec2 dst2[]; };
+layout(std430, set = 1, binding = 0) writeonly buffer Destination4 { uvec4 dst4[]; };
+
+layout(push_constant) uniform Push {
+  uint job_first;
+  uint job_count;
+} pc;
+
+shared uint s_job;
+
+int Signed16(uint v) { return int(v ^ 0x8000u) - 0x8000; }
+
+void main() {
+  const uint group = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+  if (gl_LocalInvocationIndex == 0u) {
+    uint lo = pc.job_first;
+    uint hi = pc.job_first + pc.job_count - 1u;
+    while (lo < hi) {
+      const uint mid = (lo + hi + 1u) >> 1;
+      if (jobs[mid].group_begin <= group) {
+        lo = mid;
+      } else {
+        hi = mid - 1u;
+      }
+    }
+    s_job = lo;
+  }
+  barrier();
+  const Job job = jobs[s_job];
+  const uint local = (group - job.group_begin) * 64u + gl_LocalInvocationIndex;
+  if (local >= job.block_count) {
+    return;
+  }
+  const uint per_layer = job.blocks_wide * job.blocks_high;
+  const uint layer = local / per_layer;
+  const uint rem = local - layer * per_layer;
+  const uint by = rem / job.blocks_wide;
+  const uint bx = rem - by * job.blocks_wide;
+  const uint format = job.format;
+  const uint words = EtcBlockWords(format);
+  const uint s = job.src_word + layer * job.src_layer_words +
+                 by * job.src_row_words + bx * words;
+  const uint d = job.dst_word + layer * job.dst_layer_words +
+                 by * job.dst_row_words + bx * words;
+  const bool refine = (job.flags & 1u) != 0u;
+
+  if (format <= FMT_ETC2_RGBA8) {
+    uint px[16];
+    const uint c = format == FMT_ETC2_RGBA8 ? 2u : 0u;
+    DecodeRgbBlock(src[s + c], src[s + c + 1u], format == FMT_ETC2_RGB8A1, px);
+    uint tex[16];
+    for (int i = 0; i < 16; ++i) {
+      tex[i] = px[(i & 3) * 4 + (i >> 2)];  // column-major -> row-major
+    }
+    if (format == FMT_ETC2_RGBA8) {
+      const uint a0 = src[s];
+      const uint a1 = src[s + 1u];
+      const int base = BlockByte(a0, a1, 0);
+      const int multiplier = BlockByte(a0, a1, 1) >> 4;
+      int alpha[16];
+      for (int i = 0; i < 16; ++i) {
+        const int t = (i & 3) * 4 + (i >> 2);
+        alpha[i] = clamp(base + EacModifier(a0, a1, t) * multiplier, 0, 255);
+      }
+      const uvec2 a = EncodeBc4(alpha, false, false);
+      const uvec2 rgb = EncodeBc1(tex, false, true, refine);
+      dst4[d >> 2] = uvec4(a.x, a.y, rgb.x, rgb.y);
+      return;
+    }
+    dst2[d >> 1] = EncodeBc1(tex, format == FMT_ETC2_RGB8A1, false, refine);
+    return;
+  }
+
+  const bool is_signed = format == FMT_EAC_R11_SIGNED || format == FMT_EAC_RG11_SIGNED;
+  const bool two = format == FMT_EAC_RG11 || format == FMT_EAC_RG11_SIGNED;
+  uvec2 blocks[2];
+  for (int ch = 0; ch < (two ? 2 : 1); ++ch) {
+    const uint w0 = src[s + uint(ch) * 2u];
+    const uint w1 = src[s + uint(ch) * 2u + 1u];
+    int values[16];
+    for (int i = 0; i < 16; ++i) {
+      const int t = (i & 3) * 4 + (i >> 2);
+      const uint v = DecodeR11(w0, w1, t, is_signed);
+      values[i] = is_signed ? Signed16(v) : int(v);
+    }
+    blocks[ch] = EncodeBc4(values, true, is_signed);
+  }
+  if (two) {
+    dst4[d >> 2] = uvec4(blocks[0].x, blocks[0].y, blocks[1].x, blocks[1].y);
+  } else {
+    dst2[d >> 1] = blocks[0];
+  }
+}
