@@ -1073,8 +1073,11 @@ struct Etc2GpuDevice::Impl {
       case Slot::Phase::kNotSubmitted:
         return Recycle(slot) ? &slot : nullptr;
       case Slot::Phase::kInFlight:
-        Signalled(fns().wait_for_fences(info.device, 1, &slot.fence, VK_TRUE,
-                                        UINT64_MAX));
+        // Never reset a fence that may still be pending.
+        if (!Signalled(fns().wait_for_fences(info.device, 1, &slot.fence,
+                                             VK_TRUE, UINT64_MAX))) {
+          return nullptr;
+        }
         return Recycle(slot) ? &slot : nullptr;
       case Slot::Phase::kRecording:
       case Slot::Phase::kLost:
