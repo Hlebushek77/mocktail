@@ -788,6 +788,15 @@ target_link_libraries(vulkan_etc2_gpu_plan_test PRIVATE
 )
 mocktail_apply_compile_options(vulkan_etc2_gpu_plan_test)
 
+# The GPU route's record, submit and teardown paths on the fake device,
+# which runs the decode jobs on the CPU (plus.2 WP2).
+add_executable(vulkan_etc2_gpu_route_test vulkan_etc2_gpu_route_test.cc)
+target_link_libraries(vulkan_etc2_gpu_route_test PRIVATE
+  mocktail_etc2_test_support
+  GTest::gtest_main
+)
+mocktail_apply_compile_options(vulkan_etc2_gpu_route_test)
+
 add_executable(etc2_emulation_gpu_test etc2_emulation_gpu_test.cc)
 target_link_libraries(etc2_emulation_gpu_test PRIVATE
   mocktail_etc2_test_support
@@ -1385,6 +1394,7 @@ gtest_discover_tests(vulkan_etc2_emulation_test)
 gtest_discover_tests(worker_pool_test)
 gtest_discover_tests(mapped_memory_copy_test)
 gtest_discover_tests(vulkan_etc2_gpu_plan_test)
+gtest_discover_tests(vulkan_etc2_gpu_route_test)
 # The committed SPIR-V header must match the GLSL it was generated from;
 # the check needs no shader compiler.
 add_test(NAME etc2_shader_header_test

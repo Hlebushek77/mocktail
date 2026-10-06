@@ -30,7 +30,10 @@ VkPhysicalDeviceProperties Rtx3060Properties();
 // PFN_vkGetDeviceProcAddr hands out entry points that keep buffers and memory
 // in malloc'd storage, record transfer commands into command buffers, and run
 // them against a CPU model of every image when the test submits: copies and
-// same-size NEAREST blits move bytes, filtered blits are only recorded. Misuse
+// same-size NEAREST blits move bytes, filtered blits are only recorded, and a
+// compute dispatch runs the ETC2 decode shader's job list on the CPU (the
+// only pipeline Mocktail builds; DecodeEtcImage per 4x4 block, written the
+// way etc2_decode.comp writes it), so the GPU route runs here too. Misuse
 // that a validation layer would flag is collected in errors() instead of
 // crashing, so a test can name the rule that broke.
 //
@@ -50,6 +53,14 @@ class FakeVulkanDevice {
     std::uint8_t image_fill = 0xCD;   // fresh images, every subresource
     // Names vkGetDeviceProcAddr returns null for, as on an older driver.
     std::vector<std::string> missing_procs;
+    // The ETC2 GPU route (plus.2 WP2). Every timestamp a command buffer
+    // writes is this much later than the one before (timestampPeriod 1).
+    std::uint64_t timestamp_step_ns = 1000;
+    // vkAllocateMemory fails above this size (0: never).
+    VkDeviceSize max_allocation_bytes = 0;
+    // A descriptor pool holds at most this many sets, whatever its maxSets
+    // (0: maxSets).
+    std::uint32_t max_sets_per_pool = 0;
   };
 
   struct ObjectCount {
@@ -65,6 +76,16 @@ class FakeVulkanDevice {
     ObjectCount command_pools;
     ObjectCount command_buffers;
     ObjectCount fences;
+    // Compute objects (the ETC2 GPU route's).
+    ObjectCount shader_modules;
+    ObjectCount pipelines;
+    ObjectCount pipeline_layouts;
+    ObjectCount descriptor_set_layouts;
+    ObjectCount descriptor_pools;
+    ObjectCount descriptor_sets;  // destroyed: freed, or with their pool
+    ObjectCount query_pools;
+    std::uint64_t dispatches = 0;
+    std::uint64_t decoded_blocks = 0;
     // Of the buffers and memory, those created through the entry points
     // (that is, by the code under test rather than by the test).
     ObjectCount entry_point_buffers;
@@ -131,6 +152,10 @@ class FakeVulkanDevice {
   VkResult Submit(const std::vector<std::vector<VkCommandBuffer>>& batches);
   // The same through the submit structures, signalling `fence` (which may
   // be the only thing submitted). Semaphores are ignored.
+  //
+  // The next vkQueueSubmit(2) calls return these results in order, and
+  // execute and signal nothing unless the result is VK_SUCCESS.
+  void FailNextSubmits(std::vector<VkResult> results);
   VkResult QueueSubmit(VkQueue queue, std::uint32_t count,
                        const VkSubmitInfo* submits, VkFence fence);
   VkResult QueueSubmit2(VkQueue queue, std::uint32_t count,
