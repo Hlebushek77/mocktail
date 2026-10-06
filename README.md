@@ -117,8 +117,8 @@ shows every change, file by file.
 - `engine.gpu` chooses the graphics card on computers with more than one,
   including laptops with AMD integrated graphics and an NVIDIA card, where
   upstream always used the NVIDIA card.
-- `engine.graphics_quality` chooses the graphics quality level that
-  Mocktail's performance preset forces, or leaves it to Roblox's slider.
+- `engine.graphics_quality` forces a graphics quality level you choose, or
+  leaves the level to Roblox's own setting (the default).
 - With direct Vulkan, vertical sync "On" now stays synchronized with Mesa's
   drivers (AMD, Intel, NVK) when the frame rate limit is unlimited.
 - The session log names the graphics card the game renders on, and how much
@@ -305,8 +305,8 @@ the desktop entry in `~/.local/share/applications`, or removes the copy when
 it only added them, and keeps a backup next to it.
 
 **Overrides Roblox setting.** Some settings replace one of Roblox's own
-in-game settings, for example the graphics quality level that Mocktail's
-performance preset forces. Such rows carry an **Overrides Roblox setting**
+in-game settings, for example a graphics quality level that you force in
+the settings window. Such rows carry an **Overrides Roblox setting**
 badge, and the Advanced page lists them under **What Mocktail decides and
 what Roblox decides**, together with the settings left to Roblox and the
 client settings Mocktail sets at every start.
@@ -337,7 +337,7 @@ empty value, hides the value from the file (empty means the default):
 | `display.server` | `auto`, `wayland`, `x11` | `MOCKTAIL_DISPLAY_SERVER` | Display server for the game window. `auto` prefers Wayland, with the [NVIDIA rule](#nvidia). A server the session does not offer falls back to `auto`. `SDL_VIDEODRIVER`, `SDL_VIDEO_DRIVER` or a `MOCKTAIL_FORCE_*` switch in your environment takes precedence. |
 | `display.start_mode` | `remember`, `windowed`, `maximized`, `fullscreen` | `MOCKTAIL_WINDOW_START_MODE` | Window state at start. `remember` restores the mode the last session ended in. |
 | `account.sign_in` | `native`, `browser` | `MOCKTAIL_NATIVE_LOGIN` (`0` means `browser`, anything else `native`) | Where you sign in when Roblox starts without a working saved session: Roblox's own welcome screen, or Mocktail's roblox.com window. |
-| `engine.graphics_quality` | `default`, `manual`, `1` to `21` | `MOCKTAIL_GRAPHICS_QUALITY` (also `auto` or `0` for `manual`) | Roblox's graphics quality level while Mocktail's performance preset is on (`performance.physics_worker_mode: throughput`, the default, or `auto` with `multithreaded_rendering`). `default` forces level 3 (level 1 with direct Vulkan on Intel integrated graphics), `manual` leaves Roblox's in-game slider in control, a number forces that level. |
+| `engine.graphics_quality` | `default`, `manual`, `1` to `21` | `MOCKTAIL_GRAPHICS_QUALITY` (also `auto` or `0` for `manual`) | Roblox's graphics quality level. `default` and `manual` leave it to Roblox's own Graphics Quality setting; a number forces that level (`DFIntDebugFRMQualityLevelOverride`), whatever the performance settings, and Roblox's in-game slider then has no effect. Before 1.0.4-plus.2 the level was sent under a name Roblox 2.738 ignores, so it never took effect. |
 | `engine.gpu` | `auto`, `discrete`, `integrated` | `MOCKTAIL_GPU` | Graphics card for direct Vulkan on computers with more than one. See [Hybrid laptops](#hybrid-laptops). |
 | `engine.nvidia_shader_mt` | `true`, `false` | `MOCKTAIL_NVIDIA_SHADER_MT` (`1`/`0`, `true`/`false`, `on`/`off`) | With direct Vulkan, lets Roblox load its shader pack on several threads on NVIDIA cards. `false` makes it use one thread there, as upstream does. |
 | `launcher.show_on_start` | `true`, `false` | `MOCKTAIL_LAUNCHER_SHOW_ON_START` (`1`/`0`, `true`/`false`, `on`/`off`) | Show the settings window before Roblox starts. |

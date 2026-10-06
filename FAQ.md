@@ -144,13 +144,12 @@ what is overridden and how to give it back. The **Advanced** page lists all
 of them under **What Mocktail decides and what Roblox decides** (the
 Performance page links there). Depending on your settings these are:
 
-- Roblox's **Graphics Quality** slider, while Mocktail's performance preset
-  forces a level (`engine.graphics_quality`, see the
-  [README](README.md#configuration)).
-- Anti-aliasing, textures and level of detail: the performance preset
+- Roblox's **Graphics Quality** slider, when `engine.graphics_quality`
+  forces a level (see the [README](README.md#configuration)).
+- Anti-aliasing and texture memory: the performance preset
   (`performance.physics_worker_mode: throughput`, the default, or `auto`
-  with `multithreaded_rendering`) turns MSAA off, caps the texture budget at
-  128 MB and uses low-end level of detail.
+  with `multithreaded_rendering`) turns MSAA off and caps the texture budget
+  at 128 MB.
 - Roblox's **Maximum Frame Rate**, when `graphics.frame_rate_limit` sets a
   target.
 - Roblox's **Theme**, when `appearance.theme` is not `roblox`.
