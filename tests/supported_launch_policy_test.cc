@@ -151,7 +151,7 @@ int RunGraphicsPolicyProbe(const char* backend) {
       std::string(resolved) != (open_gl ? "opengl" : "direct-vulkan") ||
       std::string(preload) != (open_gl ? "0" : "1") ||
       nvidia_shader_mt == nullptr || std::string(nvidia_shader_mt) != "1" ||
-      etc2_to_bc == nullptr || std::string(etc2_to_bc) != "0") {
+      etc2_to_bc == nullptr || std::string(etc2_to_bc) != "1") {
     return 23;
   }
   if (open_gl) {
@@ -391,10 +391,11 @@ TEST(GraphicsLaunchPolicyTest, PublishesTheEtc2ConversionForTheCanaries) {
     const char* expected;
   };
   for (const Case& entry : {
-           Case{"direct-vulkan", nullptr, "0"},
+           Case{"direct-vulkan", nullptr, "1"},
            Case{"direct-vulkan", "on", "1"},
            Case{"direct-vulkan", "false", "0"},
-           Case{"opengl", "true", "1"},
+           Case{"opengl", "off", "0"},
+           Case{"opengl", nullptr, "1"},
        }) {
     const pid_t child = fork();
     ASSERT_GE(child, 0);

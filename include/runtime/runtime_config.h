@@ -145,11 +145,12 @@ struct EngineConfig {
   // loading on NVIDIA GPUs.
   bool nvidia_shader_mt = true;
   bool nvidia_shader_mt_valid = true;
-  // engine.etc2_to_bc / MOCKTAIL_ETC2_TO_BC. True asks the Vulkan ETC2/EAC
-  // emulation, which reads the variable itself, to keep Roblox's ETC2/EAC
-  // textures compressed as BC1/BC3/BC4/BC5 on a device without
-  // textureCompressionETC2 instead of unpacking them to RGBA8/R16.
-  bool etc2_to_bc = false;
+  // engine.etc2_to_bc / MOCKTAIL_ETC2_TO_BC, on by default. True asks the
+  // Vulkan ETC2/EAC emulation, which reads the variable itself, to keep
+  // Roblox's ETC2/EAC textures compressed as BC1/BC3/BC4/BC5 on a device
+  // without textureCompressionETC2 instead of unpacking them to RGBA8/R16.
+  // A device with native ETC2 is not emulated, so it changes nothing there.
+  bool etc2_to_bc = true;
   bool etc2_to_bc_valid = true;
 };
 

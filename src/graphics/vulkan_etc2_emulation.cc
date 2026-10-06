@@ -249,7 +249,7 @@ Etc2EmulationOptions Etc2EmulationOptions::FromLookup(
   options.upscale =
       SmallTextureUpscale(lookup("MOCKTAIL_SMALL_TEXTURE_UPSCALE"));
   options.gpu = ParseSwitch(lookup("MOCKTAIL_ETC2_GPU"), true);
-  options.to_bc = ParseSwitch(lookup("MOCKTAIL_ETC2_TO_BC"), false);
+  options.to_bc = ParseSwitch(lookup("MOCKTAIL_ETC2_TO_BC"), true);
   std::uint64_t value = 0;
   if (ParseCount(lookup("MOCKTAIL_ETC2_WORKERS"), 64, &value)) {
     options.workers = static_cast<unsigned>(value);

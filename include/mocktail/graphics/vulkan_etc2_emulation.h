@@ -93,7 +93,7 @@ enum class Etc2StagingMemory { kCached, kCoherent };
 struct Etc2EmulationOptions {
   std::uint32_t upscale = kDefaultSmallTextureUpscale;  // MOCKTAIL_SMALL_TEXTURE_UPSCALE (1..8)
   bool gpu = true;                // MOCKTAIL_ETC2_GPU
-  bool to_bc = false;             // MOCKTAIL_ETC2_TO_BC
+  bool to_bc = true;              // MOCKTAIL_ETC2_TO_BC
   unsigned workers = 0;           // MOCKTAIL_ETC2_WORKERS, 0: min(8, cores / 2)
   std::uint64_t gpu_arena_bytes = 0;  // MOCKTAIL_ETC2_GPU_ARENA_MB, 0: automatic
   Etc2StagingMemory staging_memory = Etc2StagingMemory::kCached;  // MOCKTAIL_ETC2_STAGING_MEMORY

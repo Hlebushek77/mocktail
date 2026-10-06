@@ -301,6 +301,9 @@ void FakeEmulationBackend::FreeMemoryDirect(VkDeviceMemory memory) {
 Etc2EmulationOptions CpuRouteOptions() {
   Etc2EmulationOptions options;
   options.gpu = false;
+  // RGBA/R16 hosts, the plus.1 output the goldens freeze; the BC suites
+  // turn ETC2->BC mode (the default) back on.
+  options.to_bc = false;
   return options;
 }
 

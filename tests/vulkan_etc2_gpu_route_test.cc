@@ -43,6 +43,7 @@ Etc2EmulationOptions GpuOptions(std::uint32_t upscale = 1) {
   Etc2EmulationOptions options;
   options.gpu = true;
   options.upscale = upscale;
+  options.to_bc = false;  // RGBA/R16 hosts, as the goldens
   return options;
 }
 

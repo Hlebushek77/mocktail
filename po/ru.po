@@ -3637,17 +3637,20 @@ msgstr "На видеокарте без ETC2 текстуры ETC2 перево
 msgid "On a card without ETC2, ETC2 textures are unpacked to full size"
 msgstr "На видеокарте без ETC2 текстуры ETC2 распаковываются в полный размер"
 
-msgid "Roblox sends most textures in the ETC2 format. NVIDIA graphics cards, and some others, cannot read ETC2, so Mocktail converts these textures for the card. By default it unpacks them to full size, which takes 4 to 8 times the video memory of the compressed texture."
-msgstr "Roblox передаёт большинство текстур в формате ETC2. Видеокарты NVIDIA и некоторые другие не умеют читать ETC2, поэтому Mocktail преобразует такие текстуры для видеокарты. По умолчанию он распаковывает их в полный размер, и в видеопамяти они занимают в 4–8 раз больше места, чем в сжатом виде."
+msgid "Roblox sends most textures in the ETC2 format. NVIDIA graphics cards, and some others, cannot read ETC2, so Mocktail converts these textures for the card. Unpacked to full size, they would take 4 to 8 times the video memory of the compressed texture."
+msgstr "Roblox передаёт большинство текстур в формате ETC2. Видеокарты NVIDIA и некоторые другие не умеют читать ETC2, поэтому Mocktail преобразует такие текстуры для видеокарты. Распакованные в полный размер, они занимали бы в видеопамяти в 4–8 раз больше места, чем в сжатом виде."
 
-msgid "With this setting on, Mocktail converts them to BC (also called DXT) instead, a compressed format these cards read natively, so the textures take about as much video memory as Roblox itself counts for them. Roblox keeps using ETC2: letting it switch to DXT itself (MOCKTAIL_ADVERTISE_ETC2=0) was much slower in a test on an RTX 3060."
-msgstr "Если настройка включена, Mocktail вместо этого переводит их в BC (он же DXT) — сжатый формат, который эти видеокарты читают сами, и текстуры занимают в видеопамяти примерно столько, сколько на них рассчитывает сам Roblox. Roblox при этом продолжает работать с ETC2: если дать ему самому перейти на DXT (MOCKTAIL_ADVERTISE_ETC2=0), в тесте на RTX 3060 игра работала намного медленнее."
+msgid "With this setting on, as it is by default, Mocktail converts them to BC (also called DXT) instead, a compressed format these cards read natively, so the textures take about as much video memory as Roblox itself counts for them. Roblox keeps using ETC2: letting it switch to DXT itself (MOCKTAIL_ADVERTISE_ETC2=0) was much slower in a test on an RTX 3060."
+msgstr "Когда настройка включена (а по умолчанию так и есть), Mocktail вместо этого переводит их в BC (он же DXT) — сжатый формат, который эти видеокарты читают сами, и текстуры занимают в видеопамяти примерно столько, сколько на них рассчитывает сам Roblox. Roblox при этом продолжает работать с ETC2: если дать ему самому перейти на DXT (MOCKTAIL_ADVERTISE_ETC2=0), в тесте на RTX 3060 игра работала намного медленнее."
 
-msgid "The cost: fine detail can lose some quality, so sharp edges in text and icons or smooth gradients may look blockier. Small textures (up to 64 pixels across) also keep their own size instead of the fourfold enlargement Mocktail gives them otherwise. Loading can take longer when the conversion has to run on the processor instead of the graphics card."
-msgstr "Цена: мелкие детали могут потерять в качестве, поэтому резкие края текста и значков или плавные градиенты могут выглядеть более блочными. Кроме того, маленькие текстуры (до 64 пикселей по ширине и высоте) остаются своего размера, без четырёхкратного увеличения, которое иначе делает Mocktail. Загрузка может идти дольше, если преобразование приходится выполнять на процессоре, а не на видеокарте."
+msgid "In a test on an RTX 3060 (driver 615), the same Roblox game used about 800 MiB of video memory on average with this setting on, against about 1900 MiB with it off, and at most about 1000 against 2400 MiB."
+msgstr "В тесте на RTX 3060 (драйвер 615) одна и та же игра Roblox с включённой настройкой занимала в среднем около 800 МиБ видеопамяти, а с выключенной — около 1900 МиБ; в пике — около 1000 МиБ против 2400 МиБ."
 
-msgid "Turn it on if video memory runs short: on a card with 4 GB or less, at a high resolution, or while other programs use the graphics card. The change applies the next time Roblox starts. On a card that reads ETC2 itself the setting changes nothing; the session log says whether textures are converted (a “[vulkan] ETC2/EAC emulation enabled” line)."
-msgstr "Включайте, если не хватает видеопамяти: на видеокарте с 4 ГБ или меньше, при высоком разрешении или когда видеокартой пользуются другие программы. Изменение вступит в силу при следующем запуске Roblox. На видеокарте, которая сама читает ETC2, настройка ничего не меняет; есть ли преобразование, видно в журнале сеанса (строка «[vulkan] ETC2/EAC emulation enabled»)."
+msgid "The cost: fine detail can lose some quality, so sharp edges in text and icons or smooth gradients may look blockier. Small textures (up to 64 pixels across) also keep their own size instead of the fourfold enlargement Mocktail gives them otherwise, so they look smoother but less crisp. When the conversion has to run on the processor instead of the graphics card, loading can stutter briefly."
+msgstr "Цена: мелкие детали могут потерять в качестве, поэтому резкие края текста и значков или плавные градиенты могут выглядеть более блочными. Кроме того, маленькие текстуры (до 64 пикселей по ширине и высоте) остаются своего размера, без четырёхкратного увеличения, которое иначе делает Mocktail, и поэтому выглядят мягче, но не так чётко. Если преобразование приходится выполнять на процессоре, а не на видеокарте, загрузка может ненадолго подтормаживать."
+
+msgid "Turn it off if textures look wrong to you: Mocktail then unpacks them to full size, as earlier versions did. The change applies the next time Roblox starts. On a card that reads ETC2 itself the setting changes nothing; the session log says whether and how textures are converted (a “[vulkan] ETC2/EAC emulation enabled” line)."
+msgstr "Выключайте, если текстуры выглядят неправильно: тогда Mocktail распаковывает их в полный размер, как прежние версии. Изменение вступит в силу при следующем запуске Roblox. На видеокарте, которая сама читает ETC2, настройка ничего не меняет; есть ли преобразование и какое, видно в журнале сеанса (строка «[vulkan] ETC2/EAC emulation enabled»)."
 
 #, c-format
 msgid "The game renders on the %s card here, which has no ETC2 in Vulkan, so this setting applies."
@@ -3660,6 +3663,9 @@ msgstr "Здесь игра отрисовывается на встроенно
 #, c-format
 msgid "The game renders on the %s card here. If its Vulkan driver reads ETC2 itself, this setting changes nothing."
 msgstr "Здесь игра отрисовывается на видеокарте %s. Если её драйвер Vulkan сам читает ETC2, настройка ничего не меняет."
+
+msgid "This card cannot read ETC2. With its textures kept compressed, the game used less than half the video memory in a test on an RTX 3060, and ran as smoothly."
+msgstr "Эта видеокарта не умеет читать ETC2. Когда текстуры остаются сжатыми, игра в тесте на RTX 3060 занимала меньше половины видеопамяти, нужной без сжатия, и работала так же плавно."
 
 
 msgid "Uses X11 (XWayland) here"

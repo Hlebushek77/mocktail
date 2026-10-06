@@ -784,8 +784,8 @@ GtkWidget* BuildTextureCompressionRow(LauncherContext* context) {
   RowSpec spec;
   spec.key = kEtc2ToBcKey;
   spec.title = _("Compressed textures (BC)");
-  // runtime_config.cc: MOCKTAIL_ETC2_TO_BC defaults to off.
-  spec.fallback = "false";
+  // runtime_config.cc: MOCKTAIL_ETC2_TO_BC defaults to on.
+  spec.fallback = "true";
   spec.keywords = {"bc",         "dxt",          "etc2",       "texture",
                    "textures",   "compression",  "compressed", "video memory",
                    "vram",       "memory",       "текстуры",   "сжатие",
@@ -816,45 +816,54 @@ GtkWidget* BuildTextureCompressionRow(LauncherContext* context) {
       // ETC2/EAC uploads per session on an RTX 3060.
       _("Roblox sends most textures in the ETC2 format. NVIDIA graphics "
         "cards, and some others, cannot read ETC2, so Mocktail converts these "
-        "textures for the card. By default it unpacks them to full size, "
-        "which takes 4 to 8 times the video memory of the compressed "
-        "texture.") +
+        "textures for the card. Unpacked to full size, they would take 4 to 8 "
+        "times the video memory of the compressed texture.") +
       std::string("\n\n") +
       // FAQ.md "Why is ETC2 kept": the ETC2 / MOCKTAIL_ADVERTISE_ETC2=0 A/B
       // (Roblox 2.738.1397, RTX 3060 Laptop, driver 615.71.09).
-      _("With this setting on, Mocktail converts them to BC (also called "
-        "DXT) instead, a compressed format these cards read natively, so the "
-        "textures take about as much video memory as Roblox itself counts "
-        "for them. Roblox keeps using ETC2: letting it switch to DXT itself "
-        "(MOCKTAIL_ADVERTISE_ETC2=0) was much slower in a test on an RTX "
-        "3060.") +
+      _("With this setting on, as it is by default, Mocktail converts them "
+        "to BC (also called DXT) instead, a compressed format these cards "
+        "read natively, so the textures take about as much video memory as "
+        "Roblox itself counts for them. Roblox keeps using ETC2: letting it "
+        "switch to DXT itself (MOCKTAIL_ADVERTISE_ETC2=0) was much slower in "
+        "a test on an RTX 3060.") +
+      "\n\n" +
+      // work/plus2-live/L123-REPORT.md, Anime Vanguards (Roblox
+      // 2.738.1397), the Mocktail process's video memory: average 774 and
+      // 841 MiB, peak 907 and 1008 MiB in BC mode (P2B1, P2B2), against
+      // 1800 and 1934 MiB, peak 2406 and 2416 MiB unpacked (P2G1, P2G2).
+      _("In a test on an RTX 3060 (driver 615), the same Roblox game used "
+        "about 800 MiB of video memory on average with this setting on, "
+        "against about 1900 MiB with it off, and at most about 1000 against "
+        "2400 MiB.") +
       "\n\n" +
       // BC1 keeps 2 colours and 2 blends per 4x4 block: about 35 dB PSNR
       // on the APK's own ETC1 textures. BC mode creates images at scale 1;
       // otherwise MOCKTAIL_SMALL_TEXTURE_UPSCALE (default 4) enlarges
-      // colour textures of up to kSmallTextureMaxExtent (64) pixels a side.
-      // The loading sentence is provisional until BC mode's loading time is
-      // measured in a real game: converting on the graphics card may cost
-      // nothing, since BC uploads are 4 to 8 times smaller, while
-      // converting on the processor, whenever the graphics card cannot do
-      // it, costs several times the work of unpacking. Keep config.yaml's
-      // template in step (runtime_config_bootstrap.cc).
+      // colour textures of up to kSmallTextureMaxExtent (64) pixels a side
+      // by repeating texels. L123-REPORT.md: no stall at all while the
+      // graphics card converts (P2B1, P2B2), stalls of up to 196 ms while
+      // a place loads when the processor converts (P2Bc1,
+      // MOCKTAIL_ETC2_GPU=0). Keep config.yaml's template in step
+      // (runtime_config_bootstrap.cc).
       _("The cost: fine detail can lose some quality, so sharp edges in text "
         "and icons or smooth gradients may look blockier. Small textures (up "
         "to 64 pixels across) also keep their own size instead of the "
-        "fourfold enlargement Mocktail gives them otherwise. Loading can take "
-        "longer when the conversion has to run on the processor instead of "
-        "the graphics card.") +
+        "fourfold enlargement Mocktail gives them otherwise, so they look "
+        "smoother but less crisp. When the conversion has to run on the "
+        "processor instead of the graphics card, loading can stutter "
+        "briefly.") +
       "\n\n" +
       // vulkan_etc2_emulation.cc logs "ETC2/EAC emulation enabled" when it
-      // emulates for a device; Etc2EmulationOptions are read once, when the
-      // game creates its Vulkan device.
-      _("Turn it on if video memory runs short: on a card with 4 GB or less, "
-        "at a high resolution, or while other programs use the graphics "
-        "card. The change applies the next time Roblox starts. On a card "
-        "that reads ETC2 itself the setting changes nothing; the session log "
-        "says whether textures are converted (a “[vulkan] ETC2/EAC emulation "
-        "enabled” line).");
+      // emulates for a device, with "become BC1/BC3/BC4/BC5 host images" in
+      // BC mode; Etc2EmulationOptions are read once, when the game creates
+      // its Vulkan device.
+      _("Turn it off if textures look wrong to you: Mocktail then unpacks "
+        "them to full size, as earlier versions did. The change applies the "
+        "next time Roblox starts. On a card that reads ETC2 itself the "
+        "setting changes nothing; the session log says whether and how "
+        "textures are converted (a “[vulkan] ETC2/EAC emulation enabled” "
+        "line).");
   spec.hint.details_for = [](LauncherContext& ctx) {
     const Etc2ConversionState state = Etc2Conversion(ctx);
     const VulkanDriverSelection driver =
@@ -880,9 +889,20 @@ GtkWidget* BuildTextureCompressionRow(LauncherContext* context) {
                           "changes nothing."),
                         name.c_str());
   };
-  // No recommendation: it trades image quality for video memory, and the
-  // launcher cannot read how much video memory the card has without
-  // loading its driver.
+  // Recommended where the game's card is known to lack ETC2 (NVIDIA);
+  // elsewhere only the game's Vulkan device tells whether it applies.
+  spec.hint.recommend = [context](const MachineProfile&) {
+    return Etc2Conversion(*context) == Etc2ConversionState::kNvidia
+               ? std::optional<std::string>("true")
+               : std::optional<std::string>();
+  };
+  spec.hint.recommend_reason = [](const MachineProfile&) {
+    // The L3 runs quoted in the details (L123-REPORT.md).
+    return std::string(
+        _("This card cannot read ETC2. With its textures kept compressed, "
+          "the game used less than half the video memory in a test on an "
+          "RTX 3060, and ran as smoothly."));
+  };
   spec.unavailable = [](LauncherContext& ctx) {
     return Etc2Conversion(ctx) == Etc2ConversionState::kNotVulkan
                ? std::string(_("Only the Vulkan backend reads this setting"))

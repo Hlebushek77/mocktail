@@ -504,6 +504,7 @@ Etc2EmulationOptions GpuOptions() {
   Etc2EmulationOptions options;
   options.gpu = true;
   options.upscale = 1;
+  options.to_bc = false;  // RGBA/R16 hosts; BcOptions() for BC mode
   return options;
 }
 

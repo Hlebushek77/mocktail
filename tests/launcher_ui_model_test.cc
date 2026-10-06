@@ -457,7 +457,7 @@ TEST(EnvOverridesTest, MovesTheEngineVariablesIntoTheDraft) {
   const MapEnvironment environment({
       {"MOCKTAIL_GPU", "integrated"},
       {"MOCKTAIL_NVIDIA_SHADER_MT", "off"},
-      {"MOCKTAIL_ETC2_TO_BC", "on"},
+      {"MOCKTAIL_ETC2_TO_BC", "off"},
   });
   const EnvOverrides overrides = EnvOverrides::FromNames(
       "MOCKTAIL_GPU,MOCKTAIL_NVIDIA_SHADER_MT,MOCKTAIL_ETC2_TO_BC",
@@ -471,7 +471,7 @@ TEST(EnvOverridesTest, MovesTheEngineVariablesIntoTheDraft) {
   EXPECT_EQ(shader->imported, "false");
   const EnvOverride* textures = overrides.Effective("engine.etc2_to_bc");
   ASSERT_NE(textures, nullptr);
-  EXPECT_EQ(textures->imported, "true");
+  EXPECT_EQ(textures->imported, "false");
 
   const EnvImportReport report = ImportEnvOverrides(overrides, &draft);
   EXPECT_TRUE(report.errors.empty())
@@ -479,13 +479,14 @@ TEST(EnvOverridesTest, MovesTheEngineVariablesIntoTheDraft) {
   EXPECT_EQ(report.imported.size(), 3U);
   EXPECT_EQ(draft.Get("engine.gpu"), "integrated");
   EXPECT_EQ(draft.Get("engine.nvidia_shader_mt"), "false");
-  EXPECT_EQ(draft.Get("engine.etc2_to_bc"), "true");
+  EXPECT_EQ(draft.Get("engine.etc2_to_bc"), "false");
   // Plain YAML, as the template writes them.
   const std::string& bytes = draft.working_bytes();
   EXPECT_NE(bytes.find("\n  gpu: integrated\n"), std::string::npos) << bytes;
   EXPECT_NE(bytes.find("\n  nvidia_shader_mt: false\n"), std::string::npos)
       << bytes;
-  EXPECT_NE(bytes.find("\n  etc2_to_bc: true\n"), std::string::npos) << bytes;
+  EXPECT_NE(bytes.find("\n  etc2_to_bc: false\n"), std::string::npos)
+      << bytes;
   std::string error;
   EXPECT_TRUE(draft.Validate(&error)) << error;
 }
