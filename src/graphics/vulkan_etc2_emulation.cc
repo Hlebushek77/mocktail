@@ -370,8 +370,9 @@ struct QueueRecord {
   std::uint32_t index = 0;
 };
 
-// Memory of an emulated device, tracked with MOCKTAIL_FRAME_STATS=1: its
-// type, and the images bound into it by offset, to spot aliasing.
+// Memory of an emulated device, tracked for the diagnostics and the trace:
+// its type, and (MOCKTAIL_FRAME_STATS=1) the images bound into it by offset,
+// to spot aliasing.
 struct BoundImage {
   VkImage image = VK_NULL_HANDLE;
   VkDeviceSize end = 0;
@@ -574,7 +575,8 @@ struct VulkanEtc2Emulation::State {
   std::unordered_map<VkCommandBuffer, CommandRecord> commands;
   std::unordered_map<VkCommandPool, PoolRecord> pools;
   std::unordered_map<VkQueue, QueueRecord> queues;
-  // MOCKTAIL_FRAME_STATS=1 only.
+  // Memory types with MOCKTAIL_FRAME_STATS=1 or a trace (TrackMemory);
+  // image bindings with MOCKTAIL_FRAME_STATS=1 only.
   std::unordered_map<VkDeviceMemory, MemoryRecord> memories;
   std::unordered_map<VkImage, ImageBinding> image_bindings;
   std::atomic<bool> has_commands{false};
