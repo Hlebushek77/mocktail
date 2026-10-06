@@ -1353,6 +1353,11 @@ gtest_discover_tests(vulkan_etc2_planning_test)
 gtest_discover_tests(vulkan_etc2_emulation_test)
 gtest_discover_tests(worker_pool_test)
 gtest_discover_tests(mapped_memory_copy_test)
+# The committed SPIR-V header must match the GLSL it was generated from;
+# the check needs no shader compiler.
+add_test(NAME etc2_shader_header_test
+  COMMAND ${PROJECT_SOURCE_DIR}/scripts/gen-etc2-shaders.sh --check
+)
 # Real GPU: skipped without a loader, driver or device, and while a live game
 # runs (CR-25). Hold these back with -LE gpu while a live measurement runs.
 gtest_discover_tests(etc2_emulation_gpu_test PROPERTIES LABELS gpu)
