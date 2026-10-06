@@ -2,10 +2,12 @@
 
 #include <png.h>
 
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <system_error>
 #include <vector>
 
 #if defined(__SSE2__)
@@ -214,9 +216,37 @@ std::string EnvironmentString(const char* name) {
 
 }  // namespace
 
+namespace {
+
+// Whether `directory` holds at least one regular *.png (any case).
+bool HoldsPng(const std::string& directory) {
+  if (directory.empty()) {
+    return false;
+  }
+  std::error_code error;
+  std::filesystem::directory_iterator entry(directory, error);
+  for (; !error && entry != std::filesystem::directory_iterator();
+       entry.increment(error)) {
+    std::string extension = entry->path().extension().string();
+    for (char& letter : extension) {
+      letter = static_cast<char>(
+          std::tolower(static_cast<unsigned char>(letter)));
+    }
+    std::error_code type_error;
+    if (extension == ".png" && entry->is_regular_file(type_error)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+}  // namespace
+
 TextureOverrides::TextureOverrides(std::string override_dir,
                                    std::string dump_dir)
-    : override_dir_(std::move(override_dir)), dump_dir_(std::move(dump_dir)) {}
+    : override_dir_(std::move(override_dir)),
+      dump_dir_(std::move(dump_dir)),
+      active_(!dump_dir_.empty() || HoldsPng(override_dir_)) {}
 
 TextureOverrides TextureOverrides::FromEnvironment() {
   return TextureOverrides(EnvironmentString("MOCKTAIL_TEXTURE_OVERRIDE_DIR"),

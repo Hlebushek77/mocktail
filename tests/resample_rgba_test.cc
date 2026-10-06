@@ -1,7 +1,13 @@
 #include <gtest/gtest.h>
 
+#include <unistd.h>
+
 #include <cstdint>
+#include <cstdio>
+#include <filesystem>
 #include <random>
+#include <string>
+#include <system_error>
 #include <vector>
 
 #include "mocktail/graphics/texture_override.h"
@@ -177,6 +183,53 @@ TEST(ResampleRgbaTest, StridedSourceMatchesACroppedCopy) {
         << source_width << "x" << source_height << " (+" << padding
         << ") -> " << width << "x" << height;
   }
+}
+
+class TextureOverridesActiveTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    directory_ = ::testing::TempDir() + "/texture_overrides_active_" +
+                 std::to_string(::getpid());
+    std::error_code error;
+    std::filesystem::remove_all(directory_, error);
+    std::filesystem::create_directories(directory_, error);
+  }
+  void TearDown() override {
+    std::error_code error;
+    std::filesystem::remove_all(directory_, error);
+  }
+
+  void Touch(const std::string& name) {
+    std::FILE* file = std::fopen((directory_ + "/" + name).c_str(), "w");
+    ASSERT_NE(file, nullptr) << name;
+    std::fclose(file);
+  }
+
+  std::string directory_;
+};
+
+// Hashing every mip-0 colour upload and probing for its PNG is only worth it
+// when an override can exist, or when uploads are being dumped.
+TEST_F(TextureOverridesActiveTest, OnlyAPngOrADumpDirectoryActivates) {
+  EXPECT_FALSE(TextureOverrides("", "").active());
+  EXPECT_FALSE(TextureOverrides(directory_ + "/missing", "").active());
+  EXPECT_TRUE(TextureOverrides(directory_ + "/missing", "").enabled());
+  EXPECT_FALSE(TextureOverrides(directory_, "").active()) << "empty folder";
+  Touch("readme.txt");
+  Touch("0123456789abcdef.png.bak");
+  std::error_code error;
+  std::filesystem::create_directories(directory_ + "/folder.png", error);
+  EXPECT_FALSE(TextureOverrides(directory_, "").active())
+      << "no regular *.png yet";
+  EXPECT_TRUE(TextureOverrides("", directory_ + "/dumps").active());
+
+  Touch("0123456789ABCDEF.PNG");
+  const TextureOverrides overrides(directory_, "");
+  EXPECT_TRUE(overrides.active()) << "the extension is matched in any case";
+  // Scanned once: removing the PNG later does not deactivate it.
+  std::filesystem::remove(directory_ + "/0123456789ABCDEF.PNG", error);
+  EXPECT_TRUE(overrides.active());
+  EXPECT_FALSE(TextureOverrides(directory_, "").active());
 }
 
 }  // namespace
