@@ -18,7 +18,9 @@
 // are read back and must equal both the reference model and the golden
 // hashes the fake device produces. The runner's default options pin the
 // CPU route (gpu = false); the GPU route and its rescue get runs of their
-// own.
+// own. The same scenarios run in ETC2->BC mode too: BC host images, whose
+// blocks read back must equal the references' and the fake device's BC
+// goldens.
 // The tests skip without a loader, driver or device, and while a live
 // Mocktail or Sober session runs (CR-25).
 
@@ -237,6 +239,50 @@ TEST_P(Etc2EmulationGpuTest, RescuedGpuRouteMatchesCpuRouteAndGolden) {
 
 INSTANTIATE_TEST_SUITE_P(Scenarios, Etc2EmulationGpuTest,
                          ::testing::ValuesIn(GpuScenarioNames()),
+                         [](const ::testing::TestParamInfo<std::string>& info) {
+                           return info.param;
+                         });
+
+// ETC2->BC mode (MOCKTAIL_ETC2_TO_BC=1) on the CPU route: every scenario a
+// GPU can run in BC mode (not those whose copies join formats of different
+// block sizes, which no device may run), BC images of the app's extent
+// read back block for block. Skips where the device cannot have BC mode
+// (it reads ETC2 itself, or lacks a BC format feature).
+std::vector<std::string> GpuBcScenarioNames() {
+  std::vector<std::string> names;
+  for (const Scenario& scenario : Etc2EmulationScenarios()) {
+    if (scenario.fake_only.empty() && scenario.bc_mode_fake_errors.empty()) {
+      names.push_back(scenario.name);
+    }
+  }
+  return names;
+}
+
+class Etc2EmulationGpuBcTest : public Etc2EmulationGpuTest {};
+
+TEST_P(Etc2EmulationGpuBcTest, CpuRouteMatchesModelAndBcGolden) {
+  const Scenario* scenario = FindEtc2EmulationScenario(GetParam());
+  ASSERT_NE(scenario, nullptr);
+  Etc2GpuBackend backend(device_);
+  ScenarioOptions options;
+  options.emulation.to_bc = true;
+  const ScenarioRun run = RunEtc2Scenario(*scenario, &backend, options);
+  if (run.skipped) {
+    GTEST_SKIP() << run.skip_reason;
+  }
+  for (const std::string& failure : run.failures) {
+    ADD_FAILURE() << failure;
+  }
+  std::uint64_t golden = 0;
+  ASSERT_TRUE(FindEtc2BcEmulationGolden(scenario->name, &golden))
+      << GoldenLine(scenario->name, run.hash);
+  EXPECT_EQ(run.hash, golden)
+      << "the GPU's BC images differ from the fake device's; this run gives "
+      << GoldenLine(scenario->name, run.hash);
+}
+
+INSTANTIATE_TEST_SUITE_P(Scenarios, Etc2EmulationGpuBcTest,
+                         ::testing::ValuesIn(GpuBcScenarioNames()),
                          [](const ::testing::TestParamInfo<std::string>& info) {
                            return info.param;
                          });

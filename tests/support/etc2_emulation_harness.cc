@@ -137,6 +137,15 @@ PFN_vkGetDeviceProcAddr FakeEmulationBackend::get_device_proc_addr() const {
   return FakeVulkanDevice::GetDeviceProcAddr();
 }
 
+PFN_vkGetInstanceProcAddr FakeEmulationBackend::get_instance_proc_addr()
+    const {
+  return FakeVulkanDevice::GetInstanceProcAddr();
+}
+
+VkInstance FakeEmulationBackend::instance() const {
+  return FakeVulkanDevice::instance();
+}
+
 std::string FakeEmulationBackend::Unsupported(const Scenario& scenario) const {
   if (scenario.queue_family >= fake_->config().queue_families.size()) {
     return "the fake has no queue family " +
@@ -330,6 +339,31 @@ ScenarioRun RunEtc2Scenario(const Scenario& scenario, EmulationBackend* backend,
   Etc2EmulationOptions emulation_options = options.emulation;
   emulation_options.upscale = scenario.upscale;
   VulkanEtc2Emulation emulation(emulation_options);
+  // In ETC2->BC mode vkCreateDevice first asks whether the device's ETC2
+  // images become BC (and then enables BC on it).
+  bool bc = false;
+  if (emulation_options.to_bc && scenario.emulated) {
+    const PFN_vkGetInstanceProcAddr instance_proc =
+        backend->get_instance_proc_addr();
+    if (instance_proc != nullptr) {
+      bc = emulation.PhysicalDeviceUsesBc(
+          backend->physical_device(),
+          reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures>(instance_proc(
+              backend->instance(), "vkGetPhysicalDeviceFeatures")),
+          reinterpret_cast<PFN_vkGetPhysicalDeviceFormatProperties>(
+              instance_proc(backend->instance(),
+                            "vkGetPhysicalDeviceFormatProperties")));
+    }
+    if (!bc) {
+      run.skipped = true;
+      run.skip_reason = "the device cannot enter ETC2->BC mode";
+      if (!scratch.empty()) {
+        std::error_code error;
+        std::filesystem::remove_all(scratch, error);
+      }
+      return run;
+    }
+  }
   const VkDevice device = backend->device();
   const float priority = 1.0F;
   VkDeviceQueueCreateInfo queue_info{};
@@ -351,7 +385,7 @@ ScenarioRun RunEtc2Scenario(const Scenario& scenario, EmulationBackend* backend,
     fail("no queue in family " + std::to_string(scenario.queue_family));
   }
   emulation.RegisterQueue(device, queue, scenario.queue_family, 0);
-  Etc2EmulationModel model(scenario);
+  Etc2EmulationModel model(scenario, bc);
 
   std::vector<VkImage> images;
   for (std::uint32_t index = 0; index < scenario.images.size(); ++index) {

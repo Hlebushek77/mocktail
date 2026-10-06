@@ -742,6 +742,7 @@ mocktail_apply_compile_options(mocktail_etc2_emulation_for_tests)
 add_library(mocktail_etc2_test_support STATIC
   support/etc2_reference_decoder.cc
   support/resample_reference.cc
+  support/bc_reference_transcode.cc
   support/fake_vulkan_device.cc
   support/etc2_emulation_scenarios.cc
   support/etc2_emulation_harness.cc

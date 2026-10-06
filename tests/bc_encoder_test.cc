@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "support/bc_reference.h"
+#include "support/bc_reference_transcode.h"
 #include "support/etc2_reference_decoder.h"
 
 // The CPU BC encoder of ETC2->BC mode (DESIGN C4.4) against the reference
@@ -65,49 +66,6 @@ void StoreLe(const std::uint32_t* words, std::size_t count, std::uint8_t* out) {
   }
 }
 
-// bc_test's CpuTranscodeBlock: the plus.1 decoder, then the reference
-// encoder.
-void ReferenceTranscode(EtcFormat format, const std::uint8_t* block,
-                        bool refine, std::uint8_t* out) {
-  std::uint8_t decoded[64];
-  reference::DecodeEtcImage(format, block, EtcBlockBytes(format), 4, 4, decoded,
-                            sizeof(decoded));
-  std::uint32_t words[4] = {};
-  switch (format) {
-    case EtcFormat::kEtc2Rgb8:
-    case EtcFormat::kEtc2Rgb8A1:
-      bcref::EncodeBc1(decoded, format == EtcFormat::kEtc2Rgb8A1, false, refine,
-                       words);
-      StoreLe(words, 2, out);
-      return;
-    case EtcFormat::kEtc2Rgba8: {
-      int alpha[16];
-      for (int i = 0; i < 16; ++i) {
-        alpha[i] = decoded[i * 4 + 3];
-      }
-      bcref::EncodeBc4(alpha, false, false, words);
-      bcref::EncodeBc1(decoded, false, true, refine, words + 2);
-      StoreLe(words, 4, out);
-      return;
-    }
-    default:
-      break;
-  }
-  const bool is_signed =
-      format == EtcFormat::kEacR11Signed || format == EtcFormat::kEacRg11Signed;
-  const int channels = EtcBlockBytes(format) / 8;
-  for (int channel = 0; channel < channels; ++channel) {
-    int values[16];
-    for (int i = 0; i < 16; ++i) {
-      const std::uint8_t* texel = decoded + (i * channels + channel) * 2;
-      const auto raw = static_cast<std::uint16_t>(texel[0] | (texel[1] << 8));
-      values[i] = is_signed ? static_cast<std::int16_t>(raw) : raw;
-    }
-    bcref::EncodeBc4(values, true, is_signed, words + channel * 2);
-  }
-  StoreLe(words, channels * 2, out);
-}
-
 std::uint64_t Fnv1a(std::uint64_t hash, const std::uint8_t* data,
                     std::size_t size) {
   for (std::size_t i = 0; i < size; ++i) {
@@ -145,8 +103,10 @@ TEST(BcEncoderTest, MatchesTheReferenceOnRandomEtcBlocks) {
       std::vector<std::uint8_t> one_by_one(blocks.size());
       std::vector<std::uint8_t> batched(blocks.size());
       for (std::size_t block = 0; block < kParityBlocks; ++block) {
-        ReferenceTranscode(format, blocks.data() + block * block_bytes, refine,
-                           expected.data() + block * block_bytes);
+        // bc_test's CpuTranscodeBlock: the plus.1 decoder, then the
+        // reference encoder.
+        reference::BcBlockFromEtc(format, blocks.data() + block * block_bytes,
+                                  refine, expected.data() + block * block_bytes);
         TranscodeEtcBlockToBc(format, blocks.data() + block * block_bytes,
                               refine, one_by_one.data() + block * block_bytes);
       }

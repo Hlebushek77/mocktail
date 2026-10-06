@@ -3,19 +3,31 @@
 #include <cstdint>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <string>
+#include <tuple>
 #include <vector>
 
+#include "mocktail/graphics/etc2_decoder.h"
+#include "mocktail/graphics/texture_override.h"
 #include "mocktail/graphics/vulkan_etc2_emulation.h"
+#include "support/bc_reference.h"
+#include "support/bc_reference_transcode.h"
 #include "support/etc2_emulation_harness.h"
+#include "support/etc2_emulation_scenarios.h"
+#include "support/etc2_reference_decoder.h"
 #include "support/fake_vulkan_device.h"
+#include "support/resample_reference.h"
 
-// ETC2->BC mode in the emulation (DESIGN C4.1-C4.3, CR-14, CR-15, CR-22):
-// which devices enter it, the BC host images and views it creates, the
-// images it leaves RGBA8/R16, and the format lists the host sees. Off (the
-// default, MOCKTAIL_ETC2_TO_BC unset or 0) nothing may change. The
-// physical-device queries come from a configurable fake instance next to
-// the GPU-free fake device.
+// ETC2->BC mode in the emulation (DESIGN C4.1-C4.4, CR-14, CR-15, CR-22,
+// CR-24): which devices enter it, the BC host images and views it creates,
+// the images it leaves RGBA8/R16, the format lists the host sees, and every
+// emulation scenario (DESIGN §9.2) end to end on the CPU route, whose BC
+// blocks must equal the references' (the GPU route's shader matches them
+// bit for bit). Off (the default, MOCKTAIL_ETC2_TO_BC unset or 0) nothing
+// may change; vulkan_etc2_emulation_test keeps the default mode's golden
+// texels. The physical-device queries come from a configurable fake
+// instance next to the GPU-free fake device, or from the fake device's own.
 
 namespace mocktail::graphics::testing {
 namespace {
@@ -495,6 +507,107 @@ TEST_F(Etc2BcModeTest, ImagesBcCannotServeStayRgba) {
   EXPECT_TRUE(fake.errors().empty()) << fake.errors().front();
 }
 
+// [CR-14] One submit of a BC device uploads into a BC image and into an
+// image BC cannot hold (storage): the first gets the references' BC blocks,
+// the second the default mode's texels without the x4 upscale, both from
+// one staging chunk.
+TEST_F(Etc2BcModeTest, UploadsFillBcAndFallbackImagesOfOneDevice) {
+  FakeVulkanDevice fake;
+  VulkanEtc2Emulation emulation(Options(true));
+  ::testing::internal::CaptureStderr();
+  ASSERT_TRUE(Register(&emulation, &fake));
+  const VkDevice device = fake.device();
+  const VkQueue queue = fake.GetQueue(0, 0);
+  emulation.RegisterQueue(device, queue, 0, 0);
+  constexpr VkCommandPoolCreateFlags kPoolFlags =
+      VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+  const VkCommandPool pool = fake.CreateCommandPool(0, kPoolFlags);
+  emulation.RegisterCommandPool(device, pool, 0, kPoolFlags);
+  // Two 32x32 ETC2 RGB8 textures: 64 blocks, 512 bytes each.
+  const std::vector<std::uint8_t> bytes = SeededBytes(0xB0C5, 1024);
+  VkBuffer source = VK_NULL_HANDLE;
+  VkDeviceMemory memory = VK_NULL_HANDLE;
+  ASSERT_EQ(fake.CreateBuffer(1024, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &source),
+            VK_SUCCESS);
+  ASSERT_EQ(fake.AllocateMemory(1024, 3, &memory), VK_SUCCESS);
+  ASSERT_EQ(emulation.BindBufferMemory(device, source, memory, 0), VK_SUCCESS);
+  void* data = nullptr;
+  ASSERT_EQ(emulation.MapMemory(device, memory, 0, VK_WHOLE_SIZE, 0, &data),
+            VK_SUCCESS);
+  std::memcpy(data, bytes.data(), bytes.size());
+  VkImageCreateInfo bc_info =
+      ImageInfo(VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK, 32, 32);
+  VkImageCreateInfo storage_info = bc_info;
+  storage_info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+  VkImageCreateInfo host{};
+  const VkImage bc_image = Create(&emulation, &fake, bc_info, &host);
+  EXPECT_EQ(host.format, VK_FORMAT_BC1_RGB_UNORM_BLOCK);
+  const VkImage rgba_image = Create(&emulation, &fake, storage_info, &host);
+  EXPECT_EQ(host.format, VK_FORMAT_R8G8B8A8_UNORM);
+  EXPECT_EQ(host.extent.width, 32U);  // no x4 upscale on a BC device
+  const VkCommandBuffer command_buffer =
+      fake.AllocateCommandBuffer(pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY);
+  emulation.BeginCommandBuffer(command_buffer, pool,
+                               VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
+  fake.BeginCommandBuffer(command_buffer,
+                          VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
+  VkBufferImageCopy region{};
+  region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  region.imageExtent = {32, 32, 1};
+  emulation.CmdCopyBufferToImage(device, command_buffer, source, bc_image,
+                                 VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+  region.bufferOffset = 512;
+  emulation.CmdCopyBufferToImage(device, command_buffer, source, rgba_image,
+                                 VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+  fake.EndCommandBuffer(command_buffer);
+  VkSubmitInfo submit{};
+  submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+  submit.commandBufferCount = 1;
+  submit.pCommandBuffers = &command_buffer;
+  Etc2SubmitPlan plan;
+  emulation.PrepareSubmit(queue, 1, &submit, VK_NULL_HANDLE, &plan);
+  const VkResult result = fake.QueueSubmit(
+      queue, plan.count(1), plan.submits(&submit), plan.fence(VK_NULL_HANDLE));
+  ASSERT_EQ(result, VK_SUCCESS);
+  emulation.FinishSubmit(&plan, result, [&](VkFence fence) {
+    return fake.QueueSubmit(queue, 0, nullptr, fence);
+  });
+
+  const std::vector<std::uint8_t>* bc_blocks =
+      fake.ImageSubresource(bc_image, 0, 0);
+  ASSERT_NE(bc_blocks, nullptr);
+  EXPECT_EQ(*bc_blocks, reference::BcFromEtc(EtcFormat::kEtc2Rgb8,
+                                             bytes.data(), 512, true));
+  std::vector<std::uint8_t> decoded(32 * 32 * 4);
+  reference::DecodeEtcImage(reference::EtcFormat::kEtc2Rgb8,
+                            bytes.data() + 512, 512, 32, 32, decoded.data(),
+                            decoded.size());
+  const std::vector<std::uint8_t>* texels =
+      fake.ImageSubresource(rgba_image, 0, 0);
+  ASSERT_NE(texels, nullptr);
+  EXPECT_EQ(*texels, decoded);
+  const auto recorded = fake.RecordedBufferCopies(command_buffer);
+  ASSERT_EQ(recorded.size(), 2U);
+  EXPECT_EQ(recorded[0].buffer, recorded[1].buffer);
+  EXPECT_EQ(recorded[0].regions[0].bufferOffset, 0U);
+  EXPECT_EQ(recorded[1].regions[0].bufferOffset, 512U);  // BC: 512 bytes
+
+  emulation.ReleaseCommandBuffer(command_buffer);
+  fake.FreeCommandBuffer(command_buffer);
+  fake.DestroyCommandPool(pool);
+  emulation.ForgetCommandPool(device, pool);
+  emulation.DestroyImage(device, bc_image, nullptr);
+  emulation.DestroyImage(device, rgba_image, nullptr);
+  emulation.UnmapMemory(device, memory);
+  emulation.DestroyBuffer(device, source, nullptr);
+  emulation.FreeMemory(device, memory, nullptr);
+  emulation.DestroyDevice(device);
+  const std::string log = ::testing::internal::GetCapturedStderr();
+  EXPECT_EQ(log.find("could not"), std::string::npos) << log;
+  EXPECT_TRUE(fake.errors().empty()) << fake.errors().front();
+  EXPECT_EQ(fake.counts().entry_point_buffers.live(), 0U);
+}
+
 // [CR-15] The host sees the host formats in an image's format list, in
 // both modes, and Roblox's own structs are as they were afterwards.
 TEST_F(Etc2BcModeTest, FormatListsNameTheHostFormats) {
@@ -712,6 +825,251 @@ TEST(Etc2BcFormatTest, FormatListRewriteRestoresEverything) {
   const void* empty = nullptr;
   const Etc2FormatListRewrite none(&empty, true);
   EXPECT_FALSE(none.found());
+}
+
+// ---- every scenario end to end in BC mode ----------------------------------
+
+std::vector<std::string> ScenarioNames() {
+  std::vector<std::string> names;
+  for (const Scenario& scenario : Etc2EmulationScenarios()) {
+    names.push_back(scenario.name);
+  }
+  return names;
+}
+
+// Every fake-device error must be one the scenario expects in BC mode, and
+// each expected one must still happen.
+void ExpectOnlyBcModeErrors(const FakeVulkanDevice& fake,
+                            const Scenario& scenario) {
+  std::vector<std::string> allowed = scenario.allowed_fake_errors;
+  allowed.insert(allowed.end(), scenario.bc_mode_fake_errors.begin(),
+                 scenario.bc_mode_fake_errors.end());
+  std::vector<bool> seen(allowed.size(), false);
+  for (const std::string& error : fake.errors()) {
+    bool known = false;
+    for (std::size_t index = 0; index < allowed.size(); ++index) {
+      if (error.find(allowed[index]) != std::string::npos) {
+        known = true;
+        seen[index] = true;
+      }
+    }
+    if (!known) {
+      ADD_FAILURE() << "fake device: " << error;
+    }
+  }
+  for (std::size_t index = 0; index < seen.size(); ++index) {
+    EXPECT_TRUE(seen[index])
+        << "expected fake-device error no longer happens: " << allowed[index];
+  }
+}
+
+void ExpectEverythingReleased(const FakeVulkanDevice& fake) {
+  const FakeVulkanDevice::Counts& counts = fake.counts();
+  EXPECT_EQ(counts.entry_point_buffers.live(), 0U);
+  EXPECT_EQ(counts.entry_point_memory.live(), 0U);
+  EXPECT_EQ(counts.buffers.live(), 0U);
+  EXPECT_EQ(counts.memory.live(), 0U);
+  EXPECT_EQ(counts.images.live(), 0U);
+  EXPECT_EQ(counts.command_pools.live(), 0U);
+  EXPECT_EQ(counts.command_buffers.live(), 0U);
+  EXPECT_EQ(counts.live_mappings, 0U);
+}
+
+const char* TeardownName(ScenarioTeardown teardown) {
+  switch (teardown) {
+    case ScenarioTeardown::kOrderly:
+      return "Orderly";
+    case ScenarioTeardown::kResetPool:
+      return "ResetPool";
+    case ScenarioTeardown::kDestroyPool:
+      return "DestroyPool";
+    case ScenarioTeardown::kDestroyDeviceFirst:
+      return "DestroyDeviceFirst";
+  }
+  return "?";
+}
+
+// Every scenario with MOCKTAIL_ETC2_TO_BC=1 on the fake device (BC, no
+// ETC2), on the fast path and the legacy one, with every teardown: the
+// host images are BC images of the app's extent (BC mode never upscales,
+// so the upscale scenarios run as plain uploads), their blocks equal the
+// references', every copy and blit is what the model expects, and the
+// emulation gives back everything it made.
+class Etc2BcScenarioTest
+    : public ::testing::TestWithParam<
+          std::tuple<std::string, bool, ScenarioTeardown>> {};
+
+TEST_P(Etc2BcScenarioTest, MatchesModelAndGolden) {
+  const auto& [name, fast_path, teardown] = GetParam();
+  const Scenario* scenario = FindEtc2EmulationScenario(name);
+  ASSERT_NE(scenario, nullptr);
+  FakeVulkanDevice fake;
+  FakeEmulationBackend backend(&fake);
+  ScenarioOptions options;
+  options.emulation.to_bc = true;
+  options.emulation.fast_path = fast_path;
+  options.teardown = teardown;
+  if (teardown == ScenarioTeardown::kOrderly) {
+    options.fake = &fake;  // the image copies and blits too
+  }
+  ::testing::internal::CaptureStderr();
+  const ScenarioRun run = RunEtc2Scenario(*scenario, &backend, options);
+  const std::string log = ::testing::internal::GetCapturedStderr();
+  ASSERT_FALSE(run.skipped) << run.skip_reason;
+  for (const std::string& failure : run.failures) {
+    ADD_FAILURE() << failure;
+  }
+  ExpectOnlyBcModeErrors(fake, *scenario);
+  ExpectEverythingReleased(fake);
+  EXPECT_EQ(CountLines(log, scenario->emulated ? kBcLine : kRgbaLine),
+            scenario->emulated ? 1 : 0)
+      << log;
+  EXPECT_EQ(log.find("could not encode"), std::string::npos) << log;
+  std::uint64_t golden = 0;
+  const bool has_golden = FindEtc2BcEmulationGolden(name, &golden);
+  if (!scenario->bc_mode_fake_errors.empty()) {
+    EXPECT_FALSE(has_golden) << "invalid copies have no golden";
+  } else if (!has_golden) {
+    ADD_FAILURE() << "no BC golden hash for " << name << "; this run gives "
+                  << GoldenLine(name, run.hash);
+  } else {
+    EXPECT_EQ(run.hash, golden)
+        << "the BC blocks of " << name << " changed from "
+        << "tests/vulkan_etc2_bc_golden.inc; this run gives "
+        << GoldenLine(name, run.hash);
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    Scenarios, Etc2BcScenarioTest,
+    ::testing::Combine(::testing::ValuesIn(ScenarioNames()), ::testing::Bool(),
+                       ::testing::Values(ScenarioTeardown::kOrderly,
+                                         ScenarioTeardown::kResetPool,
+                                         ScenarioTeardown::kDestroyPool,
+                                         ScenarioTeardown::kDestroyDeviceFirst)),
+    [](const ::testing::TestParamInfo<
+        std::tuple<std::string, bool, ScenarioTeardown>>& info) {
+      return std::get<0>(info.param) +
+             (std::get<1>(info.param) ? "_Fast_" : "_Legacy_") +
+             TeardownName(std::get<2>(info.param));
+    });
+
+TEST(Etc2BcScenarioListTest, EveryScenarioValidInBcModeHasABcGolden) {
+  for (const Scenario& scenario : Etc2EmulationScenarios()) {
+    std::uint64_t hash = 0;
+    EXPECT_EQ(FindEtc2BcEmulationGolden(scenario.name, &hash),
+              scenario.bc_mode_fake_errors.empty())
+        << scenario.name;
+  }
+}
+
+// Without MOCKTAIL_ETC2_TO_BC the same runner keeps the default mode's
+// texels, on a fake device that could do BC.
+TEST(Etc2BcScenarioListTest, OffKeepsTheDefaultGoldens) {
+  for (const Scenario& scenario : Etc2EmulationScenarios()) {
+    SCOPED_TRACE(scenario.name);
+    FakeVulkanDevice fake;
+    FakeEmulationBackend backend(&fake);
+    ScenarioOptions options;
+    options.emulation.to_bc = false;
+    ::testing::internal::CaptureStderr();
+    const ScenarioRun run = RunEtc2Scenario(scenario, &backend, options);
+    const std::string log = ::testing::internal::GetCapturedStderr();
+    ASSERT_FALSE(run.skipped);
+    EXPECT_TRUE(run.failures.empty()) << run.failures.front();
+    std::uint64_t golden = 0;
+    ASSERT_TRUE(FindEtc2EmulationGolden(scenario.name, &golden));
+    EXPECT_EQ(run.hash, golden);
+    EXPECT_EQ(log.find("ETC2->BC"), std::string::npos) << log;
+    EXPECT_EQ(fake.calls("vkGetPhysicalDeviceFeatures"), 0U);
+    EXPECT_EQ(fake.calls("vkGetPhysicalDeviceImageFormatProperties"), 0U);
+  }
+}
+
+// [CR-24] An override PNG on an RGB8A1 image: BC1's punch-through is
+// binary, so texels whose override alpha is below 128 become transparent
+// black and the rest opaque (RGBA8 hosts keep the PNG's alpha).
+TEST(Etc2BcOverrideTest, Rgb8A1OverridesArePunchedThroughAtAlpha128) {
+  constexpr std::uint32_t kSize = 32;
+  constexpr std::uint64_t kSeed = 0xA1FA;
+  Scenario scenario;
+  scenario.name = "Rgb8A1Override";
+  scenario.overrides = true;
+  scenario.images = {{VK_FORMAT_ETC2_R8G8B8A1_UNORM_BLOCK, kSize, kSize, 2, 1}};
+  VkBufferImageCopy mip0{};
+  mip0.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  mip0.imageExtent = {kSize, kSize, 1};
+  VkBufferImageCopy mip1 = mip0;
+  mip1.bufferOffset = (kSize / 4) * (kSize / 4) * 8;
+  mip1.imageSubresource.mipLevel = 1;
+  mip1.imageExtent = {kSize / 2, kSize / 2, 1};
+  scenario.sources = {
+      {0x5EED, mip1.bufferOffset + (kSize / 8) * (kSize / 8) * 8, true, 0, 0}};
+  scenario.command_buffers = {{false}};
+  ScenarioStep override_step;
+  override_step.kind = ScenarioStep::Kind::kWriteOverride;
+  override_step.regions = {mip0};
+  override_step.override_width = 24;  // resampled to 32 and 16
+  override_step.override_height = 40;
+  override_step.seed = kSeed;
+  ScenarioStep copy;
+  copy.kind = ScenarioStep::Kind::kCopyBufferToImage;
+  copy.regions = {mip0, mip1};
+  ScenarioStep submit;
+  submit.kind = ScenarioStep::Kind::kSubmit;
+  submit.batches = {{0}};
+  scenario.steps = {override_step, copy, submit};
+  for (const bool fast_path : {true, false}) {
+    SCOPED_TRACE(fast_path ? "fast path" : "legacy path");
+    FakeVulkanDevice fake;
+    FakeEmulationBackend backend(&fake);
+    ScenarioOptions options;
+    options.emulation.to_bc = true;
+    options.emulation.fast_path = fast_path;
+    ::testing::internal::CaptureStderr();
+    const ScenarioRun run = RunEtc2Scenario(scenario, &backend, options);
+    const std::string log = ::testing::internal::GetCapturedStderr();
+    ASSERT_FALSE(run.skipped) << run.skip_reason;
+    for (const std::string& failure : run.failures) {
+      ADD_FAILURE() << failure;
+    }
+    EXPECT_NE(log.find("texture override loaded"), std::string::npos) << log;
+    EXPECT_TRUE(fake.errors().empty()) << fake.errors().front();
+  }
+  // The emulation's blocks equal the reference encoding of the resampled
+  // override (checked above against the model); what those blocks decode
+  // to, by D3D10 rules:
+  const std::vector<std::uint8_t> png = SeededBytes(kSeed, 24 * 40 * 4);
+  for (const std::uint32_t size : {kSize, kSize / 2}) {
+    std::vector<std::uint8_t> texels(static_cast<std::size_t>(size) * size * 4);
+    reference::ResampleRgba(png.data(), 24, 40, size, size, texels.data());
+    const std::vector<std::uint8_t> blocks = reference::BcFromTexels(
+        EtcFormat::kEtc2Rgb8A1, texels.data(), size, size, 1, true);
+    int transparent = 0;
+    for (std::uint32_t block = 0; block < blocks.size() / 8; ++block) {
+      std::uint32_t words[2];
+      std::memcpy(words, blocks.data() + block * 8, 8);
+      std::uint8_t decoded[64];
+      bcref::DecodeBc1(words, false, decoded);
+      const std::uint32_t bx = block % (size / 4);
+      const std::uint32_t by = block / (size / 4);
+      for (std::uint32_t texel = 0; texel < 16; ++texel) {
+        const std::uint8_t* original =
+            texels.data() +
+            ((by * 4 + texel / 4) * size + bx * 4 + texel % 4) * 4;
+        const std::uint8_t* out = decoded + texel * 4;
+        if (original[3] < 128) {
+          ++transparent;
+          EXPECT_EQ(out[0] | out[1] | out[2] | out[3], 0)
+              << "block " << block << " texel " << texel;
+        } else {
+          EXPECT_EQ(out[3], 255) << "block " << block << " texel " << texel;
+        }
+      }
+    }
+    EXPECT_GT(transparent, 0);
+    EXPECT_LT(transparent, static_cast<int>(size * size));
+  }
 }
 
 }  // namespace

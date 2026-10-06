@@ -119,6 +119,9 @@ class FakeEmulationBackend final : public EmulationBackend {
   VkPhysicalDeviceMemoryProperties memory_properties() const override;
   std::vector<VkQueueFamilyProperties> queue_families() const override;
   PFN_vkGetDeviceProcAddr get_device_proc_addr() const override;
+  // The fake's physical device: BC, no ETC2 (FakeVulkanDevice::Config).
+  PFN_vkGetInstanceProcAddr get_instance_proc_addr() const override;
+  VkInstance instance() const override;
   std::string Unsupported(const Scenario& scenario) const override;
   VkQueue Queue(std::uint32_t family) override;
   bool CreateSource(VkDeviceSize size, VkDeviceSize bind_offset,
@@ -175,7 +178,9 @@ enum class ScenarioTeardown {
 
 // The options the runner gives the emulation unless told otherwise: the
 // CPU route (gpu = false), no diagnostics. `upscale` always comes from the
-// scenario.
+// scenario. With `to_bc` (ETC2->BC mode) the runner decides BC first, as
+// vkCreateDevice does, skips the scenario when the device cannot have it,
+// and checks the images against the model's BC mode.
 Etc2EmulationOptions CpuRouteOptions();
 
 struct ScenarioOptions {

@@ -2578,6 +2578,109 @@ FakeGetDeviceProcAddr(VkDevice device, const char* name) {
   return nullptr;
 }
 
+// ---- the physical device ----------------------------------------------------
+
+bool IsCompressed(VkFormat format) {
+  FormatBlock block;
+  return LookupFormatBlock(format, &block) && block.width > 1;
+}
+
+bool IsBcFormat(VkFormat format) {
+  return format >= VK_FORMAT_BC1_RGB_UNORM_BLOCK &&
+         format <= VK_FORMAT_BC7_SRGB_BLOCK;
+}
+
+// What an RTX 3060 reports (vkformats.txt): block-compressed formats can be
+// sampled, filtered, blitted from and copied; uncompressed ones also
+// rendered to, stored to and blitted into.
+VkFormatFeatureFlags OptimalFeatures(const FakeVulkanDevice::Config& config,
+                                     VkFormat format) {
+  constexpr VkFormatFeatureFlags kCompressed =
+      VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+      VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+      VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
+      VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+  if (!LookupFormatBlock(format, nullptr)) {
+    return 0;
+  }
+  if (!IsCompressed(format)) {
+    return kCompressed | VK_FORMAT_FEATURE_BLIT_DST_BIT |
+           VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
+           VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
+  }
+  const bool supported = IsBcFormat(format) ? config.texture_compression_bc
+                                            : config.texture_compression_etc2;
+  return supported ? kCompressed : 0;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+FakeGetPhysicalDeviceFeatures(VkPhysicalDevice physical_device,
+                              VkPhysicalDeviceFeatures* features) {
+  *features = VkPhysicalDeviceFeatures{};
+  FAKE_ENTER(physical_device, "vkGetPhysicalDeviceFeatures", );
+  features->textureCompressionETC2 =
+      impl->config.texture_compression_etc2 ? VK_TRUE : VK_FALSE;
+  features->textureCompressionBC =
+      impl->config.texture_compression_bc ? VK_TRUE : VK_FALSE;
+}
+
+VKAPI_ATTR void VKAPI_CALL FakeGetPhysicalDeviceFormatProperties(
+    VkPhysicalDevice physical_device, VkFormat format,
+    VkFormatProperties* properties) {
+  *properties = VkFormatProperties{};
+  FAKE_ENTER(physical_device, "vkGetPhysicalDeviceFormatProperties", );
+  properties->optimalTilingFeatures = OptimalFeatures(impl->config, format);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL FakeGetPhysicalDeviceImageFormatProperties(
+    VkPhysicalDevice physical_device, VkFormat format, VkImageType type,
+    VkImageTiling tiling, VkImageUsageFlags usage, VkImageCreateFlags flags,
+    VkImageFormatProperties* properties) {
+  *properties = VkImageFormatProperties{};
+  FAKE_ENTER(physical_device, "vkGetPhysicalDeviceImageFormatProperties",
+             VK_ERROR_INITIALIZATION_FAILED);
+  // Block-compressed images are only sampled and copied.
+  constexpr VkImageUsageFlags kCompressedUsage =
+      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+      VK_IMAGE_USAGE_SAMPLED_BIT;
+  constexpr VkImageCreateFlags kCompressedFlags =
+      VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT |
+      VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT |
+      VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT;
+  if (OptimalFeatures(impl->config, format) == 0 ||
+      type != VK_IMAGE_TYPE_2D || tiling != VK_IMAGE_TILING_OPTIMAL ||
+      (IsCompressed(format) && ((usage & ~kCompressedUsage) != 0 ||
+                                (flags & ~kCompressedFlags) != 0))) {
+    return VK_ERROR_FORMAT_NOT_SUPPORTED;
+  }
+  properties->maxExtent = {32768, 32768, 1};
+  properties->maxMipLevels = 16;
+  properties->maxArrayLayers = 2048;
+  properties->sampleCounts = VK_SAMPLE_COUNT_1_BIT;
+  properties->maxResourceSize = 1ULL << 40;
+  return VK_SUCCESS;
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
+FakeGetInstanceProcAddr(VkInstance, const char* name) {
+  const ProcEntry kInstanceProcs[] = {
+      {"vkGetPhysicalDeviceFeatures",
+       reinterpret_cast<PFN_vkVoidFunction>(&FakeGetPhysicalDeviceFeatures)},
+      {"vkGetPhysicalDeviceFormatProperties",
+       reinterpret_cast<PFN_vkVoidFunction>(
+           &FakeGetPhysicalDeviceFormatProperties)},
+      {"vkGetPhysicalDeviceImageFormatProperties",
+       reinterpret_cast<PFN_vkVoidFunction>(
+           &FakeGetPhysicalDeviceImageFormatProperties)},
+  };
+  for (const ProcEntry& entry : kInstanceProcs) {
+    if (name != nullptr && std::strcmp(entry.name, name) == 0) {
+      return entry.function;
+    }
+  }
+  return nullptr;
+}
+
 }  // namespace
 
 VkCommandBuffer FakeVulkanDevice::Impl::Allocate(VkCommandPool pool,
@@ -2650,6 +2753,7 @@ VKAPI_ATTR void VKAPI_CALL FakeGetDeviceQueue(VkDevice device,
 FakeVulkanDevice::FakeVulkanDevice(Config config)
     : impl_(std::make_unique<Impl>(std::move(config))) {
   Register(impl_->device, impl_.get());
+  Register(impl_->physical_device, impl_.get());
 }
 
 FakeVulkanDevice::~FakeVulkanDevice() {
@@ -2660,6 +2764,7 @@ FakeVulkanDevice::~FakeVulkanDevice() {
   for (const auto& [key, queue] : impl_->queues) {
     Unregister(queue);
   }
+  Unregister(impl_->physical_device);
   Unregister(impl_->device);
 }
 
@@ -2675,6 +2780,14 @@ const FakeVulkanDevice::Config& FakeVulkanDevice::config() const {
 
 PFN_vkGetDeviceProcAddr FakeVulkanDevice::GetDeviceProcAddr() {
   return &FakeGetDeviceProcAddr;
+}
+
+PFN_vkGetInstanceProcAddr FakeVulkanDevice::GetInstanceProcAddr() {
+  return &FakeGetInstanceProcAddr;
+}
+
+VkInstance FakeVulkanDevice::instance() {
+  return reinterpret_cast<VkInstance>(std::uintptr_t{0x1A57A});
 }
 
 VkResult FakeVulkanDevice::CreateBuffer(VkDeviceSize size,
