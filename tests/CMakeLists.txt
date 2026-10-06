@@ -690,6 +690,7 @@ add_executable(vulkan_etc2_diagnostics_test
   ${PROJECT_SOURCE_DIR}/src/graphics/etc2_decoder.cc
   ${PROJECT_SOURCE_DIR}/src/graphics/texture_override.cc
   ${PROJECT_SOURCE_DIR}/src/graphics/worker_pool.cc
+  ${PROJECT_SOURCE_DIR}/src/graphics/mapped_memory_copy.cc
 )
 target_include_directories(vulkan_etc2_diagnostics_test PRIVATE
   ${PROJECT_SOURCE_DIR}/include
@@ -714,6 +715,7 @@ add_library(mocktail_etc2_emulation_for_tests STATIC
   ${PROJECT_SOURCE_DIR}/src/graphics/etc2_decoder.cc
   ${PROJECT_SOURCE_DIR}/src/graphics/texture_override.cc
   ${PROJECT_SOURCE_DIR}/src/graphics/worker_pool.cc
+  ${PROJECT_SOURCE_DIR}/src/graphics/mapped_memory_copy.cc
 )
 target_include_directories(mocktail_etc2_emulation_for_tests PUBLIC
   ${PROJECT_SOURCE_DIR}/include
@@ -781,13 +783,21 @@ target_link_libraries(etc2_emulation_gpu_test PRIVATE
 )
 mocktail_apply_compile_options(etc2_emulation_gpu_test)
 
-# ETC2 CPU fast path (plus.2 WP1): the persistent worker pool.
+# ETC2 CPU fast path (plus.2 WP1): the persistent worker pool, and the
+# streaming copy out of mapped memory.
 add_executable(worker_pool_test worker_pool_test.cc)
 target_link_libraries(worker_pool_test PRIVATE
   mocktail_etc2_emulation_for_tests
   GTest::gtest_main
 )
 mocktail_apply_compile_options(worker_pool_test)
+
+add_executable(mapped_memory_copy_test mapped_memory_copy_test.cc)
+target_link_libraries(mapped_memory_copy_test PRIVATE
+  mocktail_etc2_emulation_for_tests
+  GTest::gtest_main
+)
+mocktail_apply_compile_options(mapped_memory_copy_test)
 
 add_executable(video_driver_policy_test
   video_driver_policy_test.cc
@@ -1337,6 +1347,7 @@ gtest_discover_tests(resample_rgba_test)
 gtest_discover_tests(vulkan_etc2_planning_test)
 gtest_discover_tests(vulkan_etc2_emulation_test)
 gtest_discover_tests(worker_pool_test)
+gtest_discover_tests(mapped_memory_copy_test)
 # Real GPU: skipped without a loader, driver or device, and while a live game
 # runs (CR-25). Hold these back with -LE gpu while a live measurement runs.
 gtest_discover_tests(etc2_emulation_gpu_test PROPERTIES LABELS gpu)
