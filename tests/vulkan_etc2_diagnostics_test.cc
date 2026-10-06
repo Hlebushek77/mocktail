@@ -3,18 +3,26 @@
 
 #include "mocktail/graphics/vulkan_etc2_emulation.h"
 
+#include <stdlib.h>
+#include <unistd.h>
+
 #include <gtest/gtest.h>
 
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <map>
 #include <set>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "mocktail/graphics/etc2_decoder.h"
+#include "mocktail/graphics/texture_override.h"
 
 namespace mocktail::graphics {
 namespace {
@@ -724,6 +732,72 @@ TEST_F(Etc2DiagnosticsTest, ANativeEtc2DeviceIsLeftAlone) {
   EXPECT_EQ(fake_.copies[0].source, source);
   emulation.DestroyDevice(device_);
   EXPECT_EQ(testing::internal::GetCapturedStderr(), "");
+}
+
+std::string ReadFile(const std::string& path) {
+  std::ifstream file(path, std::ios::binary);
+  std::stringstream text;
+  text << file.rdbuf();
+  return text.str();
+}
+
+TEST_F(Etc2DiagnosticsTest, TracesEveryUploadAndKeepsDistinctBlocks) {
+  const char* temporary = std::getenv("TMPDIR");
+  std::string pattern = std::string(temporary != nullptr && temporary[0] != '\0'
+                                        ? temporary
+                                        : "/tmp") +
+                        "/etc2-trace-XXXXXX";
+  ASSERT_NE(mkdtemp(pattern.data()), nullptr);
+  const std::string directory = pattern;
+  testing::internal::CaptureStderr();
+  {
+    Etc2EmulationOptions options = Options(false);
+    options.trace_path = directory + "/trace.csv";
+    options.trace_blocks_dir = directory + "/blocks";
+    VulkanEtc2Emulation emulation(options);
+    Register(&emulation);
+    const VkImage image = CreateEtc2Image(&emulation);
+    const VkBuffer source = CreateSource(&emulation, 3);
+    Copy(&emulation, command_buffer_, source, image);
+    Copy(&emulation, command_buffer_, source, image);
+    Submit(&emulation, {command_buffer_});
+    emulation.DestroyDevice(device_);
+  }
+  const std::string log = testing::internal::GetCapturedStderr();
+  EXPECT_NE(log.find("ETC2 upload trace: " + directory + "/trace.csv"),
+            std::string::npos)
+      << log;
+
+  const std::string hash = HashName(HashBytes(kBlock, sizeof(kBlock)));
+  std::istringstream trace(ReadFile(directory + "/trace.csv"));
+  std::vector<std::string> lines;
+  for (std::string line; std::getline(trace, line);) {
+    lines.push_back(line);
+  }
+  ASSERT_EQ(lines.size(), 3U);
+  EXPECT_EQ(lines[0],
+            "t_ns,submit,record_call,image,vkformat,w,h,mip,layers,scale,"
+            "row_length,image_height,offset,bytes,src_mem_type,route,hash64");
+  for (std::size_t index = 1; index < 3; ++index) {
+    const std::string& line = lines[index];
+    const std::size_t image = line.find(",0x");
+    ASSERT_NE(image, std::string::npos) << line;
+    EXPECT_EQ(line.substr(line.find(',') + 1, image - line.find(',') - 1),
+              "1," + std::to_string(index));
+    EXPECT_EQ(line.substr(line.find(',', image + 1)),
+              ",147,4,4,0,1,1,0,0,0:0,8,3,cpu," + hash);
+  }
+
+  EXPECT_EQ(ReadFile(directory + "/blocks/etc2_blocks.bin"),
+            std::string(reinterpret_cast<const char*>(kBlock), 8));
+  EXPECT_EQ(ReadFile(directory + "/blocks/etc2_blocks.csv"),
+            "offset,bytes,vkformat,w,h,mip,layers,hash64\n0,8,147,4,4,0,1," +
+                hash + "\n");
+  std::remove((directory + "/trace.csv").c_str());
+  std::remove((directory + "/blocks/etc2_blocks.bin").c_str());
+  std::remove((directory + "/blocks/etc2_blocks.csv").c_str());
+  rmdir((directory + "/blocks").c_str());
+  rmdir(directory.c_str());
 }
 
 }  // namespace

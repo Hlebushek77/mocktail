@@ -63,6 +63,7 @@ struct Etc2PendingUpload {
   Etc2Route route = Etc2Route::kCpu;
   std::uint32_t pool_family = kEtc2UnknownQueueFamily;
   // Roblox's region as given, for the upload trace.
+  VkFormat app_format = VK_FORMAT_UNDEFINED;
   std::uint32_t row_length = 0;
   std::uint32_t image_height = 0;
   std::int32_t offset_x = 0;

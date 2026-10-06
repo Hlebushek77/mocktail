@@ -1,6 +1,7 @@
 #include "mocktail/graphics/vulkan_etc2_emulation.h"
 
 #include <pthread.h>
+#include <sys/stat.h>
 
 #include "mocktail/graphics/chunk_arena.h"
 #include "mocktail/graphics/etc2_decode_totals.h"
@@ -22,6 +23,7 @@
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -550,7 +552,16 @@ std::string QuotedThreadName() {
 
 struct VulkanEtc2Emulation::State {
   explicit State(Etc2EmulationOptions emulation_options)
-      : options(std::move(emulation_options)) {}
+      : options(std::move(emulation_options)) {
+    OpenTraces();
+  }
+  ~State() {
+    for (std::FILE* file : {trace, blocks, blocks_index}) {
+      if (file != nullptr) {
+        std::fclose(file);
+      }
+    }
+  }
 
   const Etc2EmulationOptions options;
   std::mutex mutex;
@@ -577,9 +588,123 @@ struct VulkanEtc2Emulation::State {
   Etc2DecodeTotals totals;
   Etc2DecodeTotals window;
   Clock::time_point window_start{};
+  // MOCKTAIL_ETC2_TRACE: one CSV line per decoded upload.
+  // MOCKTAIL_ETC2_TRACE_BLOCKS: up to kTraceBlocksBytes of distinct
+  // compressed uploads with an index, a corpus for offline tests.
+  static constexpr std::uint64_t kTraceBlocksBytes = 64ULL << 20;
+  std::mutex trace_mutex;
+  std::FILE* trace = nullptr;
+  std::FILE* blocks = nullptr;
+  std::FILE* blocks_index = nullptr;
+  std::uint64_t blocks_bytes = 0;
+  bool blocks_full_logged = false;
+  std::unordered_set<std::uint64_t> blocks_saved;
+  std::uint64_t submit_sequence = 0;
+  std::atomic<std::uint64_t> record_sequence{0};
   std::set<std::thread::id> submit_thread_ids;
   std::set<std::string> submit_threads;
   std::vector<std::string> new_submit_threads;
+
+  bool Tracing() const { return trace != nullptr || blocks != nullptr; }
+  // Memory types are only looked up for the diagnostics and the trace.
+  bool TrackMemory() const { return options.frame_stats || Tracing(); }
+
+  void OpenTraces() {
+    if (!options.trace_path.empty()) {
+      trace = std::fopen(options.trace_path.c_str(), "w");
+      if (trace == nullptr) {
+        std::fprintf(stderr, "  [vulkan] ETC2 upload trace: cannot write %s\n",
+                     options.trace_path.c_str());
+      } else {
+        std::fprintf(trace,
+                     "t_ns,submit,record_call,image,vkformat,w,h,mip,layers,"
+                     "scale,row_length,image_height,offset,bytes,"
+                     "src_mem_type,route,hash64\n");
+        std::fprintf(stderr, "  [vulkan] ETC2 upload trace: %s\n",
+                     options.trace_path.c_str());
+      }
+    }
+    if (!options.trace_blocks_dir.empty()) {
+      ::mkdir(options.trace_blocks_dir.c_str(), 0700);
+      const std::string base = options.trace_blocks_dir + "/etc2_blocks";
+      blocks = std::fopen((base + ".bin").c_str(), "wb");
+      blocks_index = blocks != nullptr
+                         ? std::fopen((base + ".csv").c_str(), "w")
+                         : nullptr;
+      if (blocks_index == nullptr) {
+        if (blocks != nullptr) {
+          std::fclose(blocks);
+          blocks = nullptr;
+        }
+        std::fprintf(stderr, "  [vulkan] ETC2 block trace: cannot write %s\n",
+                     options.trace_blocks_dir.c_str());
+      } else {
+        std::fprintf(blocks_index,
+                     "offset,bytes,vkformat,w,h,mip,layers,hash64\n");
+        std::fprintf(stderr, "  [vulkan] ETC2 block trace: %s.{bin,csv}\n",
+                     base.c_str());
+      }
+    }
+  }
+
+  // Writes the trace lines of one submit's uploads; `compressed` holds
+  // their source bytes packed, in order. Returns the time it took.
+  std::uint64_t TraceUploads(const std::vector<const PendingUpload*>& uploads,
+                             const std::vector<std::uint32_t>& memory_types,
+                             const std::uint8_t* compressed) {
+    const Clock::time_point start = Clock::now();
+    std::lock_guard<std::mutex> lock(trace_mutex);
+    const std::uint64_t submit = ++submit_sequence;
+    const auto now_ns = static_cast<unsigned long long>(
+        Nanoseconds(start.time_since_epoch()));
+    for (std::size_t index = 0; index < uploads.size(); ++index) {
+      const PendingUpload& upload = *uploads[index];
+      const std::uint64_t hash = HashBytes(compressed, upload.compressed);
+      if (trace != nullptr) {
+        std::fprintf(
+            trace,
+            "%llu,%llu,%llu,0x%llx,%d,%u,%u,%u,%u,%u,%u,%u,%d:%d,%llu,%d,%s,"
+            "%016llx\n",
+            now_ns, static_cast<unsigned long long>(submit),
+            static_cast<unsigned long long>(upload.record_call),
+            static_cast<unsigned long long>(
+                reinterpret_cast<std::uintptr_t>(upload.image)),
+            static_cast<int>(upload.app_format), upload.width, upload.height,
+            upload.mip_level, upload.layers, upload.scale, upload.row_length,
+            upload.image_height, upload.offset_x, upload.offset_y,
+            static_cast<unsigned long long>(upload.compressed),
+            memory_types[index] == UINT32_MAX
+                ? -1
+                : static_cast<int>(memory_types[index]),
+            upload.route == Etc2Route::kGpu ? "gpu" : "cpu",
+            static_cast<unsigned long long>(hash));
+      }
+      if (blocks != nullptr && blocks_saved.count(hash) == 0) {
+        if (blocks_bytes + upload.compressed <= kTraceBlocksBytes) {
+          blocks_saved.insert(hash);
+          std::fwrite(compressed, 1, upload.compressed, blocks);
+          std::fprintf(blocks_index, "%llu,%llu,%d,%u,%u,%u,%u,%016llx\n",
+                       static_cast<unsigned long long>(blocks_bytes),
+                       static_cast<unsigned long long>(upload.compressed),
+                       static_cast<int>(upload.app_format), upload.width,
+                       upload.height, upload.mip_level, upload.layers,
+                       static_cast<unsigned long long>(hash));
+          blocks_bytes += upload.compressed;
+        } else if (!blocks_full_logged) {
+          blocks_full_logged = true;
+          std::fprintf(stderr, "  [vulkan] ETC2 block trace is full (%llu MiB)\n",
+                       static_cast<unsigned long long>(kTraceBlocksBytes >> 20));
+        }
+      }
+      compressed += upload.compressed;
+    }
+    for (std::FILE* file : {trace, blocks, blocks_index}) {
+      if (file != nullptr) {
+        std::fflush(file);
+      }
+    }
+    return Nanoseconds(Clock::now() - start);
+  }
 
   // Applies `update` to the session totals and to the current window.
   template <typename Update>
@@ -808,10 +933,15 @@ struct VulkanEtc2Emulation::State {
       return result;
     }
     result.staging_allocated = true;
+    const std::uint64_t record_call =
+        Tracing() ? record_sequence.fetch_add(1, std::memory_order_relaxed) + 1
+                  : 0;
     for (PendingUpload& upload : uploads) {
       upload.target = mapped + upload.target_offset;
       upload.route = Etc2Route::kCpu;
       upload.pool_family = target.pool_family;
+      upload.app_format = target.image.app_format;
+      upload.record_call = record_call;
     }
     result.first_upload =
         Record(command_buffer, dev.device, destination, std::move(uploads),
@@ -1497,7 +1627,7 @@ void VulkanEtc2Emulation::NoteAllocateMemory(VkDevice device,
                                              std::uint32_t type_index,
                                              VkDeviceSize size) {
   static_cast<void>(size);
-  if (!state_->options.frame_stats || memory == VK_NULL_HANDLE) {
+  if (!state_->TrackMemory() || memory == VK_NULL_HANDLE) {
     return;
   }
   std::lock_guard<std::mutex> lock(state_->mutex);
@@ -1896,7 +2026,7 @@ std::uint32_t VulkanEtc2Emulation::State::RunCpuUploads(
     std::uint8_t* source = nullptr;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkDeviceSize memory_offset = 0;
-    std::uint32_t memory_type = UINT32_MAX;  // MOCKTAIL_FRAME_STATS=1 only
+    std::uint32_t memory_type = UINT32_MAX;  // diagnostics and trace only
   };
   std::vector<Work> work;
   {
@@ -1914,7 +2044,7 @@ std::uint32_t VulkanEtc2Emulation::State::RunCpuUploads(
         }
         Work item;
         item.upload = upload;
-        if (options.frame_stats) {
+        if (TrackMemory()) {
           const auto memory = memories.find(binding->second.memory);
           if (memory != memories.end()) {
             item.memory_type = memory->second.type;
@@ -1999,6 +2129,7 @@ std::uint32_t VulkanEtc2Emulation::State::RunCpuUploads(
   const auto decode_start = Clock::now();
   std::vector<Copy> copies;
   std::vector<const PendingUpload*> copied_uploads;
+  std::vector<std::uint32_t> copied_types;
   VkDeviceSize compressed_total = 0;
   VkDeviceSize decoded_total = 0;
   for (const Work& item : work) {
@@ -2025,6 +2156,7 @@ std::uint32_t VulkanEtc2Emulation::State::RunCpuUploads(
     }
     copies.push_back({source, upload.compressed, upload.decoded});
     copied_uploads.push_back(&upload);
+    copied_types.push_back(item.memory_type);
     compressed_total += upload.compressed;
     decoded_total += upload.decoded;
   }
@@ -2106,12 +2238,17 @@ std::uint32_t VulkanEtc2Emulation::State::RunCpuUploads(
     host_total += upload->target_bytes;
   }
   const auto emit_end = Clock::now();
+  const std::uint64_t trace_ns =
+      Tracing() && !copied_uploads.empty()
+          ? TraceUploads(copied_uploads, copied_types, scratch_source.data())
+          : 0;
   ReleaseOversizedEtc2Scratch(&scratch_source);
   ReleaseOversizedEtc2Scratch(&scratch_decoded);
   if (copied_uploads.empty()) {
     return 0;
   }
-  const std::uint64_t decode_ns = Nanoseconds(Clock::now() - decode_start);
+  const std::uint64_t decode_ns =
+      Nanoseconds(Clock::now() - decode_start) - trace_ns;
   // MOCKTAIL_FRAME_STATS=1: name each submit that held the render thread.
   if (options.frame_stats && decode_ns >= 20000000ULL) {
     std::fprintf(stderr,
