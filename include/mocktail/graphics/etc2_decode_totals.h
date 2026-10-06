@@ -80,7 +80,8 @@ struct Etc2DecodeTotals {
 
   // Step-0 diagnostics: how Roblox uploads (DESIGN C0.4).
   std::uint64_t images_destroyed = 0;
-  std::uint64_t bc_images = 0;
+  std::uint64_t bc_images = 0;           // ETC2->BC mode: BC host images
+  std::uint64_t bc_fallback_images = 0;  // ... kept RGBA8/R16 (CR-14)
   std::uint64_t image_copy_buckets[kEtc2ImageCopyBuckets] = {};
   std::uint64_t family_uploads[kEtc2CountedQueueFamilies] = {};
   std::uint64_t family_bytes[kEtc2CountedQueueFamilies] = {};  // compressed

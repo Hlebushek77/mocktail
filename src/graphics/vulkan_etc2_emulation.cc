@@ -3,6 +3,7 @@
 #include <pthread.h>
 #include <sys/stat.h>
 
+#include "mocktail/graphics/bc_encoder.h"
 #include "mocktail/graphics/chunk_arena.h"
 #include "mocktail/graphics/etc2_decode_totals.h"
 #include "mocktail/graphics/mapped_memory_copy.h"
@@ -24,6 +25,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -36,37 +38,62 @@ bool LookupEmulatedEtc2Format(VkFormat format, Etc2EmulatedFormat* out) {
   Etc2EmulatedFormat mapped;
   switch (format) {
     case VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK:
-      mapped = {VK_FORMAT_R8G8B8A8_UNORM, EtcFormat::kEtc2Rgb8};
+      mapped = {VK_FORMAT_R8G8B8A8_UNORM, EtcFormat::kEtc2Rgb8,
+                VK_FORMAT_BC1_RGB_UNORM_BLOCK};
       break;
     case VK_FORMAT_ETC2_R8G8B8_SRGB_BLOCK:
-      mapped = {VK_FORMAT_R8G8B8A8_SRGB, EtcFormat::kEtc2Rgb8};
+      mapped = {VK_FORMAT_R8G8B8A8_SRGB, EtcFormat::kEtc2Rgb8,
+                VK_FORMAT_BC1_RGB_SRGB_BLOCK};
       break;
     case VK_FORMAT_ETC2_R8G8B8A1_UNORM_BLOCK:
-      mapped = {VK_FORMAT_R8G8B8A8_UNORM, EtcFormat::kEtc2Rgb8A1};
+      mapped = {VK_FORMAT_R8G8B8A8_UNORM, EtcFormat::kEtc2Rgb8A1,
+                VK_FORMAT_BC1_RGBA_UNORM_BLOCK};
       break;
     case VK_FORMAT_ETC2_R8G8B8A1_SRGB_BLOCK:
-      mapped = {VK_FORMAT_R8G8B8A8_SRGB, EtcFormat::kEtc2Rgb8A1};
+      mapped = {VK_FORMAT_R8G8B8A8_SRGB, EtcFormat::kEtc2Rgb8A1,
+                VK_FORMAT_BC1_RGBA_SRGB_BLOCK};
       break;
     case VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK:
-      mapped = {VK_FORMAT_R8G8B8A8_UNORM, EtcFormat::kEtc2Rgba8};
+      mapped = {VK_FORMAT_R8G8B8A8_UNORM, EtcFormat::kEtc2Rgba8,
+                VK_FORMAT_BC3_UNORM_BLOCK};
       break;
     case VK_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK:
-      mapped = {VK_FORMAT_R8G8B8A8_SRGB, EtcFormat::kEtc2Rgba8};
+      mapped = {VK_FORMAT_R8G8B8A8_SRGB, EtcFormat::kEtc2Rgba8,
+                VK_FORMAT_BC3_SRGB_BLOCK};
       break;
     case VK_FORMAT_EAC_R11_UNORM_BLOCK:
-      mapped = {VK_FORMAT_R16_UNORM, EtcFormat::kEacR11};
+      mapped = {VK_FORMAT_R16_UNORM, EtcFormat::kEacR11,
+                VK_FORMAT_BC4_UNORM_BLOCK};
       break;
     case VK_FORMAT_EAC_R11_SNORM_BLOCK:
-      mapped = {VK_FORMAT_R16_SNORM, EtcFormat::kEacR11Signed};
+      mapped = {VK_FORMAT_R16_SNORM, EtcFormat::kEacR11Signed,
+                VK_FORMAT_BC4_SNORM_BLOCK};
       break;
     case VK_FORMAT_EAC_R11G11_UNORM_BLOCK:
-      mapped = {VK_FORMAT_R16G16_UNORM, EtcFormat::kEacRg11};
+      mapped = {VK_FORMAT_R16G16_UNORM, EtcFormat::kEacRg11,
+                VK_FORMAT_BC5_UNORM_BLOCK};
       break;
     case VK_FORMAT_EAC_R11G11_SNORM_BLOCK:
-      mapped = {VK_FORMAT_R16G16_SNORM, EtcFormat::kEacRg11Signed};
+      mapped = {VK_FORMAT_R16G16_SNORM, EtcFormat::kEacRg11Signed,
+                VK_FORMAT_BC5_SNORM_BLOCK};
       break;
     default:
       return false;
+  }
+  if (out != nullptr) {
+    *out = mapped;
+  }
+  return true;
+}
+
+bool LookupEmulatedEtc2Format(VkFormat format, bool bc,
+                              Etc2EmulatedFormat* out) {
+  Etc2EmulatedFormat mapped;
+  if (!LookupEmulatedEtc2Format(format, &mapped)) {
+    return false;
+  }
+  if (bc) {
+    mapped.host_format = mapped.bc_host_format;
   }
   if (out != nullptr) {
     *out = mapped;
@@ -82,6 +109,73 @@ VkFormatFeatureFlags EmulatedEtc2FormatFeatures(
       VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
       VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
   return host_features & kCompressedFeatures;
+}
+
+VkFormatFeatureFlags Etc2BcRequiredFormatFeatures() {
+  return EmulatedEtc2FormatFeatures(~VkFormatFeatureFlags{0});
+}
+
+const VkImageFormatListCreateInfo* FindImageFormatList(const void* next) {
+  for (auto* cursor = static_cast<const VkBaseInStructure*>(next);
+       cursor != nullptr; cursor = cursor->pNext) {
+    if (cursor->sType == VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO) {
+      return reinterpret_cast<const VkImageFormatListCreateInfo*>(cursor);
+    }
+  }
+  return nullptr;
+}
+
+bool Etc2FormatListAllowsBc(const void* next) {
+  const VkImageFormatListCreateInfo* list = FindImageFormatList(next);
+  if (list == nullptr || list->pViewFormats == nullptr) {
+    return true;
+  }
+  for (std::uint32_t index = 0; index < list->viewFormatCount; ++index) {
+    if (!LookupEmulatedEtc2Format(list->pViewFormats[index], nullptr)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+Etc2FormatListRewrite::Etc2FormatListRewrite(const void** host_next,
+                                             bool bc) {
+  const VkImageFormatListCreateInfo* list =
+      host_next != nullptr ? FindImageFormatList(*host_next) : nullptr;
+  found_ = list != nullptr;
+  if (list == nullptr || list->pViewFormats == nullptr) {
+    return;
+  }
+  bool etc2 = false;
+  for (std::uint32_t index = 0; index < list->viewFormatCount; ++index) {
+    etc2 = etc2 || LookupEmulatedEtc2Format(list->pViewFormats[index], nullptr);
+  }
+  if (!etc2) {
+    return;
+  }
+  formats_.assign(list->pViewFormats,
+                  list->pViewFormats + list->viewFormatCount);
+  for (VkFormat& format : formats_) {
+    Etc2EmulatedFormat mapped;
+    if (LookupEmulatedEtc2Format(format, bc, &mapped)) {
+      format = mapped.host_format;
+    }
+  }
+  if (*host_next == list) {
+    copy_ = *list;
+    copy_.pViewFormats = formats_.data();
+    *host_next = &copy_;
+    return;
+  }
+  patched_ = const_cast<VkImageFormatListCreateInfo*>(list);
+  original_ = list->pViewFormats;
+  patched_->pViewFormats = formats_.data();
+}
+
+Etc2FormatListRewrite::~Etc2FormatListRewrite() {
+  if (patched_ != nullptr) {
+    patched_->pViewFormats = original_;
+  }
 }
 
 namespace {
@@ -298,6 +392,19 @@ struct HostDevice {
   std::unique_ptr<ChunkArena> host_staging;  // the CPU route's staging
   std::unique_ptr<Etc2GpuDevice> gpu;        // the GPU route
   std::atomic<bool> saw_emulated_image{false};
+
+  // ETC2->BC mode (DESIGN C4.2), set once by RegisterDevice, and the
+  // host's answers for BC images by (format, type, tiling, usage, flags)
+  // (CR-14), under their own leaf mutex.
+  bool bc = false;
+  using BcImageKey = std::tuple<VkFormat, VkImageType, VkImageTiling,
+                                VkImageUsageFlags, VkImageCreateFlags>;
+  struct BcImageSupport {
+    VkResult result = VK_ERROR_FORMAT_NOT_SUPPORTED;
+    VkImageFormatProperties properties{};
+  };
+  std::mutex bc_support_mutex;
+  std::map<BcImageKey, BcImageSupport> bc_support;
 };
 
 template <typename Function>
@@ -321,10 +428,10 @@ struct Mapping {
   VkDeviceSize size = VK_WHOLE_SIZE;
 };
 
+// `bc` (in the shape): the host image holds BC blocks (ETC2->BC mode).
 struct ImageRecord : Etc2ImageShape {
   VkDevice device = VK_NULL_HANDLE;
   VkFormat app_format = VK_FORMAT_UNDEFINED;
-  bool bc = false;  // the host image holds BC blocks (ETC2->BC mode)
   std::uint32_t copies = 0;  // record calls, with MOCKTAIL_FRAME_STATS=1
   std::shared_ptr<const RgbaImage> override;
   std::shared_ptr<const RgbaImage> base;
@@ -426,6 +533,17 @@ constexpr std::size_t kCopyPieceBytes = 256U << 10;
 constexpr std::size_t kCopyTaskBytes = 128U << 10;
 constexpr std::size_t kParallelCopyMinimumBytes = 64U << 10;
 constexpr std::size_t kParallelEmitMinimumBytes = 256U << 10;
+std::atomic<unsigned> g_bc_fallback_logs{0};
+
+// ETC2->BC mode on the CPU route (DESIGN C4.4): every block gets the
+// endpoint refinement, as in the GPU route's etc2_bc pipeline, so a BC
+// image's bytes do not depend on which route served an upload. (CR-13
+// leaves it to the user whether this route may skip it: a quarter of the
+// transcode time for RGB8->BC1, a fifth for RGBA8->BC3, at the price of
+// route-dependent bytes.) Transcoding comes in pieces of at most 1024
+// blocks, about 0.2 ms on one core, batched into tasks of at least as many.
+constexpr bool kBcRefine = true;
+constexpr std::size_t kBcPieceBlocks = 1024;
 
 void LogFailure(const char* message) {
   if (ShouldLog(&g_failure_logs, 8)) {
@@ -682,6 +800,7 @@ struct VulkanEtc2Emulation::State {
   std::mutex mutex;
   std::mutex devices_mutex;
   std::unordered_map<VkPhysicalDevice, bool> physical_devices;
+  std::unordered_map<VkPhysicalDevice, bool> bc_physical_devices;
   std::vector<std::unique_ptr<HostDevice>> devices;
   std::unordered_map<VkImage, ImageRecord> images;
   std::unordered_map<VkBuffer, BufferBinding> buffers;
@@ -902,6 +1021,10 @@ struct VulkanEtc2Emulation::State {
                   const std::uint8_t* decoded) {
     const std::shared_ptr<const RgbaImage> replacement =
         FindOverride(upload, compressed, decoded);
+    if (upload.bc) {
+      EmitBc(upload, compressed, replacement.get());
+      return;
+    }
     if (replacement != nullptr) {
       ResampleRgba(*replacement, upload.target_width, upload.target_height,
                    upload.target);
@@ -912,12 +1035,89 @@ struct VulkanEtc2Emulation::State {
     }
   }
 
+  // An upload into a BC image. Roblox's blocks transcode as the GPU route
+  // does it: whole decoded blocks, padding texels of edge blocks included.
+  // An override is resampled to the region (never upscaled in BC mode) and
+  // encoded, its edge texels repeated; for RGB8A1, texels with alpha below
+  // 128 become transparent black and the rest opaque, where RGBA8 hosts
+  // keep the override's alpha (CR-24).
+  void EmitBc(const PendingUpload& upload, const std::uint8_t* compressed,
+              const RgbaImage* replacement) {
+    bool encoded = false;
+    if (replacement != nullptr) {
+      std::vector<std::uint8_t> texels(
+          static_cast<std::size_t>(upload.target_width) *
+          upload.target_height * 4);
+      ResampleRgba(*replacement, upload.target_width, upload.target_height,
+                   texels.data());
+      encoded = TranscodeDecodedToBc(
+          upload.format, texels.data(), upload.target_width,
+          upload.target_height, 1, upload.target,
+          static_cast<std::size_t>(upload.target_bytes), kBcRefine);
+    } else {
+      encoded = TranscodeEtcToBc(
+          upload.format, compressed, static_cast<std::size_t>(upload.compressed),
+          upload.target, static_cast<std::size_t>(upload.target_bytes),
+          kBcRefine);
+    }
+    if (!encoded) {
+      LogFailure("could not encode an upload as BC");
+    }
+  }
+
   HostDevice* Find(VkDevice device) {
     std::lock_guard<std::mutex> lock(devices_mutex);
     for (const auto& candidate : devices) {
       if (candidate->device == device) {
         return candidate.get();
       }
+    }
+    return nullptr;
+  }
+
+  // [CR-14] In ETC2->BC mode, why the host cannot take this image as BC,
+  // or null when it can. RGBA8 accepts usages and views BC does not
+  // (storage, attachments, uncompressed views), and failing vkCreateImage
+  // where the default mode succeeds would be worse than one image left
+  // RGBA8/R16. `flags` are the host image's.
+  const char* BcImageRefusal(HostDevice& dev, const VkImageCreateInfo& info,
+                             VkImageCreateFlags flags, VkFormat format) {
+    if (!Etc2FormatListAllowsBc(info.pNext)) {
+      return "its format list names a format that is not ETC2/EAC";
+    }
+    if (dev.get_image_format_properties == nullptr) {
+      return "image formats cannot be queried";
+    }
+    const HostDevice::BcImageKey key{format, info.imageType, info.tiling,
+                                     info.usage, flags};
+    HostDevice::BcImageSupport support;
+    bool known = false;
+    {
+      std::lock_guard<std::mutex> lock(dev.bc_support_mutex);
+      const auto found = dev.bc_support.find(key);
+      if (found != dev.bc_support.end()) {
+        support = found->second;
+        known = true;
+      }
+    }
+    if (!known) {
+      support.result = dev.get_image_format_properties(
+          dev.physical_device, format, info.imageType, info.tiling,
+          info.usage, flags, &support.properties);
+      std::lock_guard<std::mutex> lock(dev.bc_support_mutex);
+      dev.bc_support.emplace(key, support);
+    }
+    if (support.result != VK_SUCCESS) {
+      return "the device takes no BC image with its usage and flags";
+    }
+    const VkImageFormatProperties& limits = support.properties;
+    if (info.extent.width > limits.maxExtent.width ||
+        info.extent.height > limits.maxExtent.height ||
+        info.extent.depth > limits.maxExtent.depth ||
+        info.mipLevels > limits.maxMipLevels ||
+        info.arrayLayers > limits.maxArrayLayers ||
+        (info.samples & limits.sampleCounts) == 0) {
+      return "it exceeds the BC format's limits";
     }
     return nullptr;
   }
@@ -981,6 +1181,13 @@ struct VulkanEtc2Emulation::State {
         return {Etc2Route::kCpu, Etc2CpuReason::kGpuUnavailable};
       default:  // building, or the selftest not done yet
         return {Etc2Route::kCpu, Etc2CpuReason::kGpuNotReady};
+    }
+    // The decode pass writes RGBA texels: BC images (ETC2->BC mode) have no
+    // GPU route until the etc2_bc pipeline exists (WP3b), so the CPU route
+    // encodes them. Their storage and attachment fallbacks stay RGBA and may
+    // take the route.
+    if (target.image.bc) {
+      return {Etc2Route::kCpu, Etc2CpuReason::kGpuUnavailable};
     }
     // Upscaled small textures need the CPU's resampling (DESIGN C3.5).
     if (target.image.scale > 1) {
@@ -1703,6 +1910,78 @@ bool VulkanEtc2Emulation::PhysicalDeviceNeedsEmulation(
   return needed;
 }
 
+bool VulkanEtc2Emulation::PhysicalDeviceUsesBc(
+    VkPhysicalDevice physical_device,
+    PFN_vkGetPhysicalDeviceFeatures get_features,
+    PFN_vkGetPhysicalDeviceFormatProperties get_format_properties) {
+  if (!state_->options.to_bc || physical_device == VK_NULL_HANDLE) {
+    return false;
+  }
+  {
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    const auto found = state_->bc_physical_devices.find(physical_device);
+    if (found != state_->bc_physical_devices.end()) {
+      return found->second;
+    }
+  }
+  char reason[160] = "";
+  if (EmulationDisabledByEnvironment()) {
+    std::snprintf(reason, sizeof(reason),
+                  "ETC2 emulation is off (MOCKTAIL_DISABLE_ETC2_EMULATION)");
+  } else if (get_features == nullptr || get_format_properties == nullptr) {
+    std::snprintf(reason, sizeof(reason),
+                  "the device's features cannot be queried");
+  } else if (!PhysicalDeviceNeedsEmulation(physical_device, get_features)) {
+    std::snprintf(reason, sizeof(reason),
+                  "not needed, the graphics card reads ETC2 itself");
+  } else {
+    VkPhysicalDeviceFeatures features{};
+    get_features(physical_device, &features);
+    if (features.textureCompressionBC != VK_TRUE) {
+      std::snprintf(reason, sizeof(reason),
+                    "the device has no textureCompressionBC");
+    }
+    // Every BC host format, in the order of the ETC2/EAC formats.
+    for (int format = VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK;
+         reason[0] == '\0' && format <= VK_FORMAT_EAC_R11G11_SNORM_BLOCK;
+         ++format) {
+      Etc2EmulatedFormat mapped;
+      if (!LookupEmulatedEtc2Format(static_cast<VkFormat>(format), true,
+                                    &mapped)) {
+        continue;
+      }
+      VkFormatProperties properties{};
+      get_format_properties(physical_device, mapped.host_format, &properties);
+      const VkFormatFeatureFlags missing =
+          Etc2BcRequiredFormatFeatures() & ~properties.optimalTilingFeatures;
+      if (missing != 0) {
+        std::snprintf(reason, sizeof(reason),
+                      "format %d lacks optimal-tiling features 0x%x",
+                      static_cast<int>(mapped.host_format),
+                      static_cast<unsigned>(missing));
+      }
+    }
+  }
+  const bool usable = reason[0] == '\0';
+  bool decided = false;
+  {
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    const auto inserted =
+        state_->bc_physical_devices.emplace(physical_device, usable);
+    decided = inserted.second;
+    if (!decided) {
+      return inserted.first->second;
+    }
+  }
+  if (!usable) {
+    std::fprintf(stderr,
+                 "  [vulkan] ETC2->BC unavailable: %s; ETC2 textures stay "
+                 "RGBA8/R16\n",
+                 reason);
+  }
+  return usable;
+}
+
 void VulkanEtc2Emulation::RegisterDevice(
     VkDevice device, VkPhysicalDevice physical_device, bool emulated,
     const VkPhysicalDeviceMemoryProperties& memory,
@@ -1837,10 +2116,30 @@ void VulkanEtc2Emulation::RegisterDevice(
     dev->host_staging =
         std::make_unique<ChunkArena>(config, std::move(backend));
   }
+  if (emulated && state_->options.to_bc) {
+    // Decided before vkCreateDevice already, which enabled
+    // textureCompressionBC then (the adapter); the same answer here.
+    dev->bc = PhysicalDeviceUsesBc(physical_device, dev->get_features,
+                                   dev->get_format_properties);
+    if (dev->bc && dev->get_image_format_properties == nullptr) {
+      dev->bc = false;
+      std::fprintf(stderr,
+                   "  [vulkan] ETC2->BC unavailable: the device's image "
+                   "formats cannot be queried; ETC2 textures stay "
+                   "RGBA8/R16\n");
+    }
+  }
   if (emulated) {
-    std::fprintf(stderr,
-                 "  [vulkan] ETC2/EAC emulation enabled: compressed uploads "
-                 "decode to RGBA8/R16 host images\n");
+    if (dev->bc) {
+      // The GPU route names itself here once it transcodes too.
+      std::fprintf(stderr,
+                   "  [vulkan] ETC2/EAC emulation enabled: compressed uploads "
+                   "become BC1/BC3/BC4/BC5 host images (CPU transcode)\n");
+    } else {
+      std::fprintf(stderr,
+                   "  [vulkan] ETC2/EAC emulation enabled: compressed uploads "
+                   "decode to RGBA8/R16 host images\n");
+    }
     std::fprintf(stderr, "  [vulkan] ETC2 queues: %s\n",
                  DescribeEtc2Queues(create_info, queue_families).c_str());
   }
@@ -2014,12 +2313,24 @@ VkResult VulkanEtc2Emulation::CreateImage(VkDevice device,
     return dev->create_image(device, create_info, allocator, image);
   }
   VkImageCreateInfo host_info = *create_info;
-  host_info.format = format.host_format;
   host_info.flags &= ~static_cast<VkImageCreateFlags>(
       VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT);
+  // ETC2->BC mode stores the blocks as BC unless the host cannot take this
+  // image as BC (CR-14); such an image keeps the RGBA8/R16 host.
+  const char* bc_refusal =
+      dev->bc ? state_->BcImageRefusal(*dev, *create_info, host_info.flags,
+                                       format.bc_host_format)
+              : nullptr;
+  const bool bc = dev->bc && bc_refusal == nullptr;
+  if (bc) {
+    format.host_format = format.bc_host_format;
+  }
+  host_info.format = format.host_format;
   std::uint32_t scale = 1;
   const std::uint32_t upscale = state_->options.upscale;
-  if (upscale > 1 && IsColorFormat(format.etc_format) &&
+  // BC images have no BLIT_DST to upscale through, and a BC-mode device
+  // upscales none, so that copies between its images stay plain copies.
+  if (!dev->bc && upscale > 1 && IsColorFormat(format.etc_format) &&
       create_info->imageType == VK_IMAGE_TYPE_2D &&
       create_info->arrayLayers == 1 && create_info->extent.depth == 1 &&
       create_info->extent.width <= kSmallTextureMaxExtent &&
@@ -2028,7 +2339,14 @@ VkResult VulkanEtc2Emulation::CreateImage(VkDevice device,
     host_info.extent.width *= scale;
     host_info.extent.height *= scale;
   }
-  const VkResult result = dev->create_image(device, &host_info, allocator, image);
+  VkResult result = VK_SUCCESS;
+  bool format_list = false;
+  {
+    // [CR-15] The host sees its own formats in a VkImageFormatListCreateInfo.
+    const Etc2FormatListRewrite rewrite(&host_info.pNext, bc);
+    format_list = rewrite.found();
+    result = dev->create_image(device, &host_info, allocator, image);
+  }
   if (result == VK_SUCCESS && image != nullptr) {
     {
       std::lock_guard<std::mutex> lock(state_->mutex);
@@ -2040,23 +2358,31 @@ VkResult VulkanEtc2Emulation::CreateImage(VkDevice device,
       record.width = create_info->extent.width;
       record.height = create_info->extent.height;
       record.app_format = create_info->format;
-    }
-    bool format_list = false;
-    for (auto* next = static_cast<const VkBaseInStructure*>(create_info->pNext);
-         next != nullptr; next = next->pNext) {
-      format_list = format_list ||
-                    next->sType ==
-                        VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO;
+      record.bc = bc;
     }
     state_->CountTotals([&](Etc2DecodeTotals& totals) {
       ++totals.images;
       if (scale > 1) {
         ++totals.upscaled_images;
       }
+      if (bc) {
+        ++totals.bc_images;
+      } else if (dev->bc) {
+        ++totals.bc_fallback_images;
+      }
       if (format_list && state_->options.frame_stats) {
         ++totals.format_lists;
       }
     });
+    if (bc_refusal != nullptr && ShouldLog(&g_bc_fallback_logs, 4)) {
+      std::fprintf(stderr,
+                   "  [vulkan] ETC2->BC: a %ux%u image (format %d, usage "
+                   "0x%x, flags 0x%x) stays RGBA8/R16: %s\n",
+                   create_info->extent.width, create_info->extent.height,
+                   static_cast<int>(create_info->format),
+                   static_cast<unsigned>(create_info->usage),
+                   static_cast<unsigned>(create_info->flags), bc_refusal);
+    }
     if (!dev->saw_emulated_image.exchange(true)) {
       state_->OnFirstEmulatedImage(*dev);
     }
@@ -2130,6 +2456,15 @@ VkResult VulkanEtc2Emulation::CreateImageView(
   }
   VkImageViewCreateInfo host_info = *create_info;
   host_info.format = format.host_format;
+  if (dev->bc) {
+    // The view takes the image's host: BC, or RGBA8/R16 for an image BC
+    // could not serve.
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    const auto image = state_->images.find(create_info->image);
+    if (image != state_->images.end() && image->second.bc) {
+      host_info.format = format.bc_host_format;
+    }
+  }
   return dev->create_image_view(device, &host_info, allocator, view);
 }
 
@@ -2847,6 +3182,8 @@ std::uint32_t VulkanEtc2Emulation::State::RunCpuUploadsLegacy(
 // worker pool; unscaled uploads decode straight into their staging, which
 // rewritten regions lay out exactly as the decoder writes; upscaled ones
 // resample per image in parallel. Its output is the same, byte for byte.
+// Uploads into BC images (C4.4) transcode straight into their staging, in
+// pieces on the pool, unless an override may replace them.
 std::uint32_t VulkanEtc2Emulation::State::RunCpuUploadsFast(
     std::vector<CpuWork>* work, const SourceTypes& types) {
   constexpr VkDeviceSize kIntoStaging = ~VkDeviceSize{0};
@@ -2885,7 +3222,8 @@ std::uint32_t VulkanEtc2Emulation::State::RunCpuUploadsFast(
     item.compressed_offset = compressed_total;
     compressed_total += upload.compressed;
     // Upscaled uploads resample, and override candidates may be replaced
-    // or dumped, from decoded texels; everything else is final as decoded.
+    // or dumped, from decoded texels; everything else is final as decoded
+    // (or, for a BC image, as transcoded).
     if (upload.scale > 1 || MayOverride(upload)) {
       item.decoded_offset = decoded_total;
       decoded_total += upload.decoded;
@@ -3000,15 +3338,44 @@ std::uint32_t VulkanEtc2Emulation::State::RunCpuUploadsFast(
                  item.upload->layers);
   }
 
-  // Decode, in bands on the pool.
+  // Decode, in bands on the pool; transcode to BC, in pieces on the pool.
   const auto jobs_start = Clock::now();
   std::vector<EtcDecodeJob> jobs;
   jobs.reserve(items.size());
+  struct BcPiece {
+    EtcFormat format;
+    const std::uint8_t* source;
+    std::uint8_t* target;
+    std::size_t bytes;
+  };
+  std::vector<BcPiece> bc_pieces;
+  std::vector<std::size_t> bc_task_ends;
+  std::size_t bc_task_blocks = 0;
   for (const Item& item : items) {
     const PendingUpload& upload = *item.upload;
     const bool into_staging = item.decoded_offset == kIntoStaging;
     if (into_staging && item.repeat) {
       continue;  // its first pass writes the same texels to the same place
+    }
+    if (into_staging && upload.bc) {
+      // The blocks of every layer lie one after another in both, so the
+      // upload is one run of blocks.
+      const std::size_t block_bytes = EtcBlockBytes(upload.format);
+      const std::size_t bytes = static_cast<std::size_t>(upload.compressed);
+      for (std::size_t offset = 0; offset < bytes;
+           offset += kBcPieceBlocks * block_bytes) {
+        const std::size_t piece =
+            std::min(kBcPieceBlocks * block_bytes, bytes - offset);
+        bc_pieces.push_back({upload.format,
+                             compressed + item.compressed_offset + offset,
+                             upload.target + offset, piece});
+        bc_task_blocks += piece / block_bytes;
+        if (bc_task_blocks >= kBcPieceBlocks) {
+          bc_task_ends.push_back(bc_pieces.size());
+          bc_task_blocks = 0;
+        }
+      }
+      continue;
     }
     const VkDeviceSize compressed_layer = upload.compressed / upload.layers;
     const VkDeviceSize decoded_layer = upload.decoded / upload.layers;
@@ -3027,11 +3394,35 @@ std::uint32_t VulkanEtc2Emulation::State::RunCpuUploadsFast(
     }
   }
   threads = std::max(threads, DecodeEtcJobs(jobs.data(), jobs.size(), workers));
+  if (bc_task_blocks != 0) {
+    bc_task_ends.push_back(bc_pieces.size());
+  }
+  std::atomic<bool> bc_failed{false};
+  const auto bc_task = [&](std::size_t task) {
+    for (std::size_t index = task == 0 ? 0 : bc_task_ends[task - 1];
+         index < bc_task_ends[task]; ++index) {
+      const BcPiece& piece = bc_pieces[index];
+      if (!TranscodeEtcToBc(piece.format, piece.source, piece.bytes,
+                            piece.target, piece.bytes, kBcRefine)) {
+        bc_failed.store(true, std::memory_order_relaxed);
+      }
+    }
+  };
+  if (pool != nullptr && bc_task_ends.size() > 1) {
+    threads = std::max(threads, pool->ParallelFor(bc_task_ends.size(), bc_task));
+  } else {
+    for (std::size_t task = 0; task < bc_task_ends.size(); ++task) {
+      bc_task(task);
+    }
+  }
   const auto jobs_end = Clock::now();
   for (const EtcDecodeJob& job : jobs) {
     if (!job.ok) {
       LogFailure("could not decode an upload layer");
     }
+  }
+  if (bc_failed.load(std::memory_order_relaxed)) {
+    LogFailure("could not encode an upload as BC");
   }
 
   // Emit what did not decode straight into staging.

@@ -693,6 +693,7 @@ add_executable(vulkan_etc2_diagnostics_test
   ${PROJECT_SOURCE_DIR}/src/graphics/texture_override.cc
   ${PROJECT_SOURCE_DIR}/src/graphics/worker_pool.cc
   ${PROJECT_SOURCE_DIR}/src/graphics/mapped_memory_copy.cc
+  ${PROJECT_SOURCE_DIR}/src/graphics/bc_encoder.cc
 )
 target_include_directories(vulkan_etc2_diagnostics_test PRIVATE
   ${PROJECT_SOURCE_DIR}/include
@@ -721,6 +722,10 @@ add_library(mocktail_etc2_emulation_for_tests STATIC
   ${PROJECT_SOURCE_DIR}/src/graphics/worker_pool.cc
   ${PROJECT_SOURCE_DIR}/src/graphics/mapped_memory_copy.cc
 )
+# ETC2->BC mode (plus.2 WP3).
+target_sources(mocktail_etc2_emulation_for_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/graphics/bc_encoder.cc
+)
 target_include_directories(mocktail_etc2_emulation_for_tests PUBLIC
   ${PROJECT_SOURCE_DIR}/include
 )
@@ -737,6 +742,7 @@ mocktail_apply_compile_options(mocktail_etc2_emulation_for_tests)
 add_library(mocktail_etc2_test_support STATIC
   support/etc2_reference_decoder.cc
   support/resample_reference.cc
+  support/bc_reference_transcode.cc
   support/fake_vulkan_device.cc
   support/etc2_emulation_scenarios.cc
   support/etc2_emulation_harness.cc
@@ -849,6 +855,36 @@ target_link_libraries(etc2_gpu_route_test PRIVATE
   GTest::gtest_main
 )
 mocktail_apply_compile_options(etc2_gpu_route_test)
+
+# ETC2->BC mode (plus.2 WP3): the CPU BC encoder against the frozen
+# reference, and the emulation's BC images, views and capabilities on the
+# fake device.
+add_executable(bc_encoder_test bc_encoder_test.cc)
+target_link_libraries(bc_encoder_test PRIVATE
+  mocktail_etc2_test_support
+  GTest::gtest_main
+)
+mocktail_apply_compile_options(bc_encoder_test)
+
+add_executable(vulkan_etc2_bc_test vulkan_etc2_bc_test.cc)
+target_link_libraries(vulkan_etc2_bc_test PRIVATE
+  mocktail_etc2_test_support
+  GTest::gtest_main
+)
+mocktail_apply_compile_options(vulkan_etc2_bc_test)
+
+add_executable(etc2_bc_gpu_test etc2_bc_gpu_test.cc)
+target_link_libraries(etc2_bc_gpu_test PRIVATE
+  mocktail_etc2_test_support
+  GTest::gtest_main
+)
+mocktail_apply_compile_options(etc2_bc_gpu_test)
+
+# Manual, not run by ctest: the PSNR of ETC2->BC mode on a texture corpus
+# (the APK's .ktx and .png, MOCKTAIL_ETC2_TRACE_BLOCKS dumps).
+add_executable(etc2_bc_quality etc2_bc_quality.cc)
+target_link_libraries(etc2_bc_quality PRIVATE mocktail_etc2_test_support)
+mocktail_apply_compile_options(etc2_bc_quality)
 
 add_executable(video_driver_policy_test
   video_driver_policy_test.cc
@@ -1406,6 +1442,9 @@ gtest_discover_tests(vulkan_etc2_gpu_route_test)
 add_test(NAME etc2_shader_header_test
   COMMAND ${PROJECT_SOURCE_DIR}/scripts/gen-etc2-shaders.sh --check
 )
+
+gtest_discover_tests(bc_encoder_test)
+gtest_discover_tests(vulkan_etc2_bc_test)
 # Real GPU: skipped without a loader, driver or device, and while a live game
 # runs (CR-25). Hold these back with -LE gpu while a live measurement runs.
 gtest_discover_tests(etc2_emulation_gpu_test PROPERTIES LABELS gpu)
@@ -1451,6 +1490,25 @@ foreach(gpu_test etc2_emulation_gpu_test etc2_gpu_parity_test
     SKIP_REGULAR_EXPRESSION "\\[  PASSED  \\] 0 tests"
   )
 endforeach()
+gtest_discover_tests(etc2_bc_gpu_test PROPERTIES LABELS gpu)
+add_test(NAME Etc2BcGpuTest.SkipsWithoutAVulkanDriver
+  COMMAND etc2_bc_gpu_test
+)
+set_tests_properties(Etc2BcGpuTest.SkipsWithoutAVulkanDriver PROPERTIES
+  ENVIRONMENT "VK_ICD_FILENAMES=/nonexistent;VK_DRIVER_FILES=/nonexistent"
+  PASS_REGULAR_EXPRESSION "\\[  SKIPPED \\] [0-9]+ tests?, listed below"
+  FAIL_REGULAR_EXPRESSION "\\[  FAILED  \\]|\\[  PASSED  \\] [1-9]"
+)
+add_test(NAME Etc2BcGpuTest.ValidationLayerReportsNothing
+  COMMAND etc2_bc_gpu_test
+)
+set_tests_properties(Etc2BcGpuTest.ValidationLayerReportsNothing
+  PROPERTIES
+  LABELS gpu
+  ENVIRONMENT "VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation"
+  PASS_REGULAR_EXPRESSION "\\[  PASSED  \\] [0-9]+ tests?\\."
+  FAIL_REGULAR_EXPRESSION "Validation (Error|Warning)|\\[  FAILED  \\]"
+)
 gtest_discover_tests(video_driver_policy_test)
 gtest_discover_tests(wayland_global_probe_test)
 gtest_discover_tests(wayland_surface_commit_guard_test)

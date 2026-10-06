@@ -17,12 +17,14 @@ namespace mocktail::graphics {
 
 // What planning needs to know about an emulated image. `scale` > 1 for small
 // colour textures that the host image holds enlarged; `width` and `height`
-// are Roblox's (unscaled) mip-0 extent.
+// are Roblox's (unscaled) mip-0 extent. `bc`: the host image holds BC blocks
+// (ETC2->BC mode), never with a scale.
 struct Etc2ImageShape {
   Etc2EmulatedFormat format;
   std::uint32_t scale = 1;
   std::uint32_t width = 0;
   std::uint32_t height = 0;
+  bool bc = false;
 };
 
 // How one vkCmdCopyBufferToImage(2) on an emulated image is served.
@@ -57,6 +59,10 @@ struct Etc2PendingUpload {
   std::uint32_t target_width = 0;
   std::uint32_t target_height = 0;
   bool full_mip = false;
+  // BC blocks for a BC host image: `compressed` bytes, one BC block per
+  // ETC2/EAC block in the same order. Otherwise decoded (or resampled)
+  // texels.
+  bool bc = false;
   VkDeviceSize target_bytes = 0;
   std::uint8_t* target = nullptr;
   // Set by the emulation when it records the copy.
@@ -88,10 +94,11 @@ bool HostRegion(const Etc2ImageShape* image, std::uint32_t mip,
 inline constexpr VkDeviceSize kEtc2StagingRegionAlignment = 16;
 
 // Plans the CPU route of one copy: per region an upload, and a rewritten
-// region that reads decoded texels tightly packed from a staging buffer at
-// offset 0 onward, each region starting kEtc2StagingRegionAlignment-aligned.
-// `total` is the staging size. False when a region cannot be served (bad
-// extent, layered upscaled image, short row length).
+// region that reads decoded texels (BC blocks for a BC image) tightly packed
+// from a staging buffer at offset 0 onward, each region starting
+// kEtc2StagingRegionAlignment-aligned. `total` is the staging size. False
+// when a region cannot be served (bad extent, layered upscaled image, short
+// row length).
 template <typename Region>
 bool PlanRegions(const Etc2ImageShape& image, VkDevice device,
                  VkBuffer source, VkImage destination, std::uint32_t count,

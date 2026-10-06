@@ -5,6 +5,7 @@
 #include <set>
 #include <utility>
 
+#include "support/bc_reference_transcode.h"
 #include "support/etc2_reference_decoder.h"
 #include "support/resample_reference.h"
 
@@ -15,41 +16,52 @@ struct EmulatedFormat {
   VkFormat host = VK_FORMAT_UNDEFINED;
   EtcFormat etc = EtcFormat::kEtc2Rgb8;
   bool color = false;
+  VkFormat bc = VK_FORMAT_UNDEFINED;  // the host in ETC2->BC mode
 };
 
 // The ETC2/EAC formats a device without ETC2 gets, and what the emulation
-// stores them as.
+// stores them as: by default, and in ETC2->BC mode (DESIGN C4.1).
 bool LookupEmulated(VkFormat format, EmulatedFormat* out) {
   switch (format) {
     case VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK:
-      *out = {VK_FORMAT_R8G8B8A8_UNORM, EtcFormat::kEtc2Rgb8, true};
+      *out = {VK_FORMAT_R8G8B8A8_UNORM, EtcFormat::kEtc2Rgb8, true,
+              VK_FORMAT_BC1_RGB_UNORM_BLOCK};
       return true;
     case VK_FORMAT_ETC2_R8G8B8_SRGB_BLOCK:
-      *out = {VK_FORMAT_R8G8B8A8_SRGB, EtcFormat::kEtc2Rgb8, true};
+      *out = {VK_FORMAT_R8G8B8A8_SRGB, EtcFormat::kEtc2Rgb8, true,
+              VK_FORMAT_BC1_RGB_SRGB_BLOCK};
       return true;
     case VK_FORMAT_ETC2_R8G8B8A1_UNORM_BLOCK:
-      *out = {VK_FORMAT_R8G8B8A8_UNORM, EtcFormat::kEtc2Rgb8A1, true};
+      *out = {VK_FORMAT_R8G8B8A8_UNORM, EtcFormat::kEtc2Rgb8A1, true,
+              VK_FORMAT_BC1_RGBA_UNORM_BLOCK};
       return true;
     case VK_FORMAT_ETC2_R8G8B8A1_SRGB_BLOCK:
-      *out = {VK_FORMAT_R8G8B8A8_SRGB, EtcFormat::kEtc2Rgb8A1, true};
+      *out = {VK_FORMAT_R8G8B8A8_SRGB, EtcFormat::kEtc2Rgb8A1, true,
+              VK_FORMAT_BC1_RGBA_SRGB_BLOCK};
       return true;
     case VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK:
-      *out = {VK_FORMAT_R8G8B8A8_UNORM, EtcFormat::kEtc2Rgba8, true};
+      *out = {VK_FORMAT_R8G8B8A8_UNORM, EtcFormat::kEtc2Rgba8, true,
+              VK_FORMAT_BC3_UNORM_BLOCK};
       return true;
     case VK_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK:
-      *out = {VK_FORMAT_R8G8B8A8_SRGB, EtcFormat::kEtc2Rgba8, true};
+      *out = {VK_FORMAT_R8G8B8A8_SRGB, EtcFormat::kEtc2Rgba8, true,
+              VK_FORMAT_BC3_SRGB_BLOCK};
       return true;
     case VK_FORMAT_EAC_R11_UNORM_BLOCK:
-      *out = {VK_FORMAT_R16_UNORM, EtcFormat::kEacR11, false};
+      *out = {VK_FORMAT_R16_UNORM, EtcFormat::kEacR11, false,
+              VK_FORMAT_BC4_UNORM_BLOCK};
       return true;
     case VK_FORMAT_EAC_R11_SNORM_BLOCK:
-      *out = {VK_FORMAT_R16_SNORM, EtcFormat::kEacR11Signed, false};
+      *out = {VK_FORMAT_R16_SNORM, EtcFormat::kEacR11Signed, false,
+              VK_FORMAT_BC4_SNORM_BLOCK};
       return true;
     case VK_FORMAT_EAC_R11G11_UNORM_BLOCK:
-      *out = {VK_FORMAT_R16G16_UNORM, EtcFormat::kEacRg11, false};
+      *out = {VK_FORMAT_R16G16_UNORM, EtcFormat::kEacRg11, false,
+              VK_FORMAT_BC5_UNORM_BLOCK};
       return true;
     case VK_FORMAT_EAC_R11G11_SNORM_BLOCK:
-      *out = {VK_FORMAT_R16G16_SNORM, EtcFormat::kEacRg11Signed, false};
+      *out = {VK_FORMAT_R16G16_SNORM, EtcFormat::kEacRg11Signed, false,
+              VK_FORMAT_BC5_SNORM_BLOCK};
       return true;
     default:
       return false;
@@ -133,6 +145,10 @@ class ScenarioBuilder {
   }
   ScenarioBuilder& AllowFakeError(std::string substring) {
     scenario_.allowed_fake_errors.push_back(std::move(substring));
+    return *this;
+  }
+  ScenarioBuilder& BcModeFakeError(std::string substring) {
+    scenario_.bc_mode_fake_errors.push_back(std::move(substring));
     return *this;
   }
 
@@ -725,6 +741,10 @@ std::vector<Scenario> BuildScenarios() {
     ScenarioBuilder b("CopyImageUnscaled", 14,
                       "vkCmdCopyImage(2) between emulated images and into a "
                       "plain RGBA8 image, passed through unchanged");
+    // ETC2 RGB8 into ETC2 RGBA8 and ETC2 RGBA8 into RGBA8 join blocks of 8,
+    // 16 and 4 bytes, which no device may copy between
+    // (VUID-vkCmdCopyImage-srcImage-01548); RGBA8 hosts hid it.
+    b.BcModeFakeError("formats are not size-compatible");
     const std::uint32_t source = b.Source();
     const std::uint32_t upload = b.CommandBuffer();
     const std::uint32_t copies = b.CommandBuffer();
@@ -753,6 +773,8 @@ std::vector<Scenario> BuildScenarios() {
                       "vkCmdCopyImage(2) between two x4-upscaled images "
                       "becomes a same-size NEAREST blit of the host regions; "
                       "between unscaled images it stays a copy");
+    // ETC2 RGB8 into ETC2 RGBA8: 8- and 16-byte blocks (as above).
+    b.BcModeFakeError("formats are not size-compatible");
     b.Upscale(4);
     const std::uint32_t source = b.Source();
     const std::uint32_t upload = b.CommandBuffer();
@@ -782,6 +804,8 @@ std::vector<Scenario> BuildScenarios() {
                       "the whole copy");
     b.Upscale(4).FakeOnly(
         "filtered blits have no exact expected texels; the fake records them");
+    // Without the upscale (BC mode) the out-of-range copy reaches the host.
+    b.BcModeFakeError("vkCmdCopyImage: region outside the image");
     const std::uint32_t source = b.Source();
     const std::uint32_t upload = b.CommandBuffer();
     const std::uint32_t copies = b.CommandBuffer();
@@ -890,6 +914,49 @@ std::vector<Scenario> BuildScenarios() {
     scenarios.push_back(b.Build());
   }
 
+  {
+    // Added with ETC2->BC mode (plus.2 WP3a): the copies Roblox makes most,
+    // which stay valid between BC hosts, where the scenarios above copy
+    // between formats of different block sizes.
+    ScenarioBuilder b("CopyImageMipMoves", 21,
+                      "the texture manager's mip moves (L0: about 92k "
+                      "vkCmdCopyImage a session): every mip of a texture "
+                      "into the next mip of a larger one of the same format, "
+                      "parts at block offsets back, layers of an array, in "
+                      "every ETC2/EAC format");
+    const std::uint32_t source = b.Source();
+    const std::uint32_t upload = b.CommandBuffer();
+    const std::uint32_t moves = b.CommandBuffer();
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> pairs;
+    for (VkFormat format : kEtc2Formats) {
+      const std::uint32_t small = b.Image(format, 40, 24, 4);
+      const std::uint32_t large = b.Image(format, 80, 48, 5);
+      b.Copy(upload, small, source, b.MipChain(source, small));
+      b.Copy(upload, large, source, b.MipChain(source, large));
+      pairs.emplace_back(small, large);
+    }
+    const std::uint32_t array_a = b.Image(kRg11Snorm, 32, 32, 2, 3);
+    const std::uint32_t array_b = b.Image(kRg11Snorm, 32, 32, 2, 3);
+    b.Copy(upload, array_a, source, b.MipChain(source, array_a));
+    b.Copy(upload, array_b, source, b.MipChain(source, array_b));
+    b.Submit({{upload}}).Checkpoint();
+    for (const auto& [small, large] : pairs) {
+      std::vector<VkImageCopy> chain;
+      for (std::uint32_t mip = 0; mip < 4; ++mip) {
+        chain.push_back(ImageCopy(mip, 0, 0, mip + 1, 0, 0, Mip(40, mip),
+                                  Mip(24, mip)));
+      }
+      b.CopyImage(moves, small, large, chain)
+          .CopyImage(moves, large, small,
+                     {ImageCopy(0, 8, 4, 0, 16, 8, 16, 12)}, true);
+    }
+    b.CopyImage(moves, array_a, array_b,
+                {ImageCopy(0, 0, 0, 0, 0, 0, 32, 32, 1, 2),
+                 ImageCopy(1, 4, 4, 1, 8, 8, 8, 8, 0, 1)})
+        .Submit({{moves}});
+    scenarios.push_back(b.Build());
+  }
+
   return scenarios;
 }
 
@@ -927,10 +994,14 @@ std::vector<std::uint8_t> SeededBytes(std::uint64_t seed, std::size_t size) {
 }
 
 HostImageShape HostShapeFor(const ScenarioImage& image, std::uint32_t upscale,
-                            bool emulated) {
+                            bool emulated, bool bc) {
   EmulatedFormat format;
   if (!emulated || !LookupEmulated(image.format, &format)) {
     return {image.format, image.width, image.height, image.mip_levels,
+            image.array_layers};
+  }
+  if (bc) {
+    return {format.bc, image.width, image.height, image.mip_levels,
             image.array_layers};
   }
   const bool scaled = upscale > 1 && format.color && image.array_layers == 1 &&
@@ -956,22 +1027,41 @@ void GoldenHasher::AddU32(std::uint32_t value) {
   Add(bytes, sizeof(bytes));
 }
 
-bool FindEtc2EmulationGolden(const std::string& name, std::uint64_t* hash) {
-  struct Entry {
-    const char* name;
-    std::uint64_t hash;
-  };
-  static constexpr Entry kGoldens[] = {
-#include "vulkan_etc2_emulation_golden.inc"
-      {nullptr, 0},
-  };
-  for (const Entry& entry : kGoldens) {
+namespace {
+
+struct GoldenEntry {
+  const char* name;
+  std::uint64_t hash;
+};
+
+template <std::size_t kCount>
+bool FindGolden(const GoldenEntry (&goldens)[kCount], const std::string& name,
+                std::uint64_t* hash) {
+  for (const GoldenEntry& entry : goldens) {
     if (entry.name != nullptr && name == entry.name) {
       *hash = entry.hash;
       return true;
     }
   }
   return false;
+}
+
+}  // namespace
+
+bool FindEtc2EmulationGolden(const std::string& name, std::uint64_t* hash) {
+  static constexpr GoldenEntry kGoldens[] = {
+#include "vulkan_etc2_emulation_golden.inc"
+      {nullptr, 0},
+  };
+  return FindGolden(kGoldens, name, hash);
+}
+
+bool FindEtc2BcEmulationGolden(const std::string& name, std::uint64_t* hash) {
+  static constexpr GoldenEntry kGoldens[] = {
+#include "vulkan_etc2_bc_golden.inc"
+      {nullptr, 0},
+  };
+  return FindGolden(kGoldens, name, hash);
 }
 
 // ---- the reference model ----------------------------------------------------
@@ -1028,6 +1118,7 @@ struct Etc2EmulationModel::State {
   std::uint32_t upscale = 1;
   bool device_emulated = true;
   bool overrides = false;
+  bool bc = false;  // ETC2->BC mode
   std::vector<Image> images;
   std::vector<CommandBuffer> command_buffers;
   std::map<std::uint64_t, std::shared_ptr<const RgbaImage>> override_files;
@@ -1091,6 +1182,12 @@ struct Etc2EmulationModel::State {
     upload->target_height = extent.height;
     upload->host_x = static_cast<std::uint32_t>(region.imageOffset.x);
     upload->host_y = static_cast<std::uint32_t>(region.imageOffset.y);
+    if (bc && image.emulated &&
+        (region.imageOffset.x < 0 || region.imageOffset.y < 0 ||
+         upload->host_x >= Mip(image.spec.width, sub.mipLevel) ||
+         upload->host_y >= Mip(image.spec.height, sub.mipLevel))) {
+      return false;  // BC mode refuses a region that starts outside its mip
+    }
     if (image.scale > 1) {
       std::uint32_t x0 = 0;
       std::uint32_t x1 = 0;
@@ -1170,6 +1267,21 @@ struct Etc2EmulationModel::State {
         replacement = image.override_image;
       }
     }
+    if (bc) {
+      // Roblox's blocks transcode whole; an override is resampled to the
+      // region and encoded, its edge texels repeated.
+      upload->staging =
+          replacement != nullptr
+              ? reference::BcFromTexels(
+                    format,
+                    Resample(replacement->pixels.data(), replacement->width,
+                             replacement->height, upload->target_width,
+                             upload->target_height)
+                        .data(),
+                    upload->target_width, upload->target_height, 1, true)
+              : reference::BcFromEtc(format, tight.data(), tight.size(), true);
+      return;
+    }
     if (replacement != nullptr) {
       upload->staging = Resample(replacement->pixels.data(), replacement->width,
                                  replacement->height, upload->target_width,
@@ -1202,24 +1314,55 @@ struct Etc2EmulationModel::State {
                                upload->target_width, upload->target_height);
   }
 
+  // Whether a region lies inside an image's mip; the device runs no region
+  // that does not (on the fake; a real one may do anything).
+  bool Inside(std::uint32_t image_index, std::uint32_t mip, std::uint32_t x,
+              std::uint32_t y, std::uint32_t width,
+              std::uint32_t height) const {
+    const Image& image = images[image_index];
+    return mip < image.host.mip_levels &&
+           x + width <= Mip(image.host.width, mip) &&
+           y + height <= Mip(image.host.height, mip);
+  }
+
+  // Staging holds the region tightly packed, in texel blocks of the host
+  // format (one texel for RGBA8/R16, 4x4 for BC). In BC mode the host copy
+  // takes the part of the region inside the mip (an extent rounded up to
+  // whole blocks past the edge), reading the same staging rows.
   void WriteUpload(const Upload& upload) {
     Image& image = images[upload.image];
-    const std::size_t texel = image.block.bytes;
-    const std::uint32_t mip_width = Mip(image.host.width, upload.mip);
+    std::uint32_t width = upload.target_width;
+    std::uint32_t height = upload.target_height;
+    if (bc && image.emulated) {
+      width = std::min(width, Mip(image.host.width, upload.mip) - upload.host_x);
+      height =
+          std::min(height, Mip(image.host.height, upload.mip) - upload.host_y);
+    }
+    if (!Inside(upload.image, upload.mip, upload.host_x, upload.host_y, width,
+                height)) {
+      return;
+    }
+    const FormatBlock& block = image.block;
+    const std::uint32_t mip_blocks =
+        DivideUp(Mip(image.host.width, upload.mip), block.width);
+    const std::uint32_t pitch = DivideUp(upload.target_width, block.width);
+    const std::uint32_t rows = DivideUp(upload.target_height, block.height);
+    const std::uint32_t wide = DivideUp(width, block.width);
+    const std::uint32_t high = DivideUp(height, block.height);
+    const std::uint32_t bx = upload.host_x / block.width;
+    const std::uint32_t by = upload.host_y / block.height;
     for (std::uint32_t layer = 0; layer < upload.layers; ++layer) {
       std::vector<std::uint8_t>& texels =
           Texels(upload.image, upload.mip, upload.base_layer + layer);
-      for (std::uint32_t y = 0; y < upload.target_height; ++y) {
+      for (std::uint32_t row = 0; row < high; ++row) {
         std::memcpy(
             texels.data() +
-                ((static_cast<std::size_t>(upload.host_y) + y) * mip_width +
-                 upload.host_x) *
-                    texel,
+                ((static_cast<std::size_t>(by) + row) * mip_blocks + bx) *
+                    block.bytes,
             upload.staging.data() +
-                ((static_cast<std::size_t>(layer) * upload.target_height + y) *
-                 upload.target_width) *
-                    texel,
-            static_cast<std::size_t>(upload.target_width) * texel);
+                ((static_cast<std::size_t>(layer) * rows + row) * pitch) *
+                    block.bytes,
+            static_cast<std::size_t>(wide) * block.bytes);
       }
     }
   }
@@ -1267,6 +1410,18 @@ struct Etc2EmulationModel::State {
 
   void CopyRegion(std::uint32_t source_index, std::uint32_t destination_index,
                   const VkImageCopy& region) {
+    if (region.srcOffset.x < 0 || region.srcOffset.y < 0 ||
+        region.dstOffset.x < 0 || region.dstOffset.y < 0 ||
+        !Inside(source_index, region.srcSubresource.mipLevel,
+                static_cast<std::uint32_t>(region.srcOffset.x),
+                static_cast<std::uint32_t>(region.srcOffset.y),
+                region.extent.width, region.extent.height) ||
+        !Inside(destination_index, region.dstSubresource.mipLevel,
+                static_cast<std::uint32_t>(region.dstOffset.x),
+                static_cast<std::uint32_t>(region.dstOffset.y),
+                region.extent.width, region.extent.height)) {
+      return;
+    }
     const FormatBlock& block = images[source_index].block;
     const std::uint32_t src_blocks = DivideUp(
         Mip(images[source_index].host.width, region.srcSubresource.mipLevel),
@@ -1397,16 +1552,18 @@ struct Etc2EmulationModel::State {
   }
 };
 
-Etc2EmulationModel::Etc2EmulationModel(const Scenario& scenario)
+Etc2EmulationModel::Etc2EmulationModel(const Scenario& scenario, bool bc)
     : state_(std::make_unique<State>()) {
   state_->upscale = scenario.upscale;
   state_->device_emulated = scenario.emulated;
   state_->overrides = scenario.overrides;
+  state_->bc = bc && scenario.emulated;
   state_->command_buffers.resize(scenario.command_buffers.size());
   for (const ScenarioImage& spec : scenario.images) {
     State::Image image;
     image.spec = spec;
-    image.host = HostShapeFor(spec, scenario.upscale, scenario.emulated);
+    image.host =
+        HostShapeFor(spec, scenario.upscale, scenario.emulated, state_->bc);
     image.emulated =
         scenario.emulated && LookupEmulated(spec.format, &image.format);
     image.scale = image.host.width / spec.width;

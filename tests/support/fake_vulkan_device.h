@@ -64,6 +64,10 @@ class FakeVulkanDevice {
     // vkCreateComputePipelines fails, as on a driver whose compiler
     // rejects the shader.
     bool fail_compute_pipelines = false;
+    // The physical device's features, which also decide its format
+    // properties (GetInstanceProcAddr). An RTX 3060 has BC and no ETC2.
+    bool texture_compression_etc2 = false;
+    bool texture_compression_bc = true;
   };
 
   struct ObjectCount {
@@ -121,6 +125,12 @@ class FakeVulkanDevice {
   VkPhysicalDevice physical_device() const;
   const Config& config() const;
   static PFN_vkGetDeviceProcAddr GetDeviceProcAddr();
+  // vkGetPhysicalDeviceFeatures, FormatProperties and ImageFormatProperties
+  // for the physical device of any fake, with any instance handle such as
+  // instance(): compressed formats can be sampled and copied when the
+  // features have them, everything else modelled can be used for anything.
+  static PFN_vkGetInstanceProcAddr GetInstanceProcAddr();
+  static VkInstance instance();
 
   // Direct host calls.
   VkResult CreateBuffer(VkDeviceSize size, VkBufferUsageFlags usage,

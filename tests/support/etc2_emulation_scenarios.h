@@ -90,6 +90,11 @@ struct Scenario {
   std::string fake_only;
   // Fake-device errors this scenario expects today, as substrings.
   std::vector<std::string> allowed_fake_errors;
+  // ... and the ones it expects in ETC2->BC mode on top: BC hosts keep the
+  // app's block sizes, so copies an app may not make (between formats of
+  // different block sizes, or regions an upscale used to drop) reach the
+  // host as they are. A real GPU does not run such a scenario in BC mode.
+  std::vector<std::string> bc_mode_fake_errors;
   std::vector<ScenarioImage> images;
   std::vector<ScenarioSource> sources;
   std::vector<ScenarioCommandBuffer> command_buffers;
@@ -102,7 +107,8 @@ const Scenario* FindEtc2EmulationScenario(const std::string& name);
 std::vector<std::uint8_t> SeededBytes(std::uint64_t seed, std::size_t size);
 
 // The image the emulation creates on the host for `image` (format, extent
-// after the small-texture upscale).
+// after the small-texture upscale). In ETC2->BC mode (`bc`) an emulated
+// image is a BC host of its own extent: BC mode never upscales.
 struct HostImageShape {
   VkFormat format = VK_FORMAT_UNDEFINED;
   std::uint32_t width = 0;
@@ -111,7 +117,7 @@ struct HostImageShape {
   std::uint32_t array_layers = 1;
 };
 HostImageShape HostShapeFor(const ScenarioImage& image, std::uint32_t upscale,
-                            bool emulated);
+                            bool emulated, bool bc = false);
 
 // FNV-1a 64, folded over every checkpoint's images. Goldens are these.
 class GoldenHasher {
@@ -126,6 +132,10 @@ class GoldenHasher {
 
 // The frozen hash for a scenario, from vulkan_etc2_emulation_golden.inc.
 bool FindEtc2EmulationGolden(const std::string& name, std::uint64_t* hash);
+// The same in ETC2->BC mode on the CPU route, from
+// vulkan_etc2_bc_golden.inc (no entry for scenarios with
+// bc_mode_fake_errors: what the fake makes of invalid copies means nothing).
+bool FindEtc2BcEmulationGolden(const std::string& name, std::uint64_t* hash);
 
 // What the plus.1 emulation does, written from its rules rather than its
 // code: ETC2/EAC copies decode with the reference decoder at submit time and
@@ -134,6 +144,14 @@ bool FindEtc2EmulationGolden(const std::string& name, std::uint64_t* hash);
 // resampled from); override PNGs replace mip-0 colour uploads by hash; image
 // copies touching an upscaled image become blits. Images are indexed in
 // scenario order, command buffers likewise.
+//
+// With `bc`, ETC2->BC mode (DESIGN C4): emulated images are BC1/BC3/BC4/BC5
+// hosts of their own extent; uploads transcode every block with the
+// reference decoder and the frozen reference encoder, refinement on
+// (support/bc_reference_transcode.h); override PNGs are resampled to the
+// region and encoded with their edge texels repeated; image copies stay
+// copies of whole blocks. Dumps are the decoded texels in both modes.
+// Regions outside an image are skipped, as the fake device skips them.
 class Etc2EmulationModel {
  public:
   struct Transfer {
@@ -152,7 +170,7 @@ class Etc2EmulationModel {
     std::vector<std::uint8_t> rgba;
   };
 
-  explicit Etc2EmulationModel(const Scenario& scenario);
+  explicit Etc2EmulationModel(const Scenario& scenario, bool bc = false);
   ~Etc2EmulationModel();
 
   const HostImageShape& host_shape(std::uint32_t image) const;

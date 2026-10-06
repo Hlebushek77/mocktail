@@ -4,11 +4,14 @@
 // runs (CR-25).
 //
 //   etc2_cpu_perf [--reps N] [--workload small|big|mixed]...
-//                 [--arm legacy|cached|coherent]... [section...]
+//                 [--arm legacy|cached|coherent|bc|bc-legacy]... [section...]
 //
 // Sections (all by default):
 //   kernels    the decoder and the resampler against the plus.1 references
 //              (single thread, bit-exact)
+//   bc         ETC2->BC mode's CPU cost (CR-13): decode against decode and
+//              BC encode, with and without the endpoint refinement, per
+//              1024x1024 texels on one thread
 //   pool       waking the persistent pool against creating and joining
 //              threads per call, as plus.1 did
 //   copy       copy-in from Roblox-like write-combined memory (type 3 on
@@ -18,7 +21,9 @@
 //              through the legacy path (MOCKTAIL_ETC2_FAST_PATH=0) and the
 //              fast path with cached and coherent staging; staging contents
 //              compared byte for byte; transient RAM; scratch and arena after
-//              the idle delays
+//              the idle delays. ETC2->BC mode (MOCKTAIL_ETC2_TO_BC=1) only
+//              when asked for: --arm bc (fast path, cached staging) and
+//              --arm bc-legacy, whose BC staging is compared between them
 //   gpucopy    the GPU reading staging: vkCmdCopyBufferToImage of 64 MiB
 //              from cached (type 4) and coherent (type 3) system memory
 //
@@ -50,12 +55,15 @@
 #include <utility>
 #include <vector>
 
+#include "mocktail/graphics/bc_encoder.h"
 #include "mocktail/graphics/etc2_decoder.h"
 #include "mocktail/graphics/mapped_memory_copy.h"
 #include "mocktail/graphics/texture_override.h"
 #include "mocktail/graphics/vulkan_etc2_emulation.h"
 #include "mocktail/graphics/worker_pool.h"
+#include "support/bc_reference_transcode.h"
 #include "support/etc2_reference_decoder.h"
+#include "support/fake_vulkan_device.h"
 #include "support/resample_reference.h"
 #include "support/vulkan_test_device.h"
 
@@ -202,6 +210,70 @@ void RunKernels() {
                 test.height, Median(old_ms) * 1000.0, Median(new_ms) * 1000.0,
                 Median(old_ms) / Median(new_ms),
                 before == after ? "identical" : "DIFFERENT");
+  }
+}
+
+// ---------------------------------------------------------------- bc
+
+// What ETC2->BC mode costs the CPU route per texel (DESIGN CR-13): the
+// decode the default mode does, against BC mode's decode and encode with the
+// endpoint refinement (what the CPU route does, as the GPU route's shader)
+// and without it (the refine=0 question CR-13 leaves to the user). Random
+// blocks, which hit every ETC2 mode; the refined output is checked against
+// the references on its first 4096 blocks.
+void RunBc() {
+  std::printf("== bc (one thread, per 1024x1024 texels; CR-13)\n");
+  struct Case {
+    EtcFormat format;
+    const char* name;
+  };
+  const Case cases[] = {
+      {EtcFormat::kEtc2Rgb8, "RGB8->BC1"},
+      {EtcFormat::kEtc2Rgb8A1, "RGB8A1->BC1"},
+      {EtcFormat::kEtc2Rgba8, "RGBA8->BC3"},
+      {EtcFormat::kEacR11, "R11->BC4"},
+      {EtcFormat::kEacRg11, "RG11->BC5"},
+      {EtcFormat::kEacRg11Signed, "RG11S->BC5S"},
+  };
+  constexpr std::uint32_t kSize = 1024;
+  constexpr std::size_t kChecked = 4096;
+  for (const Case& test : cases) {
+    const std::size_t block_bytes = EtcBlockBytes(test.format);
+    const std::vector<std::uint8_t> source = RandomBytes(
+        static_cast<std::size_t>(kSize / 4) * (kSize / 4) * block_bytes,
+        0xBC + static_cast<int>(test.format));
+    std::vector<std::uint8_t> decoded(static_cast<std::size_t>(kSize) * kSize *
+                                      EtcDecodedTexelBytes(test.format));
+    std::vector<std::uint8_t> refined(source.size());
+    std::vector<std::uint8_t> plain(source.size());
+    std::vector<double> decode_ms;
+    std::vector<double> refined_ms;
+    std::vector<double> plain_ms;
+    for (int rep = 0; rep < 7; ++rep) {
+      const auto t0 = Clock::now();
+      DecodeEtcImage(test.format, source.data(), source.size(), kSize, kSize,
+                     decoded.data(), decoded.size());
+      const auto t1 = Clock::now();
+      TranscodeEtcToBc(test.format, source.data(), source.size(),
+                       refined.data(), refined.size(), true);
+      const auto t2 = Clock::now();
+      TranscodeEtcToBc(test.format, source.data(), source.size(), plain.data(),
+                       plain.size(), false);
+      const auto t3 = Clock::now();
+      decode_ms.push_back(Ms(t1 - t0));
+      refined_ms.push_back(Ms(t2 - t1));
+      plain_ms.push_back(Ms(t3 - t2));
+    }
+    const std::vector<std::uint8_t> expected = reference::BcFromEtc(
+        test.format, source.data(), kChecked * block_bytes, true);
+    const bool identical = std::equal(expected.begin(), expected.end(),
+                                      refined.begin());
+    std::printf("  %-11s decode %6.2f ms   BC refined %6.2f ms (x%.1f)   BC "
+                "plain %6.2f ms (x%.1f)   %s\n",
+                test.name, Median(decode_ms), Median(refined_ms),
+                Median(refined_ms) / Median(decode_ms), Median(plain_ms),
+                Median(plain_ms) / Median(decode_ms),
+                identical ? "refined = reference" : "REFINED DIFFERS");
   }
 }
 
@@ -693,8 +765,10 @@ Workload MakeWorkload(const char* kind, bool per_mip) {
 
 struct Arm {
   const char* name;
+  const char* word;  // for --arm
   bool fast_path;
   Etc2StagingMemory staging;
+  bool bc;  // MOCKTAIL_ETC2_TO_BC=1
 };
 
 // The bytes the host copies read from staging, hashed in copy order.
@@ -712,16 +786,18 @@ std::uint64_t HashStaging(std::uint64_t* written) {
     }
     const std::uint8_t* base = mapping->second + binding->second.second;
     const auto format = g_host.images.find(copy.image);
-    const std::size_t texel =
-        format != g_host.images.end() &&
-                (format->second == VK_FORMAT_R16_UNORM ||
-                 format->second == VK_FORMAT_R16_SNORM)
-            ? 2
-            : 4;
+    // Texels of RGBA8 or R16, or 4x4 blocks of BC.
+    FormatBlock block{1, 1, 4};
+    if (format != g_host.images.end()) {
+      LookupFormatBlock(format->second, &block);
+    }
     for (const VkBufferImageCopy& region : copy.regions) {
       const std::size_t bytes =
-          static_cast<std::size_t>(region.imageExtent.width) *
-          region.imageExtent.height * texel;
+          static_cast<std::size_t>((region.imageExtent.width + block.width -
+                                    1) /
+                                   block.width) *
+          ((region.imageExtent.height + block.height - 1) / block.height) *
+          block.bytes;
       const std::uint8_t* data = base + region.bufferOffset;
       for (std::size_t index = 0; index < bytes; ++index) {
         hash = (hash ^ data[index]) * 0x100000001b3ULL;
@@ -777,12 +853,32 @@ class Session {
     options.gpu = false;
     options.fast_path = arm.fast_path;
     options.staging_memory = arm.staging;
+    options.to_bc = arm.bc;
     options.frame_stats = true;
     emulation_ = std::make_unique<VulkanEtc2Emulation>(options);
+    if (arm.bc) {
+      // As vkCreateDevice decides it, from the driver's own answers.
+      const auto instance_proc = [&](const char* name) {
+        return device.get_instance_proc_addr()(device.instance(), name);
+      };
+      log_ += CaptureStderr([&] {
+        ok_ = emulation_->PhysicalDeviceUsesBc(
+            device.physical_device(),
+            reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures>(
+                instance_proc("vkGetPhysicalDeviceFeatures")),
+            reinterpret_cast<PFN_vkGetPhysicalDeviceFormatProperties>(
+                instance_proc("vkGetPhysicalDeviceFormatProperties")));
+      });
+      if (!ok_) {
+        why_ = "the device cannot enter ETC2->BC mode";
+        return;
+      }
+    }
     // Room for the buffer's alignment padding.
     ok_ = AllocateMapped(device, workload.source_bytes + (64U << 10),
                          source_type, &source_);
     if (!ok_) {
+      why_ = "cannot allocate the source memory";
       return;
     }
     // Written once, then unmapped, so that the emulation maps it through
@@ -802,10 +898,12 @@ class Session {
     device_info.pQueueCreateInfos = &queue_info;
     const VkDevice handle = device.device();
     log_ += CaptureStderr([&] {
-      emulation_->RegisterDevice(handle, device.physical_device(), true,
-                                 device.memory(), device.properties(),
-                                 device.queue_families(), device_info,
-                                 HostGetDeviceProcAddr);
+      emulation_->RegisterDevice(
+          handle, device.physical_device(), true, device.memory(),
+          device.properties(), device.queue_families(), device_info,
+          HostGetDeviceProcAddr,
+          arm.bc ? device.get_instance_proc_addr() : nullptr,
+          arm.bc ? device.instance() : VK_NULL_HANDLE);
       emulation_->RegisterQueue(handle, device.queue(), device.queue_family(),
                                 0);
       emulation_->RegisterCommandPool(handle, kPool, device.queue_family(), 0);
@@ -836,6 +934,9 @@ class Session {
 
   ~Session() {
     if (!ok_) {
+      if (source_.memory != VK_NULL_HANDLE) {
+        FreeBuffer(device_, &source_);
+      }
       return;
     }
     const VkDevice handle = device_.device();
@@ -853,6 +954,7 @@ class Session {
   }
 
   bool ok() const { return ok_; }
+  const std::string& why() const { return why_; }
   const Arm& arm() const { return arm_; }
 
   // One burst: record every copy, submit, release. Round 0 makes the
@@ -962,6 +1064,7 @@ class Session {
   const Workload& workload_;
   Arm arm_;
   bool ok_ = false;
+  std::string why_;
   std::unique_ptr<VulkanEtc2Emulation> emulation_;
   DeviceMemory source_;
   VkBuffer buffer_ = VK_NULL_HANDLE;
@@ -998,15 +1101,18 @@ void RunEmulation(const HeadlessVulkanDevice& device, int reps,
     return;
   }
   std::vector<Arm> arms;
-  for (const Arm& arm : {Arm{"legacy", false, Etc2StagingMemory::kCoherent},
-                         Arm{"fast cached", true, Etc2StagingMemory::kCached},
-                         Arm{"fast coherent", true,
-                             Etc2StagingMemory::kCoherent}}) {
-    // --arm takes the last word of the name: legacy, cached, coherent.
-    const std::string name = arm.name;
-    const std::string word = name.substr(name.rfind(' ') + 1);
-    if (only_arms.empty() || std::find(only_arms.begin(), only_arms.end(),
-                                       word) != only_arms.end()) {
+  for (const Arm& arm :
+       {Arm{"legacy", "legacy", false, Etc2StagingMemory::kCoherent, false},
+        Arm{"fast cached", "cached", true, Etc2StagingMemory::kCached, false},
+        Arm{"fast coherent", "coherent", true, Etc2StagingMemory::kCoherent,
+            false},
+        Arm{"bc legacy", "bc-legacy", false, Etc2StagingMemory::kCoherent,
+            true},
+        Arm{"bc cached", "bc", true, Etc2StagingMemory::kCached, true}}) {
+    // ETC2->BC mode only when asked for.
+    if (only_arms.empty() ? !arm.bc
+                          : std::find(only_arms.begin(), only_arms.end(),
+                                      arm.word) != only_arms.end()) {
       arms.push_back(arm);
     }
   }
@@ -1043,7 +1149,7 @@ void RunEmulation(const HeadlessVulkanDevice& device, int reps,
       sessions.push_back(std::make_unique<Session>(device, workload, bytes,
                                                    source_type, arm));
       if (!sessions.back()->ok()) {
-        std::printf("  cannot allocate the source memory\n");
+        std::printf("  %s: %s\n", arm.name, sessions.back()->why().c_str());
         return;
       }
     }
@@ -1052,8 +1158,13 @@ void RunEmulation(const HeadlessVulkanDevice& device, int reps,
         session->Round(round == 0, round == reps);
       }
     }
+    // Each arm against the first of its mode: BC staging holds blocks.
     for (const auto& session : sessions) {
-      session->Print(sessions.front()->staging_hash());
+      const auto first = std::find_if(
+          sessions.begin(), sessions.end(), [&](const auto& other) {
+            return other->arm().bc == session->arm().bc;
+          });
+      session->Print((*first)->staging_hash());
     }
     sessions.clear();
     const auto fast = std::find_if(arms.begin(), arms.end(),
@@ -1108,6 +1219,9 @@ int main(int argc, char** argv) {
   }
   if (wanted("kernels")) {
     RunKernels();
+  }
+  if (wanted("bc")) {
+    RunBc();
   }
   if (wanted("pool")) {
     RunPool(workers);

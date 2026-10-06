@@ -1286,6 +1286,28 @@ bool Etc2FormatsAdvertised(VkPhysicalDevice physical_device) {
   return mocktail::graphics::Etc2FormatsAdvertised(emulated, advertised, mode);
 }
 
+// ETC2->BC mode on this physical device (MOCKTAIL_ETC2_TO_BC=1 and the
+// device can do it): the format-property hooks then answer from the BC host
+// formats, as its images will be BC (DESIGN C4.5).
+bool Etc2BcPhysicalDevice(VkPhysicalDevice physical_device) {
+  return State().etc2.options().to_bc &&
+         State().etc2.PhysicalDeviceUsesBc(
+             physical_device,
+             HostPhysicalDeviceProc<PFN_vkGetPhysicalDeviceFeatures>(
+                 "vkGetPhysicalDeviceFeatures", nullptr),
+             HostPhysicalDeviceProc<PFN_vkGetPhysicalDeviceFormatProperties>(
+                 "vkGetPhysicalDeviceFormatProperties", nullptr));
+}
+
+// The format a format-property query for an emulated format asks the host
+// about: the host image's.
+VkFormat Etc2QueryHostFormat(
+    VkPhysicalDevice physical_device,
+    const mocktail::graphics::Etc2EmulatedFormat& mapped) {
+  return Etc2BcPhysicalDevice(physical_device) ? mapped.bc_host_format
+                                               : mapped.host_format;
+}
+
 void ReleaseEtc2PoolCommandBuffers(VkDevice device,
                                    VkCommandPool command_pool) {
   std::vector<VkCommandBuffer> command_buffers;
@@ -1631,9 +1653,14 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(
       physical_device, reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures>(
                            HostInstanceProc(instance,
                                             "vkGetPhysicalDeviceFeatures")));
+  // ETC2->BC mode stores ETC2 textures as BC images: enable BC on the
+  // device too (no VUID asks for it; insurance, DESIGN C4.2).
+  const bool etc2_to_bc =
+      etc2_emulated && Etc2BcPhysicalDevice(physical_device);
   VkPhysicalDeviceFeatures host_enabled_features{};
   VkPhysicalDeviceFeatures2* requested_features2 = nullptr;
   VkBool32 requested_features2_etc2 = VK_FALSE;
+  VkBool32 requested_features2_bc = VK_FALSE;
   if (etc2_emulated) {
     enabled.root.features.textureCompressionETC2 = VK_FALSE;
     if (create_info->pEnabledFeatures != nullptr) {
@@ -1641,14 +1668,28 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(
       host_enabled_features.textureCompressionETC2 = VK_FALSE;
       host_info.pEnabledFeatures = &host_enabled_features;
     }
-    // Restore the caller-owned feature bit after the host call.
+    // Restore the caller-owned feature bits after the host call.
     requested_features2 = const_cast<VkPhysicalDeviceFeatures2*>(
         reinterpret_cast<const VkPhysicalDeviceFeatures2*>(FindFeature(
             create_info->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2)));
     if (requested_features2 != nullptr) {
       requested_features2_etc2 =
           requested_features2->features.textureCompressionETC2;
+      requested_features2_bc =
+          requested_features2->features.textureCompressionBC;
       requested_features2->features.textureCompressionETC2 = VK_FALSE;
+    }
+  }
+  if (etc2_to_bc) {
+    enabled.root.features.textureCompressionBC = VK_TRUE;
+    if (requested_features2 != nullptr) {
+      requested_features2->features.textureCompressionBC = VK_TRUE;
+    } else {
+      // Roblox's pEnabledFeatures, copied above, or [CR-15] when it passed
+      // neither that nor VkPhysicalDeviceFeatures2, a struct of our own
+      // with only BC.
+      host_enabled_features.textureCompressionBC = VK_TRUE;
+      host_info.pEnabledFeatures = &host_enabled_features;
     }
   }
   enabled.root.pNext = &enabled.vulkan11;
@@ -1689,6 +1730,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(
   if (requested_features2 != nullptr) {
     requested_features2->features.textureCompressionETC2 =
         requested_features2_etc2;
+    requested_features2->features.textureCompressionBC = requested_features2_bc;
   }
   if (result != VK_SUCCESS) {
     return result;
@@ -2519,7 +2561,8 @@ VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFormatProperties(
     host(physical_device, format, properties);
     return;
   }
-  host(physical_device, mapped.host_format, properties);
+  host(physical_device, Etc2QueryHostFormat(physical_device, mapped),
+       properties);
   properties->linearTilingFeatures = 0;
   properties->optimalTilingFeatures =
       mocktail::graphics::EmulatedEtc2FormatFeatures(
@@ -2543,7 +2586,8 @@ VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFormatProperties2(
     host(physical_device, format, properties);
     return;
   }
-  host(physical_device, mapped.host_format, properties);
+  host(physical_device, Etc2QueryHostFormat(physical_device, mapped),
+       properties);
   VkFormatProperties& base = properties->formatProperties;
   base.linearTilingFeatures = 0;
   base.optimalTilingFeatures =
@@ -2581,10 +2625,20 @@ VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceImageFormatProperties(
   if (tiling != VK_IMAGE_TILING_OPTIMAL || type != VK_IMAGE_TYPE_2D) {
     return VK_ERROR_FORMAT_NOT_SUPPORTED;
   }
+  const VkImageCreateFlags host_flags =
+      flags & ~static_cast<VkImageCreateFlags>(
+                  VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT);
+  if (Etc2BcPhysicalDevice(physical_device)) {
+    // The limits come from BC. [CR-14] A usage BC rejects gets an
+    // RGBA8/R16 image from vkCreateImage, so its answer stands then.
+    const VkResult result = host(physical_device, mapped.bc_host_format, type,
+                                 tiling, usage, host_flags, properties);
+    if (result == VK_SUCCESS) {
+      return result;
+    }
+  }
   return host(physical_device, mapped.host_format, type, tiling, usage,
-              flags & ~static_cast<VkImageCreateFlags>(
-                          VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT),
-              properties);
+              host_flags, properties);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceImageFormatProperties2(
@@ -2608,9 +2662,28 @@ VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceImageFormatProperties2(
     return VK_ERROR_FORMAT_NOT_SUPPORTED;
   }
   VkPhysicalDeviceImageFormatInfo2 host_info = *info;
-  host_info.format = mapped.host_format;
   host_info.flags &= ~static_cast<VkImageCreateFlags>(
       VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT);
+  if (Etc2BcPhysicalDevice(physical_device) &&
+      mocktail::graphics::Etc2FormatListAllowsBc(info->pNext)) {
+    // As in the hook above: BC's limits, else what vkCreateImage would
+    // fall back to (CR-14).
+    host_info.format = mapped.bc_host_format;
+    VkResult result = VK_ERROR_FORMAT_NOT_SUPPORTED;
+    {
+      const mocktail::graphics::Etc2FormatListRewrite rewrite(
+          &host_info.pNext, true);
+      result = host(physical_device, &host_info, properties);
+    }
+    if (result == VK_SUCCESS) {
+      return result;
+    }
+    host_info.pNext = info->pNext;
+  }
+  host_info.format = mapped.host_format;
+  // [CR-15] A format list names the host formats too.
+  const mocktail::graphics::Etc2FormatListRewrite rewrite(&host_info.pNext,
+                                                          false);
   return host(physical_device, &host_info, properties);
 }
 

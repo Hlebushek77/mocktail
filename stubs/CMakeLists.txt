@@ -127,6 +127,10 @@ target_include_directories(stub_vulkan PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_sources(stub_vulkan PRIVATE
   ${CMAKE_SOURCE_DIR}/src/graphics/vulkan_call_stats.cc
 )
+# ETC2->BC mode (plus.2 WP3).
+target_sources(stub_vulkan PRIVATE
+  ${CMAKE_SOURCE_DIR}/src/graphics/bc_encoder.cc
+)
 pkg_check_modules(LIBPLACEBO REQUIRED IMPORTED_TARGET libplacebo)
 pkg_check_modules(LIBPNG REQUIRED IMPORTED_TARGET libpng)
 target_link_libraries(stub_vulkan PRIVATE

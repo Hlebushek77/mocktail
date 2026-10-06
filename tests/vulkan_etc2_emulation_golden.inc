@@ -26,3 +26,7 @@
 {"NotEmulatedDevice", 0x77dccff1e29868c9ULL},
 {"TransferOnlyQueueFamily", 0x4995331e4d312511ULL},
 {"TextureOverridesAndDumps", 0xd804d9c02baf52caULL},
+// Added with ETC2->BC mode (plus.2 WP3a, on plus2/main d027807), after the
+// scenario matched the reference model on both CPU paths: no plus.1 output
+// exists for it.
+{"CopyImageMipMoves", 0x700880df3f83b086ULL},

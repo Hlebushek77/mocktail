@@ -13,14 +13,66 @@
 namespace mocktail::graphics {
 
 struct Etc2EmulatedFormat {
+  // The host image's format: RGBA8, R16 or R16G16 by default, the BC
+  // format in ETC2->BC mode.
   VkFormat host_format = VK_FORMAT_UNDEFINED;
   EtcFormat etc_format = EtcFormat::kEtc2Rgb8;
+  // What ETC2->BC mode (MOCKTAIL_ETC2_TO_BC=1) stores instead, with the
+  // same block size (DESIGN C4.1): RGB8 -> BC1_RGB, RGB8A1 -> BC1_RGBA,
+  // RGBA8 -> BC3, R11 -> BC4, RG11 -> BC5; UNORM, SRGB and SNORM kept.
+  VkFormat bc_host_format = VK_FORMAT_UNDEFINED;
 };
 
+// An ETC2/EAC format's emulation, with the default host format.
 bool LookupEmulatedEtc2Format(VkFormat format, Etc2EmulatedFormat* out);
+// The same, with the BC host format when `bc` (an ETC2->BC mode image).
+bool LookupEmulatedEtc2Format(VkFormat format, bool bc,
+                              Etc2EmulatedFormat* out);
 
 VkFormatFeatureFlags EmulatedEtc2FormatFeatures(
     VkFormatFeatureFlags host_features);
+
+// The optimal-tiling features ETC2->BC mode needs on every BC host format:
+// all that EmulatedEtc2FormatFeatures() can advertise, so the ETC2/EAC
+// formats report the same features in both modes (CR-22: BLIT_SRC too).
+VkFormatFeatureFlags Etc2BcRequiredFormatFeatures();
+
+// The VkImageFormatListCreateInfo in a pNext chain, or null.
+const VkImageFormatListCreateInfo* FindImageFormatList(const void* next);
+
+// [CR-14] Whether an image with this pNext chain can be BC in ETC2->BC
+// mode: a format list that names a format other than ETC2/EAC asks for
+// views a BC image cannot have, so such an image keeps RGBA8/R16.
+bool Etc2FormatListAllowsBc(const void* next);
+
+// [CR-15] An emulated image's VkImageFormatListCreateInfo names ETC2/EAC
+// formats, which the host image does not have: for one host call this
+// replaces each of them by its host format (the BC one with `bc`) and puts
+// everything back when it goes out of scope. `host_next` is the pNext
+// member of the caller's own copy of the create or query struct. A list
+// that is the first struct of the chain is copied and linked in there, so
+// Roblox's memory is not written; a list further down keeps its place and
+// only its pViewFormats pointer changes until the destructor, as for the
+// textureCompressionETC2 bit in vkCreateDevice.
+class Etc2FormatListRewrite {
+ public:
+  Etc2FormatListRewrite(const void** host_next, bool bc);
+  ~Etc2FormatListRewrite();
+  Etc2FormatListRewrite(const Etc2FormatListRewrite&) = delete;
+  Etc2FormatListRewrite& operator=(const Etc2FormatListRewrite&) = delete;
+
+  // The chain holds a format list.
+  bool found() const { return found_; }
+  // ... that named an ETC2/EAC format, which the host call sees replaced.
+  bool rewritten() const { return !formats_.empty(); }
+
+ private:
+  bool found_ = false;
+  VkImageFormatListCreateInfo copy_{};
+  VkImageFormatListCreateInfo* patched_ = nullptr;
+  const VkFormat* original_ = nullptr;
+  std::vector<VkFormat> formats_;
+};
 
 bool Etc2UploadByteCounts(EtcFormat format, const VkExtent3D& extent,
                           std::uint32_t layer_count, VkDeviceSize* compressed,
@@ -122,6 +174,19 @@ class VulkanEtc2Emulation final {
 
   bool PhysicalDeviceNeedsEmulation(VkPhysicalDevice physical_device,
                                     PFN_vkGetPhysicalDeviceFeatures host);
+
+  // ETC2->BC mode (MOCKTAIL_ETC2_TO_BC=1, DESIGN C4.2) for devices of
+  // `physical_device`: it was asked for, the device is emulated, reports
+  // textureCompressionBC and gives every BC host format
+  // Etc2BcRequiredFormatFeatures(). Otherwise images keep their RGBA8/R16
+  // hosts and one "[vulkan] ETC2->BC unavailable: <reason>" line says why.
+  // Decided once per physical device, so vkCreateDevice (which then
+  // enables textureCompressionBC), the format-property hooks and the
+  // device's images agree. The functions must be the host loader's.
+  bool PhysicalDeviceUsesBc(
+      VkPhysicalDevice physical_device,
+      PFN_vkGetPhysicalDeviceFeatures get_features,
+      PFN_vkGetPhysicalDeviceFormatProperties get_format_properties);
 
   // `properties` and `queue_families` are the physical device's;
   // `create_info` is what Roblox passed to vkCreateDevice and is only read
