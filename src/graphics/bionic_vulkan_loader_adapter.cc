@@ -1266,24 +1266,11 @@ bool Etc2FeatureAdvertised(VkPhysicalDevice physical_device) {
 
 // Whether the format-property hooks answer for ETC2/EAC with the emulated
 // features. Only while the feature is advertised too, so that with
-// MOCKTAIL_ADVERTISE_ETC2=0 the formats report what the driver reports;
-// MOCKTAIL_ETC2_FORMAT_PROPS=legacy keeps plus.1's answer for the DXT probe.
+// MOCKTAIL_ADVERTISE_ETC2=0 the formats report what the driver reports.
 bool Etc2FormatsAdvertised(VkPhysicalDevice physical_device) {
-  const bool emulated = Etc2EmulatedPhysicalDevice(physical_device);
-  const bool advertised = mocktail::graphics::Etc2SupportAdvertised();
-  const mocktail::graphics::Etc2FormatPropsMode mode =
-      mocktail::graphics::Etc2FormatPropsModeFromEnvironment();
-  if (emulated && !advertised &&
-      mode == mocktail::graphics::Etc2FormatPropsMode::kLegacy) {
-    static std::atomic<bool> logged{false};
-    if (!logged.exchange(true, std::memory_order_relaxed)) {
-      std::fprintf(stderr,
-                   "  [vulkan] MOCKTAIL_ETC2_FORMAT_PROPS=legacy: ETC2/EAC "
-                   "formats report emulated features while "
-                   "textureCompressionETC2 is hidden\n");
-    }
-  }
-  return mocktail::graphics::Etc2FormatsAdvertised(emulated, advertised, mode);
+  return mocktail::graphics::Etc2FormatsAdvertised(
+      Etc2EmulatedPhysicalDevice(physical_device),
+      mocktail::graphics::Etc2SupportAdvertised());
 }
 
 // ETC2->BC mode on this physical device (MOCKTAIL_ETC2_TO_BC=1 and the
