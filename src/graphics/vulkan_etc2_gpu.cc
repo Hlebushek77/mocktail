@@ -1351,8 +1351,9 @@ struct Etc2GpuDevice::Impl {
     std::lock_guard<std::mutex> lock(queue_state->mutex);
     // [CR-29] Trimming and shrinking run here, on the submitting thread.
     TrimArenas(start);
-    const bool decode = state.load(std::memory_order_acquire) == State::kReady;
     Slot* slot = AcquireSlot(*queue_state);
+    // After AcquireSlot: its fence polls may have found the device lost.
+    const bool decode = state.load(std::memory_order_acquire) == State::kReady;
     bool buffers = false;
     if (slot != nullptr && decode) {
       VkDeviceSize input_bytes = 0;

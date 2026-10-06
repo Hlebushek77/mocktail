@@ -318,6 +318,7 @@ struct FakeVulkanDevice::Impl {
   std::vector<VkResult> submit_results;
   bool hold_fences = false;
   std::vector<VkFence> held_fences;
+  bool lost = false;
   std::map<std::pair<std::uint32_t, std::uint32_t>, VkQueue> queues;
   Counts counts;
   std::map<std::string, std::uint64_t> calls;
@@ -1908,6 +1909,9 @@ VKAPI_ATTR void VKAPI_CALL FakeDestroyFence(VkDevice device, VkFence fence,
 VKAPI_ATTR VkResult VKAPI_CALL FakeGetFenceStatus(VkDevice device,
                                                   VkFence fence) {
   FAKE_ENTER(device, "vkGetFenceStatus", VK_ERROR_DEVICE_LOST);
+  if (impl->lost) {
+    return VK_ERROR_DEVICE_LOST;
+  }
   const auto found = impl->fences.find(fence);
   if (found == impl->fences.end()) {
     impl->Error("vkGetFenceStatus", "unknown fence");
@@ -1922,6 +1926,9 @@ VKAPI_ATTR VkResult VKAPI_CALL FakeWaitForFences(VkDevice device,
                                                  VkBool32 wait_all,
                                                  std::uint64_t) {
   FAKE_ENTER(device, "vkWaitForFences", VK_ERROR_DEVICE_LOST);
+  if (impl->lost) {
+    return VK_ERROR_DEVICE_LOST;
+  }
   std::uint32_t signalled = 0;
   for (std::uint32_t index = 0; index < count; ++index) {
     const auto found = impl->fences.find(fences[index]);
@@ -2786,6 +2793,11 @@ VkQueue FakeVulkanDevice::GetQueue(std::uint32_t family, std::uint32_t index) {
 void FakeVulkanDevice::FailNextSubmits(std::vector<VkResult> results) {
   std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
   impl_->submit_results = std::move(results);
+}
+
+void FakeVulkanDevice::LoseDevice() {
+  std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
+  impl_->lost = true;
 }
 
 void FakeVulkanDevice::HoldFences(bool hold) {

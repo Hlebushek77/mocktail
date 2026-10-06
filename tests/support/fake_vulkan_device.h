@@ -163,6 +163,8 @@ class FakeVulkanDevice {
   // fell behind (the commands still run at submit). Letting go signals
   // every held fence.
   void HoldFences(bool hold);
+  // From now on fence queries and waits return VK_ERROR_DEVICE_LOST.
+  void LoseDevice();
   VkResult QueueSubmit(VkQueue queue, std::uint32_t count,
                        const VkSubmitInfo* submits, VkFence fence);
   VkResult QueueSubmit2(VkQueue queue, std::uint32_t count,

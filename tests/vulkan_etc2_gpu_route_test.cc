@@ -1031,6 +1031,51 @@ TEST_F(Etc2GpuRouteFakeTest, ARescueReadsStridedLayeredAndUnmappedSources) {
   }
 }
 
+// [CR-30] A lost device: the fence poll that finds it counts the slot as
+// signalled (never waits on it) and ends the GPU route. That call's
+// uploads are rescued on the CPU, later copies take the CPU route, and
+// teardown does not hang on the lost fences.
+TEST_F(Etc2GpuRouteFakeTest, ALostDeviceEndsTheGpuRoute) {
+  ::testing::internal::CaptureStderr();
+  {
+    FakeRig rig(GpuOptions());
+    ASSERT_TRUE(rig.WarmUp());
+    const VkCommandPool pool = rig.Pool(0);
+    RigImage* image = rig.Image(VK_FORMAT_EAC_R11G11_UNORM_BLOCK, 20, 20, 3);
+    RigSource* source = rig.Source(4096, 47);
+    const VkCommandBuffer first = rig.Begin(pool);
+    rig.Upload(first, *image, *source);
+    rig.End(first);
+    ASSERT_EQ(rig.Submit(rig.queue(), {{first}}, VK_NULL_HANDLE), VK_SUCCESS);
+    // Recorded while the route is ready; the device is lost before submit.
+    const VkCommandBuffer second = rig.Begin(pool);
+    const auto regions = rig.Upload(second, *image, *source);
+    rig.End(second);
+    rig.fake().LoseDevice();
+    ASSERT_EQ(rig.Submit(rig.queue(), {{second}}, VK_NULL_HANDLE), VK_SUCCESS);
+    rig.Check(*image, *source, regions);
+    EXPECT_EQ(rig.gpu()->state(), Etc2GpuDevice::State::kFailed);
+    EXPECT_EQ(rig.gpu()->stats().rescues, 1U);
+    EXPECT_EQ(rig.gpu()->stats().dropped_uploads, 0U);
+    EXPECT_EQ(rig.fake().calls("vkWaitForFences"), 0U);
+    const VkCommandBuffer third = rig.Begin(pool);
+    const auto later = rig.Upload(third, *image, *source);
+    rig.End(third);
+    const std::uint64_t passes = rig.gpu()->stats().passes;
+    ASSERT_EQ(rig.Submit(rig.queue(), {{third}}, VK_NULL_HANDLE), VK_SUCCESS);
+    rig.Check(*image, *source, later);
+    EXPECT_EQ(rig.gpu()->stats().passes, passes) << "the CPU route served it";
+    rig.Teardown();
+    ExpectEverythingReleased(rig.fake());
+    EXPECT_TRUE(rig.fake().errors().empty()) << rig.fake().errors().front();
+  }
+  const std::string log = ::testing::internal::GetCapturedStderr();
+  EXPECT_NE(log.find("[vulkan] ETC2 GPU decode unavailable: the device was "
+                     "lost"),
+            std::string::npos)
+      << log;
+}
+
 // Nothing submitted, nothing waited for: vkDestroyDevice of a device whose
 // route was built but never used makes no vkWaitForFences call.
 TEST_F(Etc2GpuRouteFakeTest, TeardownWaitsForNothingWhenNothingWasSubmitted) {
