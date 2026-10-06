@@ -2091,7 +2091,11 @@ std::uint32_t VulkanEtc2Emulation::State::RunCpuUploads(
       }
     }
   }
-  if (options.frame_stats && !work.empty()) {
+  if (work.empty()) {
+    // Most submits; never wait for another submit's decode for nothing.
+    return 0;
+  }
+  if (options.frame_stats) {
     // Which memory Roblox's upload sources live in.
     std::uint64_t by_type[kEtc2CountedMemoryTypes] = {};
     std::uint64_t unknown_type = 0;
