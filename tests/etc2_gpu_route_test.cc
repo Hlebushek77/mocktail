@@ -10,6 +10,7 @@
 #include <thread>
 #include <vector>
 
+#include "mocktail/graphics/bc_encoder.h"
 #include "mocktail/graphics/etc2_decoder.h"
 #include "mocktail/graphics/vulkan_etc2_emulation.h"
 #include "mocktail/graphics/vulkan_etc2_gpu.h"
@@ -23,8 +24,11 @@
 // vkQueueSubmit2, a semaphore-guarded source another queue writes, two
 // queues submitting from two threads, a compute-only family, a transfer-only
 // family, a forced rescue with no slot, a failed selftest, and vkDestroyDevice
-// with work in flight. Every image is read back and compared with the CPU
-// decoder. Label "gpu"; skipped without a device and while a live game runs.
+// with work in flight; and in ETC2->BC mode (DESIGN C4.4) BC images and the
+// RGBA images BC cannot hold (CR-14) served by one pass, its rescue and a
+// failed BC selftest. Every image is read back and compared with the CPU
+// decoder, or for BC images with the CPU BC encoder. Label "gpu"; skipped
+// without a device and while a live game runs.
 
 namespace mocktail::graphics::testing {
 namespace {
@@ -35,6 +39,7 @@ struct RigImage {
   VkImage image = VK_NULL_HANDLE;
   VkFormat format = VK_FORMAT_UNDEFINED;
   EtcFormat etc = EtcFormat::kEtc2Rgb8;
+  bool bc = false;  // ETC2->BC mode made it a BC host image
   std::uint32_t width = 0;
   std::uint32_t height = 0;
   std::uint32_t mips = 1;
@@ -84,6 +89,18 @@ class Rig {
     create_info.queueCreateInfoCount =
         static_cast<std::uint32_t>(queues.size());
     create_info.pQueueCreateInfos = queues.data();
+    if (options.to_bc) {
+      // The adapter's vkCreateDevice decides ETC2->BC mode first.
+      const PFN_vkGetInstanceProcAddr instance_proc =
+          device->get_instance_proc_addr();
+      bc_ = emulation_.PhysicalDeviceUsesBc(
+          device->physical_device(),
+          reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures>(
+              instance_proc(device->instance(), "vkGetPhysicalDeviceFeatures")),
+          reinterpret_cast<PFN_vkGetPhysicalDeviceFormatProperties>(
+              instance_proc(device->instance(),
+                            "vkGetPhysicalDeviceFormatProperties")));
+    }
     emulation_.RegisterDevice(
         device->device(), device->physical_device(), true, device->memory(),
         device->properties(), device->queue_families(), create_info,
@@ -102,6 +119,8 @@ class Rig {
 
   VulkanEtc2Emulation& emulation() { return emulation_; }
   Etc2GpuBackend& backend() { return backend_; }
+  // ETC2->BC mode is on for the device (options.to_bc and the driver can).
+  bool bc() const { return bc_; }
   const HeadlessVulkanDevice::Dispatch& vk() const { return device_->vk(); }
   Etc2GpuDevice* gpu() const { return Etc2GpuDevice::Find(device_->device()); }
 
@@ -176,9 +195,12 @@ class Rig {
     return runtime->state() == Etc2GpuDevice::State::kReady;
   }
 
+  // `extra_usage` with STORAGE makes, in ETC2->BC mode, an image that BC
+  // cannot hold: it stays RGBA8/R16 (CR-14).
   RigImage* Image(VkFormat format, std::uint32_t width, std::uint32_t height,
                   std::uint32_t mips, std::uint32_t layers = 1,
-                  std::vector<std::uint32_t> concurrent_families = {}) {
+                  std::vector<std::uint32_t> concurrent_families = {},
+                  VkImageUsageFlags extra_usage = 0) {
     auto image = std::make_unique<RigImage>();
     image->format = format;
     Etc2EmulatedFormat emulated;
@@ -188,9 +210,10 @@ class Rig {
     image->height = height;
     image->mips = mips;
     image->layers = layers;
+    image->bc = bc_ && (extra_usage & VK_IMAGE_USAGE_STORAGE_BIT) == 0;
     ScenarioImage spec{format, width, height, mips, layers};
-    image->shape =
-        HostShapeFor(spec, emulation_.options().upscale, /*emulated=*/true);
+    image->shape = HostShapeFor(spec, emulation_.options().upscale,
+                                /*emulated=*/true, image->bc);
     VkImageCreateInfo info{};
     info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     info.imageType = VK_IMAGE_TYPE_2D;
@@ -201,7 +224,8 @@ class Rig {
     info.samples = VK_SAMPLE_COUNT_1_BIT;
     info.tiling = VK_IMAGE_TILING_OPTIMAL;
     info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                 VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+                 VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                 extra_usage;
     info.sharingMode = concurrent_families.empty() ? VK_SHARING_MODE_EXCLUSIVE
                                                    : VK_SHARING_MODE_CONCURRENT;
     info.queueFamilyIndexCount =
@@ -423,7 +447,8 @@ class Rig {
   }
 
   // Every upload's subresource must hold what the CPU decoder makes of
-  // `bytes` (the source as the GPU read it).
+  // `bytes` (the source as the GPU read it), or for a BC image what the CPU
+  // BC encoder makes of it.
   void Check(const std::vector<RigUpload>& uploads,
              const std::vector<std::uint8_t>& bytes, const std::string& what) {
     std::vector<std::vector<std::uint8_t>> texels;
@@ -443,10 +468,17 @@ class Rig {
       Etc2UploadByteCounts(image.etc, region.imageExtent, 1, &compressed,
                            &decoded);
       for (std::uint32_t layer = 0; layer < image.layers; ++layer) {
-        std::vector<std::uint8_t> expected(decoded);
-        ASSERT_TRUE(DecodeEtcImage(
-            image.etc, bytes.data() + region.bufferOffset + layer * compressed,
-            compressed, width, height, expected.data(), expected.size()));
+        const std::uint8_t* blocks =
+            bytes.data() + region.bufferOffset + layer * compressed;
+        std::vector<std::uint8_t> expected(image.bc ? compressed : decoded);
+        if (image.bc) {
+          ASSERT_TRUE(TranscodeEtcToBc(image.etc, blocks, compressed,
+                                       expected.data(), expected.size(),
+                                       kEtc2ToBcRefine));
+        } else {
+          ASSERT_TRUE(DecodeEtcImage(image.etc, blocks, compressed, width,
+                                     height, expected.data(), expected.size()));
+        }
         EXPECT_EQ(texels[mip * image.layers + layer], expected)
             << what << ": " << image.width << "x" << image.height << " format "
             << image.format << " mip " << mip << " layer " << layer;
@@ -463,6 +495,7 @@ class Rig {
   std::vector<std::pair<VkCommandPool, std::vector<VkCommandBuffer>>> pools_;
   std::vector<VkSemaphore> semaphores_;
   std::vector<VkFence> fences_;
+  bool bc_ = false;
   bool torn_down_ = false;
   bool device_destroyed_ = false;
 };
@@ -501,6 +534,7 @@ class Etc2GpuRouteTest : public ::testing::Test {
     hooks.fail_slot_acquire = false;
     hooks.fail_rescue_slot = false;
     hooks.corrupt_selftest = false;
+    hooks.corrupt_bc_selftest = false;
     {
       std::lock_guard<std::mutex> lock(hooks.mutex);
       hooks.rescue_decode = nullptr;
@@ -895,6 +929,167 @@ TEST_F(Etc2GpuRouteTest, DestroyDeviceWaitsForPassesInFlight) {
   rig.DestroyEmulationDevice();
   EXPECT_EQ(Etc2GpuDevice::Find(device_->device()), nullptr);
   rig.vk().vkQueueWaitIdle(queue());
+}
+
+// ---- ETC2->BC mode (DESIGN C4.4)
+// ---------------------------------------------
+
+Etc2EmulationOptions BcOptions() {
+  Etc2EmulationOptions options = GpuOptions();
+  options.to_bc = true;
+  return options;
+}
+
+// One call with two batches: BC images (BC1 punch-through, BC3, BC5 signed)
+// and an image BC cannot hold (storage, CR-14), whose pass mixes a decode
+// dispatch with etc2_bc dispatches; then vkQueueSubmit2. Every image holds
+// the CPU route's bytes.
+TEST_F(Etc2GpuRouteTest, BcModeServesBcAndFallbackImagesInOnePass) {
+  Rig rig(device_, BcOptions());
+  if (!rig.bc()) {
+    GTEST_SKIP() << "the device cannot enter ETC2->BC mode";
+  }
+  ASSERT_TRUE(rig.WarmUp(queue()));
+  const VkCommandPool pool = rig.Pool(device_->queue_family());
+  RigImage* punch = rig.Image(VK_FORMAT_ETC2_R8G8B8A1_SRGB_BLOCK, 45, 29, 4);
+  RigImage* rgba = rig.Image(VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK, 64, 40, 3);
+  RigImage* storage = rig.Image(VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK, 37, 37, 3,
+                                1, {}, VK_IMAGE_USAGE_STORAGE_BIT);
+  RigImage* normals = rig.Image(VK_FORMAT_EAC_R11G11_SNORM_BLOCK, 60, 33, 4, 2);
+  EXPECT_TRUE(punch->bc && rgba->bc && normals->bc);
+  EXPECT_FALSE(storage->bc);
+  RigSource* source = rig.Source(128 * 1024, 91);
+  const VkCommandBuffer a = rig.Begin(pool);
+  VkDeviceSize offset = 0;
+  std::vector<RigUpload> uploads =
+      rig.UploadChain(a, *punch, *source, offset, &offset);
+  rig.End(a);
+  const VkCommandBuffer b = rig.Begin(pool);
+  for (const RigImage* image : {rgba, storage, normals}) {
+    const std::vector<RigUpload> chain =
+        rig.UploadChain(b, *image, *source, offset, &offset);
+    uploads.insert(uploads.end(), chain.begin(), chain.end());
+  }
+  rig.End(b);
+  std::uint64_t passes = rig.gpu()->stats().passes;
+  ASSERT_EQ(rig.Submit(queue(), {{a}, {b}}, VK_NULL_HANDLE), VK_SUCCESS);
+  rig.vk().vkQueueWaitIdle(queue());
+  EXPECT_EQ(rig.gpu()->stats().passes - passes, 2U);
+  rig.Check(uploads, source->bytes, "BC mode, two batches");
+
+  if (device_->synchronization2()) {
+    rig.Rewrite(source, 92);
+    const VkCommandBuffer c = rig.Begin(pool);
+    offset = 0;
+    std::vector<RigUpload> again;
+    for (const RigImage* image : {normals, storage}) {
+      const std::vector<RigUpload> chain =
+          rig.UploadChain(c, *image, *source, offset, &offset);
+      again.insert(again.end(), chain.begin(), chain.end());
+    }
+    rig.End(c);
+    passes = rig.gpu()->stats().passes;
+    ASSERT_EQ(rig.Submit2(queue(), {c}, VK_NULL_HANDLE), VK_SUCCESS);
+    rig.vk().vkQueueWaitIdle(queue());
+    EXPECT_EQ(rig.gpu()->stats().passes - passes, 1U);
+    rig.Check(again, source->bytes, "BC mode, vkQueueSubmit2");
+  }
+  const Etc2GpuDevice::Stats stats = rig.gpu()->stats();
+  EXPECT_EQ(stats.rescues, 0U);
+  EXPECT_EQ(stats.dropped_uploads, 0U);
+}
+
+// [CR-7] No slot comes free: the rescue encodes the BC images' uploads (and
+// decodes the fallback image's) on the CPU, and the reserved slot copies
+// them into the arena: the same bytes as the etc2_bc pass. Padded rows and
+// layers apart in Roblox's buffer, too.
+TEST_F(Etc2GpuRouteTest, BcModeRescueEncodesOnTheCpu) {
+  Rig rig(device_, BcOptions());
+  if (!rig.bc()) {
+    GTEST_SKIP() << "the device cannot enter ETC2->BC mode";
+  }
+  ASSERT_TRUE(rig.WarmUp(queue()));
+  const VkCommandPool pool = rig.Pool(device_->queue_family());
+  RigImage* colour = rig.Image(VK_FORMAT_ETC2_R8G8B8_SRGB_BLOCK, 50, 30, 4);
+  RigImage* storage = rig.Image(VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK, 24, 24, 2,
+                                1, {}, VK_IMAGE_USAGE_STORAGE_BIT);
+  RigImage* layered = rig.Image(VK_FORMAT_EAC_R11_SNORM_BLOCK, 27, 14, 1, 2);
+  RigSource* source = rig.Source(32 * 1024, 93);
+  Etc2GpuTesting().fail_slot_acquire = true;
+  const VkCommandBuffer command_buffer = rig.Begin(pool);
+  VkDeviceSize end = 0;
+  std::vector<RigUpload> uploads =
+      rig.UploadChain(command_buffer, *colour, *source, 0, &end);
+  const std::vector<RigUpload> more =
+      rig.UploadChain(command_buffer, *storage, *source, end, &end);
+  uploads.insert(uploads.end(), more.begin(), more.end());
+  VkBufferImageCopy padded{};
+  padded.bufferOffset = end + 64;
+  padded.bufferRowLength = 27 + 9;
+  padded.bufferImageHeight = 14 + 10;
+  padded.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 2};
+  padded.imageExtent = {27, 14, 1};
+  rig.emulation().CmdCopyBufferToImage(device_->device(), command_buffer,
+                                       source->source.buffer, layered->image,
+                                       VK_IMAGE_LAYOUT_GENERAL, 1, &padded);
+  rig.End(command_buffer);
+  ASSERT_EQ(rig.Submit(queue(), {{command_buffer}}, VK_NULL_HANDLE),
+            VK_SUCCESS);
+  rig.vk().vkQueueWaitIdle(queue());
+  Etc2GpuTesting().fail_slot_acquire = false;
+  const Etc2GpuDevice::Stats stats = rig.gpu()->stats();
+  EXPECT_EQ(stats.rescues, 1U);
+  EXPECT_EQ(stats.rescued_uploads, uploads.size() + 1);
+  EXPECT_EQ(stats.dropped_uploads, 0U);
+  rig.Check(uploads, source->bytes, "BC rescue");
+  std::vector<std::vector<std::uint8_t>> blocks;
+  ASSERT_TRUE(rig.backend().ReadImage(layered->image, layered->shape, &blocks));
+  const VkDeviceSize block = EtcBlockBytes(layered->etc);
+  const VkDeviceSize row_stride = ((padded.bufferRowLength + 3) / 4) * block;
+  const VkDeviceSize layer_stride =
+      row_stride * ((padded.bufferImageHeight + 3) / 4);
+  for (std::uint32_t layer = 0; layer < 2; ++layer) {
+    std::vector<std::uint8_t> packed;
+    for (std::uint32_t row = 0; row < (14 + 3) / 4; ++row) {
+      const std::uint8_t* from = source->bytes.data() + padded.bufferOffset +
+                                 layer * layer_stride + row * row_stride;
+      packed.insert(packed.end(), from, from + ((27 + 3) / 4) * block);
+    }
+    std::vector<std::uint8_t> expected(packed.size());
+    ASSERT_TRUE(TranscodeEtcToBc(layered->etc, packed.data(), packed.size(),
+                                 expected.data(), expected.size(),
+                                 kEtc2ToBcRefine));
+    EXPECT_EQ(blocks[layer], expected) << "padded rows, layer " << layer;
+  }
+}
+
+// A selftest whose BC part differs keeps the device on the CPU route for
+// good, BC images and decode alike; the CPU route still gives the same
+// blocks.
+TEST_F(Etc2GpuRouteTest, ABcSelftestMismatchKeepsTheCpuRoute) {
+  Etc2GpuTesting().corrupt_bc_selftest = true;
+  Rig rig(device_, BcOptions());
+  if (!rig.bc()) {
+    GTEST_SKIP() << "the device cannot enter ETC2->BC mode";
+  }
+  EXPECT_FALSE(rig.WarmUp(queue()));
+  ASSERT_NE(rig.gpu(), nullptr);
+  EXPECT_EQ(rig.gpu()->state(), Etc2GpuDevice::State::kFailed);
+  EXPECT_NE(rig.gpu()->failure().find("selftest mismatch: BC from EAC_RG11"),
+            std::string::npos)
+      << rig.gpu()->failure();
+  const VkCommandPool pool = rig.Pool(device_->queue_family());
+  RigImage* image = rig.Image(VK_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK, 40, 40, 3);
+  RigSource* source = rig.Source(32 * 1024, 94);
+  const VkCommandBuffer command_buffer = rig.Begin(pool);
+  const std::vector<RigUpload> uploads =
+      rig.UploadChain(command_buffer, *image, *source, 0);
+  rig.End(command_buffer);
+  ASSERT_EQ(rig.Submit(queue(), {{command_buffer}}, VK_NULL_HANDLE),
+            VK_SUCCESS);
+  rig.vk().vkQueueWaitIdle(queue());
+  EXPECT_EQ(rig.gpu()->stats().passes, 0U);
+  rig.Check(uploads, source->bytes, "CPU route after a failed BC selftest");
 }
 
 }  // namespace

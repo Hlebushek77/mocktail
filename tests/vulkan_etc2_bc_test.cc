@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <map>
@@ -11,6 +12,7 @@
 #include "mocktail/graphics/etc2_decoder.h"
 #include "mocktail/graphics/texture_override.h"
 #include "mocktail/graphics/vulkan_etc2_emulation.h"
+#include "mocktail/graphics/vulkan_etc2_gpu.h"
 #include "support/bc_reference.h"
 #include "support/bc_reference_transcode.h"
 #include "support/etc2_emulation_harness.h"
@@ -23,8 +25,10 @@
 // CR-24): which devices enter it, the BC host images and views it creates,
 // the images it leaves RGBA8/R16, the format lists the host sees, and every
 // emulation scenario (DESIGN §9.2) end to end on the CPU route, whose BC
-// blocks must equal the references' (the GPU route's shader matches them
-// bit for bit). Off (the default, MOCKTAIL_ETC2_TO_BC unset or 0) nothing
+// blocks must equal the references', and on the GPU route (its etc2_bc
+// pass, and its rescue), which must give the same blocks (the shader itself
+// is checked against the CPU encoder on a GPU, etc2_gpu_parity_test's
+// BcParity). Off (the default, MOCKTAIL_ETC2_TO_BC unset or 0) nothing
 // may change; vulkan_etc2_emulation_test keeps the default mode's golden
 // texels. The physical-device queries come from a configurable fake
 // instance next to the GPU-free fake device, or from the fake device's own.
@@ -233,6 +237,10 @@ const char kRgbaLine[] =
 const char kBcLine[] =
     "  [vulkan] ETC2/EAC emulation enabled: compressed uploads become "
     "BC1/BC3/BC4/BC5 host images (CPU transcode)";
+// The same with the GPU route on (MOCKTAIL_ETC2_GPU's default).
+const char kBcGpuLine[] =
+    "  [vulkan] ETC2/EAC emulation enabled: compressed uploads become "
+    "BC1/BC3/BC4/BC5 host images (GPU transcode)";
 const char kUnavailable[] = "  [vulkan] ETC2->BC unavailable: ";
 
 class Etc2BcModeTest : public ::testing::Test {
@@ -510,102 +518,198 @@ TEST_F(Etc2BcModeTest, ImagesBcCannotServeStayRgba) {
 // [CR-14] One submit of a BC device uploads into a BC image and into an
 // image BC cannot hold (storage): the first gets the references' BC blocks,
 // the second the default mode's texels without the x4 upscale, both from
-// one staging chunk.
+// one staging chunk on the CPU route. With the GPU route on, one pass in
+// front of the batch serves both: a decode dispatch for the fallback image
+// and an etc2_bc dispatch for the BC image, with the same results.
 TEST_F(Etc2BcModeTest, UploadsFillBcAndFallbackImagesOfOneDevice) {
+  for (const bool gpu_route : {false, true}) {
+    SCOPED_TRACE(gpu_route ? "GPU route" : "CPU route");
+    FakeVulkanDevice fake;
+    Etc2EmulationOptions options = Options(true);
+    options.gpu = gpu_route;
+    VulkanEtc2Emulation emulation(options);
+    ::testing::internal::CaptureStderr();
+    ASSERT_TRUE(Register(&emulation, &fake));
+    const VkDevice device = fake.device();
+    const VkQueue queue = fake.GetQueue(0, 0);
+    emulation.RegisterQueue(device, queue, 0, 0);
+    // The adapter's submit: pre-submits, the host submit, FinishSubmit.
+    const auto submit = [&](std::uint32_t count, const VkSubmitInfo* info) {
+      Etc2SubmitPlan plan;
+      emulation.PrepareSubmit(queue, count, info, VK_NULL_HANDLE, &plan);
+      for (const Etc2PreSubmit& pre : plan.pre_submits()) {
+        EXPECT_EQ(fake.QueueSubmit(queue, 1, &pre.info, pre.fence), VK_SUCCESS);
+      }
+      const VkResult result =
+          fake.QueueSubmit(queue, plan.count(count), plan.submits(info),
+                           plan.fence(VK_NULL_HANDLE));
+      EXPECT_EQ(result, VK_SUCCESS);
+      emulation.FinishSubmit(&plan, result, [&](VkFence fence) {
+        return fake.QueueSubmit(queue, 0, nullptr, fence);
+      });
+    };
+    constexpr VkCommandPoolCreateFlags kPoolFlags =
+        VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    const VkCommandPool pool = fake.CreateCommandPool(0, kPoolFlags);
+    emulation.RegisterCommandPool(device, pool, 0, kPoolFlags);
+    // Two 32x32 ETC2 RGB8 textures: 64 blocks, 512 bytes each.
+    const std::vector<std::uint8_t> bytes = SeededBytes(0xB0C5, 1024);
+    VkBuffer source = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    ASSERT_EQ(
+        fake.CreateBuffer(1024, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &source),
+        VK_SUCCESS);
+    ASSERT_EQ(fake.AllocateMemory(1024, 3, &memory), VK_SUCCESS);
+    ASSERT_EQ(emulation.BindBufferMemory(device, source, memory, 0),
+              VK_SUCCESS);
+    void* data = nullptr;
+    ASSERT_EQ(emulation.MapMemory(device, memory, 0, VK_WHOLE_SIZE, 0, &data),
+              VK_SUCCESS);
+    std::memcpy(data, bytes.data(), bytes.size());
+    VkImageCreateInfo bc_info =
+        ImageInfo(VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK, 32, 32);
+    VkImageCreateInfo storage_info = bc_info;
+    storage_info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+    VkImageCreateInfo host{};
+    const VkImage bc_image = Create(&emulation, &fake, bc_info, &host);
+    EXPECT_EQ(host.format, VK_FORMAT_BC1_RGB_UNORM_BLOCK);
+    const VkImage rgba_image = Create(&emulation, &fake, storage_info, &host);
+    EXPECT_EQ(host.format, VK_FORMAT_R8G8B8A8_UNORM);
+    EXPECT_EQ(host.extent.width, 32U);  // no x4 upscale on a BC device
+    Etc2GpuDevice* const gpu = Etc2GpuDevice::Find(device);
+    EXPECT_EQ(gpu != nullptr, gpu_route);
+    if (gpu != nullptr) {
+      // The first image started the build; the selftest runs with empty
+      // submits, the BC pipeline's part included.
+      ASSERT_TRUE(gpu->WaitForBuild(std::chrono::seconds(60)));
+      for (int round = 0;
+           round < 3 && gpu->state() != Etc2GpuDevice::State::kReady; ++round) {
+        submit(0, nullptr);
+      }
+      ASSERT_EQ(gpu->state(), Etc2GpuDevice::State::kReady);
+    }
+    const FakeVulkanDevice::Counts before = fake.counts();
+    const VkCommandBuffer command_buffer =
+        fake.AllocateCommandBuffer(pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY);
+    emulation.BeginCommandBuffer(command_buffer, pool,
+                                 VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
+    fake.BeginCommandBuffer(command_buffer,
+                            VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
+    VkBufferImageCopy region{};
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = {32, 32, 1};
+    emulation.CmdCopyBufferToImage(device, command_buffer, source, bc_image,
+                                   VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+    region.bufferOffset = 512;
+    emulation.CmdCopyBufferToImage(device, command_buffer, source, rgba_image,
+                                   VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+    fake.EndCommandBuffer(command_buffer);
+    VkSubmitInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    info.commandBufferCount = 1;
+    info.pCommandBuffers = &command_buffer;
+    submit(1, &info);
+
+    const std::vector<std::uint8_t>* bc_blocks =
+        fake.ImageSubresource(bc_image, 0, 0);
+    ASSERT_NE(bc_blocks, nullptr);
+    EXPECT_EQ(*bc_blocks, reference::BcFromEtc(EtcFormat::kEtc2Rgb8,
+                                               bytes.data(), 512, true));
+    std::vector<std::uint8_t> decoded(32 * 32 * 4);
+    reference::DecodeEtcImage(reference::EtcFormat::kEtc2Rgb8,
+                              bytes.data() + 512, 512, 32, 32, decoded.data(),
+                              decoded.size());
+    const std::vector<std::uint8_t>* texels =
+        fake.ImageSubresource(rgba_image, 0, 0);
+    ASSERT_NE(texels, nullptr);
+    EXPECT_EQ(*texels, decoded);
+    const auto recorded = fake.RecordedBufferCopies(command_buffer);
+    ASSERT_EQ(recorded.size(), 2U);
+    EXPECT_EQ(recorded[0].buffer, recorded[1].buffer);
+    const FakeVulkanDevice::Counts& after = fake.counts();
+    if (gpu_route) {
+      // Out of the output arena: 256-byte aligned ranges in one chunk.
+      EXPECT_EQ(recorded[1].regions[0].bufferOffset -
+                    recorded[0].regions[0].bufferOffset,
+                512U);
+      EXPECT_EQ(gpu->stats().passes, 1U);
+      EXPECT_EQ(after.dispatches - before.dispatches, 2U);
+      EXPECT_EQ(after.bc_blocks - before.bc_blocks, 64U);
+      EXPECT_EQ(after.decoded_blocks - before.decoded_blocks, 64U);
+    } else {
+      EXPECT_EQ(recorded[0].regions[0].bufferOffset, 0U);
+      EXPECT_EQ(recorded[1].regions[0].bufferOffset, 512U);  // BC: 512 bytes
+      EXPECT_EQ(after.dispatches, 0U);
+    }
+
+    emulation.ReleaseCommandBuffer(command_buffer);
+    fake.FreeCommandBuffer(command_buffer);
+    fake.DestroyCommandPool(pool);
+    emulation.ForgetCommandPool(device, pool);
+    emulation.DestroyImage(device, bc_image, nullptr);
+    emulation.DestroyImage(device, rgba_image, nullptr);
+    emulation.UnmapMemory(device, memory);
+    emulation.DestroyBuffer(device, source, nullptr);
+    emulation.FreeMemory(device, memory, nullptr);
+    emulation.DestroyDevice(device);
+    const std::string log = ::testing::internal::GetCapturedStderr();
+    EXPECT_EQ(log.find("could not"), std::string::npos) << log;
+    EXPECT_EQ(CountLines(log, gpu_route ? kBcGpuLine : kBcLine), 1) << log;
+    EXPECT_TRUE(fake.errors().empty()) << fake.errors().front();
+    EXPECT_EQ(fake.counts().entry_point_buffers.live(), 0U);
+    EXPECT_EQ(fake.counts().pipelines.live(), 0U);
+  }
+}
+
+// DESIGN C3.4: a selftest whose BC part differs from the CPU encoder keeps
+// the CPU route for the session (decode included), and says which format
+// and block.
+TEST_F(Etc2BcModeTest, ABcSelftestMismatchKeepsTheCpuRoute) {
   FakeVulkanDevice fake;
-  VulkanEtc2Emulation emulation(Options(true));
+  Etc2EmulationOptions options = Options(true);
+  options.gpu = true;
+  VulkanEtc2Emulation emulation(options);
+  Etc2GpuTesting().corrupt_bc_selftest = true;
   ::testing::internal::CaptureStderr();
   ASSERT_TRUE(Register(&emulation, &fake));
   const VkDevice device = fake.device();
   const VkQueue queue = fake.GetQueue(0, 0);
   emulation.RegisterQueue(device, queue, 0, 0);
-  constexpr VkCommandPoolCreateFlags kPoolFlags =
-      VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-  const VkCommandPool pool = fake.CreateCommandPool(0, kPoolFlags);
-  emulation.RegisterCommandPool(device, pool, 0, kPoolFlags);
-  // Two 32x32 ETC2 RGB8 textures: 64 blocks, 512 bytes each.
-  const std::vector<std::uint8_t> bytes = SeededBytes(0xB0C5, 1024);
-  VkBuffer source = VK_NULL_HANDLE;
-  VkDeviceMemory memory = VK_NULL_HANDLE;
-  ASSERT_EQ(fake.CreateBuffer(1024, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &source),
-            VK_SUCCESS);
-  ASSERT_EQ(fake.AllocateMemory(1024, 3, &memory), VK_SUCCESS);
-  ASSERT_EQ(emulation.BindBufferMemory(device, source, memory, 0), VK_SUCCESS);
-  void* data = nullptr;
-  ASSERT_EQ(emulation.MapMemory(device, memory, 0, VK_WHOLE_SIZE, 0, &data),
-            VK_SUCCESS);
-  std::memcpy(data, bytes.data(), bytes.size());
-  VkImageCreateInfo bc_info =
-      ImageInfo(VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK, 32, 32);
-  VkImageCreateInfo storage_info = bc_info;
-  storage_info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
   VkImageCreateInfo host{};
-  const VkImage bc_image = Create(&emulation, &fake, bc_info, &host);
-  EXPECT_EQ(host.format, VK_FORMAT_BC1_RGB_UNORM_BLOCK);
-  const VkImage rgba_image = Create(&emulation, &fake, storage_info, &host);
-  EXPECT_EQ(host.format, VK_FORMAT_R8G8B8A8_UNORM);
-  EXPECT_EQ(host.extent.width, 32U);  // no x4 upscale on a BC device
-  const VkCommandBuffer command_buffer =
-      fake.AllocateCommandBuffer(pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY);
-  emulation.BeginCommandBuffer(command_buffer, pool,
-                               VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
-  fake.BeginCommandBuffer(command_buffer,
-                          VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
-  VkBufferImageCopy region{};
-  region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-  region.imageExtent = {32, 32, 1};
-  emulation.CmdCopyBufferToImage(device, command_buffer, source, bc_image,
-                                 VK_IMAGE_LAYOUT_GENERAL, 1, &region);
-  region.bufferOffset = 512;
-  emulation.CmdCopyBufferToImage(device, command_buffer, source, rgba_image,
-                                 VK_IMAGE_LAYOUT_GENERAL, 1, &region);
-  fake.EndCommandBuffer(command_buffer);
-  VkSubmitInfo submit{};
-  submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-  submit.commandBufferCount = 1;
-  submit.pCommandBuffers = &command_buffer;
-  Etc2SubmitPlan plan;
-  emulation.PrepareSubmit(queue, 1, &submit, VK_NULL_HANDLE, &plan);
-  const VkResult result = fake.QueueSubmit(
-      queue, plan.count(1), plan.submits(&submit), plan.fence(VK_NULL_HANDLE));
-  ASSERT_EQ(result, VK_SUCCESS);
-  emulation.FinishSubmit(&plan, result, [&](VkFence fence) {
-    return fake.QueueSubmit(queue, 0, nullptr, fence);
-  });
-
-  const std::vector<std::uint8_t>* bc_blocks =
-      fake.ImageSubresource(bc_image, 0, 0);
-  ASSERT_NE(bc_blocks, nullptr);
-  EXPECT_EQ(*bc_blocks, reference::BcFromEtc(EtcFormat::kEtc2Rgb8,
-                                             bytes.data(), 512, true));
-  std::vector<std::uint8_t> decoded(32 * 32 * 4);
-  reference::DecodeEtcImage(reference::EtcFormat::kEtc2Rgb8,
-                            bytes.data() + 512, 512, 32, 32, decoded.data(),
-                            decoded.size());
-  const std::vector<std::uint8_t>* texels =
-      fake.ImageSubresource(rgba_image, 0, 0);
-  ASSERT_NE(texels, nullptr);
-  EXPECT_EQ(*texels, decoded);
-  const auto recorded = fake.RecordedBufferCopies(command_buffer);
-  ASSERT_EQ(recorded.size(), 2U);
-  EXPECT_EQ(recorded[0].buffer, recorded[1].buffer);
-  EXPECT_EQ(recorded[0].regions[0].bufferOffset, 0U);
-  EXPECT_EQ(recorded[1].regions[0].bufferOffset, 512U);  // BC: 512 bytes
-
-  emulation.ReleaseCommandBuffer(command_buffer);
-  fake.FreeCommandBuffer(command_buffer);
-  fake.DestroyCommandPool(pool);
-  emulation.ForgetCommandPool(device, pool);
-  emulation.DestroyImage(device, bc_image, nullptr);
-  emulation.DestroyImage(device, rgba_image, nullptr);
-  emulation.UnmapMemory(device, memory);
-  emulation.DestroyBuffer(device, source, nullptr);
-  emulation.FreeMemory(device, memory, nullptr);
+  const VkImage image =
+      Create(&emulation, &fake,
+             ImageInfo(VK_FORMAT_EAC_R11G11_UNORM_BLOCK, 16, 16), &host);
+  Etc2GpuDevice* const gpu = Etc2GpuDevice::Find(device);
+  ASSERT_NE(gpu, nullptr);
+  ASSERT_TRUE(gpu->WaitForBuild(std::chrono::seconds(60)));
+  for (int round = 0; round < 3; ++round) {
+    Etc2SubmitPlan plan;
+    emulation.PrepareSubmit(queue, 0, nullptr, VK_NULL_HANDLE, &plan);
+    for (const Etc2PreSubmit& pre : plan.pre_submits()) {
+      EXPECT_EQ(fake.QueueSubmit(queue, 1, &pre.info, pre.fence), VK_SUCCESS);
+    }
+    const VkResult result =
+        fake.QueueSubmit(queue, plan.count(0), plan.submits(nullptr),
+                         plan.fence(VK_NULL_HANDLE));
+    emulation.FinishSubmit(&plan, result, [&](VkFence fence) {
+      return fake.QueueSubmit(queue, 0, nullptr, fence);
+    });
+  }
+  Etc2GpuTesting().corrupt_bc_selftest = false;
+  EXPECT_EQ(gpu->state(), Etc2GpuDevice::State::kFailed);
+  EXPECT_NE(gpu->failure().find("selftest mismatch: BC from EAC_RG11 block "),
+            std::string::npos)
+      << gpu->failure();
+  emulation.DestroyImage(device, image, nullptr);
   emulation.DestroyDevice(device);
   const std::string log = ::testing::internal::GetCapturedStderr();
-  EXPECT_EQ(log.find("could not"), std::string::npos) << log;
+  EXPECT_NE(log.find("[vulkan] ETC2 GPU decode unavailable: selftest mismatch: "
+                     "BC from EAC_RG11"),
+            std::string::npos)
+      << log;
   EXPECT_TRUE(fake.errors().empty()) << fake.errors().front();
-  EXPECT_EQ(fake.counts().entry_point_buffers.live(), 0U);
+  EXPECT_EQ(fake.counts().pipelines.live(), 0U);
+  EXPECT_EQ(fake.counts().fences.live(), 0U);
 }
 
 // [CR-15] The host sees the host formats in an image's format list, in
@@ -964,53 +1068,145 @@ std::vector<std::string> BcModeScenarioNames() {
   return names;
 }
 
-// With the GPU route on as well (MOCKTAIL_ETC2_GPU's default) and ready:
-// its decode pass writes RGBA texels and has no BC pipeline yet (WP3b), so
-// every upload into a BC image must stay on the CPU route and give the same
-// BC blocks.
-class Etc2BcGpuRouteTest : public ::testing::TestWithParam<std::string> {};
+// Whether the GPU route serves one of the scenario's uploads in BC mode: a
+// copy into an emulated image on a queue with compute (family 1 of the fake
+// is transfer-only), unless texture overrides are active and the image is a
+// colour one (DESIGN §3.2). BC images are never upscaled, so the upscale
+// scenarios' uploads take the route too.
+bool BcServesOnTheGpu(const Scenario& scenario) {
+  if (!scenario.emulated || scenario.queue_family == 1) {
+    return false;
+  }
+  for (const ScenarioStep& step : scenario.steps) {
+    if (step.kind != ScenarioStep::Kind::kCopyBufferToImage) {
+      continue;
+    }
+    Etc2EmulatedFormat format;
+    if (!LookupEmulatedEtc2Format(scenario.images[step.image].format,
+                                  &format)) {
+      continue;
+    }
+    const bool colour = format.etc_format == EtcFormat::kEtc2Rgb8 ||
+                        format.etc_format == EtcFormat::kEtc2Rgb8A1 ||
+                        format.etc_format == EtcFormat::kEtc2Rgba8;
+    if (!scenario.overrides || !colour) {
+      return true;
+    }
+  }
+  return false;
+}
 
-TEST_P(Etc2BcGpuRouteTest, KeepsBcImagesOnTheCpuRoute) {
-  const Scenario* scenario = FindEtc2EmulationScenario(GetParam());
-  ASSERT_NE(scenario, nullptr);
-  FakeVulkanDevice fake;
-  FakeEmulationBackend backend(&fake);
-  ScenarioOptions options;
-  options.emulation.to_bc = true;
-  options.emulation.gpu = true;
-  options.fake = &fake;
-  ::testing::internal::CaptureStderr();
-  const ScenarioRun run = RunEtc2Scenario(*scenario, &backend, options);
-  const std::string log = ::testing::internal::GetCapturedStderr();
-  ASSERT_FALSE(run.skipped) << run.skip_reason;
-  for (const std::string& failure : run.failures) {
-    ADD_FAILURE() << failure;
+// How a scenario's GPU-route uploads reach the arena in BC mode.
+enum class BcFill {
+  kPass,    // the etc2_bc dispatches in front of the batch
+  kRescue,  // [CR-7] no slot after the warm-up: CPU-encoded, copied in
+  kRescueLegacyStaging,  // the same through one-off staging buffers
+};
+
+// With the GPU route on as well (MOCKTAIL_ETC2_GPU's default) and ready
+// (DESIGN C4.4): uploads into BC images get their blocks from the etc2_bc
+// pipeline (which the fake device runs with the production encoder), or
+// from the rescue's CPU encoder, and must give the CPU route's BC goldens;
+// with every teardown, everything the route made is given back.
+class Etc2BcGpuRouteTest : public ::testing::TestWithParam<std::string> {
+ protected:
+  void TearDown() override { Etc2GpuTesting().fail_slot_acquire = false; }
+
+  void RunAndCheck(ScenarioTeardown teardown, bool frame_stats,
+                   BcFill fill = BcFill::kPass) {
+    const Scenario* scenario = FindEtc2EmulationScenario(GetParam());
+    ASSERT_NE(scenario, nullptr);
+    FakeVulkanDevice fake;
+    FakeEmulationBackend backend(&fake);
+    ScenarioOptions options;
+    options.teardown = teardown;
+    options.emulation.to_bc = true;
+    options.emulation.gpu = true;
+    options.emulation.frame_stats = frame_stats;
+    options.emulation.fast_path = fill != BcFill::kRescueLegacyStaging;
+    if (teardown == ScenarioTeardown::kOrderly) {
+      options.fake = &fake;  // the image copies and blits too
+    }
+    if (fill != BcFill::kPass) {
+      options.after_warm_up = [] { Etc2GpuTesting().fail_slot_acquire = true; };
+    }
+    ::testing::internal::CaptureStderr();
+    const ScenarioRun run = RunEtc2Scenario(*scenario, &backend, options);
+    const std::string log = ::testing::internal::GetCapturedStderr();
+    Etc2GpuTesting().fail_slot_acquire = false;
+    ASSERT_FALSE(run.skipped) << run.skip_reason;
+    for (const std::string& failure : run.failures) {
+      ADD_FAILURE() << failure;
+    }
+    ExpectOnlyBcModeErrors(fake, *scenario);
+    ExpectEverythingReleased(fake);
+    const FakeVulkanDevice::Counts& counts = fake.counts();
+    EXPECT_EQ(counts.fences.live(), 0U);
+    EXPECT_EQ(counts.shader_modules.live(), 0U);
+    EXPECT_EQ(counts.pipelines.live(), 0U);
+    EXPECT_EQ(counts.pipeline_layouts.live(), 0U);
+    EXPECT_EQ(counts.descriptor_set_layouts.live(), 0U);
+    EXPECT_EQ(counts.descriptor_pools.live(), 0U);
+    EXPECT_EQ(counts.descriptor_sets.live(), 0U);
+    EXPECT_EQ(counts.query_pools.live(), 0U);
+    std::uint64_t golden = 0;
+    ASSERT_TRUE(FindEtc2BcEmulationGolden(scenario->name, &golden));
+    EXPECT_EQ(run.hash, golden)
+        << "the GPU route's BC blocks of " << scenario->name
+        << " differ from the CPU route's; this run gives "
+        << GoldenLine(scenario->name, run.hash);
+    if (!scenario->emulated) {
+      EXPECT_FALSE(run.gpu_route);
+      return;
+    }
+    ASSERT_TRUE(run.gpu_route);
+    EXPECT_EQ(CountLines(log, kBcGpuLine), 1) << log;
+    // Built with both pipelines; on a queue with compute the selftest
+    // checked the BC one too (a transfer-only queue never runs it).
+    EXPECT_EQ(counts.pipelines.created, 2U);
+    EXPECT_EQ(log.find("selftest ok, BC transcode too)") != std::string::npos,
+              scenario->queue_family != 1)
+        << log;
+    if (BcServesOnTheGpu(*scenario)) {
+      EXPECT_EQ(run.gpu_state, "ready") << log;
+      EXPECT_GT(run.gpu_stats.passes, 0U);
+      if (fill == BcFill::kPass) {
+        EXPECT_GT(counts.bc_blocks, 0U) << "no etc2_bc dispatch ran";
+        EXPECT_EQ(run.gpu_stats.rescues, 0U);
+      } else {
+        EXPECT_EQ(run.gpu_stats.rescues, run.gpu_stats.passes);
+        EXPECT_GT(run.gpu_stats.rescued_uploads, 0U);
+      }
+    } else {
+      EXPECT_EQ(run.gpu_stats.passes, 0U);
+    }
+    EXPECT_EQ(run.gpu_stats.dropped_uploads, 0U);
+    EXPECT_EQ(log.find("GPU decode unavailable"), std::string::npos) << log;
+    EXPECT_EQ(log.find("dropped GPU-route uploads"), std::string::npos) << log;
+    EXPECT_EQ(log.find("could not encode"), std::string::npos) << log;
   }
-  ExpectOnlyBcModeErrors(fake, *scenario);
-  ExpectEverythingReleased(fake);
-  EXPECT_EQ(fake.counts().pipelines.live(), 0U);
-  EXPECT_EQ(fake.counts().fences.live(), 0U);
-  std::uint64_t golden = 0;
-  ASSERT_TRUE(FindEtc2BcEmulationGolden(scenario->name, &golden));
-  EXPECT_EQ(run.hash, golden)
-      << "the BC blocks of " << scenario->name
-      << " changed with the GPU route on; this run gives "
-      << GoldenLine(scenario->name, run.hash);
-  if (!scenario->emulated) {
-    EXPECT_FALSE(run.gpu_route);
-    return;
-  }
-  ASSERT_TRUE(run.gpu_route);
-  const std::vector<VkQueueFamilyProperties> families =
-      backend.queue_families();
-  if (scenario->queue_family < families.size() &&
-      (families[scenario->queue_family].queueFlags & VK_QUEUE_COMPUTE_BIT) !=
-          0) {
-    EXPECT_EQ(run.gpu_state, "ready") << log;
-  }
-  EXPECT_EQ(run.gpu_stats.passes, 0U) << "a BC upload took the GPU route";
-  EXPECT_EQ(run.gpu_stats.rescues, 0U);
-  EXPECT_EQ(run.gpu_stats.dropped_uploads, 0U);
+};
+
+TEST_P(Etc2BcGpuRouteTest, MatchesTheBcGoldens) {
+  RunAndCheck(ScenarioTeardown::kOrderly, false);
+}
+
+TEST_P(Etc2BcGpuRouteTest, ResetPoolReleasesEverything) {
+  RunAndCheck(ScenarioTeardown::kResetPool, false);
+}
+
+TEST_P(Etc2BcGpuRouteTest, DestroyDeviceFirstReleasesEverything) {
+  RunAndCheck(ScenarioTeardown::kDestroyDeviceFirst, true);
+}
+
+// The rescue encodes on the CPU what the etc2_bc pass would have written.
+TEST_P(Etc2BcGpuRouteTest, RescueMatchesTheBcGoldens) {
+  RunAndCheck(ScenarioTeardown::kOrderly, false, BcFill::kRescue);
+}
+
+TEST_P(Etc2BcGpuRouteTest, RescueWithOneOffStagingReleasesEverything) {
+  RunAndCheck(ScenarioTeardown::kDestroyPool, false,
+              BcFill::kRescueLegacyStaging);
 }
 
 INSTANTIATE_TEST_SUITE_P(Scenarios, Etc2BcGpuRouteTest,

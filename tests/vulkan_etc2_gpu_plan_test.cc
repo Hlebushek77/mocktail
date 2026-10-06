@@ -5,12 +5,15 @@
 #include <cstdint>
 #include <vector>
 
+#include "mocktail/graphics/bc_encoder.h"
+
 // The GPU route's pure planning (DESIGN §9.1): the rewritten regions and
 // output layout of a copy (PlanGpuRegions), the decode pass of a batch
 // (BuildDecodePass: input copies, the shader's job words, dispatches) and
 // the rewritten submit arrays (RewriteSubmits, RewriteSubmits2). The
 // expectations are worked out by hand from the Vulkan copy rules and the
-// shader's Job layout in src/graphics/shaders/etc2_decode.comp.
+// shaders' Job layout in src/graphics/shaders/etc2_decode.comp and
+// etc2_bc.comp.
 
 namespace mocktail::graphics {
 namespace {
@@ -166,9 +169,30 @@ TEST(PlanGpuRegionsTest, BcModeKeepsTightBlocks) {
   ASSERT_TRUE(plan.ok);
   EXPECT_TRUE(plan.uploads[0].bc);
   EXPECT_EQ(plan.uploads[0].output_bytes, 5U * 3U * 16U);
+  // The host image receives the blocks: the CPU route counts the same.
+  EXPECT_EQ(plan.uploads[0].decoded, plan.uploads[0].compressed);
   // Whole blocks per row and layer: the same as the tight layout.
   EXPECT_EQ(plan.rewritten[0].bufferRowLength, 20U);
   EXPECT_EQ(plan.rewritten[0].bufferImageHeight, 12U);
+}
+
+TEST(PlanGpuRegionsTest, BcModeClipsBlockRoundedExtentsToTheMip) {
+  // A 6x6 image: mip 1 is 3x3, but the region asks for a whole 4x4 block.
+  // A BC host takes only an extent that is whole blocks or reaches the
+  // mip's edge (VUID-vkCmdCopyBufferToImage-imageSubresource-07971): the
+  // copy stops at 3x3 and reads the one BC block of its padded row.
+  const Etc2ImageShape shape = Shape(VK_FORMAT_EAC_R11G11_SNORM_BLOCK, 6, 6);
+  const GpuPlan plan =
+      PlanAll(shape, {Region(0, 0, 0, 1, 1, 0, 0, 4, 4)}, /*bc=*/true);
+  ASSERT_TRUE(plan.ok);
+  EXPECT_EQ(plan.uploads[0].blocks_wide, 1U);
+  EXPECT_EQ(plan.uploads[0].output_bytes, 16U);
+  EXPECT_EQ(plan.uploads[0].decoded, 16U);
+  EXPECT_EQ(plan.rewritten[0].imageExtent.width, 3U);
+  EXPECT_EQ(plan.rewritten[0].imageExtent.height, 3U);
+  EXPECT_EQ(plan.rewritten[0].bufferRowLength, 4U);
+  EXPECT_EQ(plan.rewritten[0].bufferImageHeight, 4U);
+  EXPECT_EQ(plan.rewritten[0].bufferOffset % 16, 0U);
 }
 
 TEST(PlanGpuRegionsTest, RejectsRegionsItCannotServe) {
@@ -362,6 +386,50 @@ TEST(BuildDecodePassTest, SplitsLargeDispatchesAt65535Groups) {
   EXPECT_EQ(x, 0U);
   EXPECT_EQ(y, 0U);
   EXPECT_EQ(Etc2DecodeGroups(65), 2U);
+}
+
+TEST(BuildDecodePassTest, BcUploadsGetTheirOwnRefinedDispatches) {
+  // ETC2->BC mode: a BC image's upload (tight blocks) and an RGBA fallback
+  // image's (CR-14), recorded in that order into one arena buffer. The
+  // decode dispatch comes first, the etc2_bc one after it, each with its
+  // own group_begin; the BC job refines, as the CPU route does, and
+  // writes block rows (2 words per BC1 block).
+  Etc2GpuUpload bc =
+      Upload(EtcFormat::kEtc2Rgb8A1, 5, 3, 2, 0, 40, 120, kOutput, 0);
+  bc.bc = true;
+  bc.output_bytes = bc.compressed;
+  const Etc2GpuUpload rgba =
+      Upload(EtcFormat::kEtc2Rgba8, 2, 2, 1, 240, 32, 64, kOutput, 256);
+  Etc2DecodePass pass;
+  ASSERT_TRUE(BuildDecodePass({bc, rgba}, 0, 0, &pass));
+  ASSERT_EQ(pass.dispatches.size(), 2U);
+  EXPECT_FALSE(pass.dispatches[0].bc);
+  EXPECT_TRUE(pass.dispatches[1].bc);
+  EXPECT_EQ(pass.dispatches[0].output, kOutput);
+  EXPECT_EQ(pass.dispatches[1].output, kOutput);
+  EXPECT_EQ(pass.dispatches[0].job_first, 0U);
+  EXPECT_EQ(pass.dispatches[1].job_first, 1U);
+  ASSERT_EQ(pass.jobs.size(), 2U);
+  const Etc2DecodeJob& decode = pass.jobs[0];
+  EXPECT_EQ(decode.format, static_cast<std::uint32_t>(EtcFormat::kEtc2Rgba8));
+  EXPECT_EQ(decode.flags, 0U);
+  EXPECT_EQ(decode.dst_word, 256U / 4);
+  const Etc2DecodeJob& transcode = pass.jobs[1];
+  EXPECT_EQ(transcode.format,
+            static_cast<std::uint32_t>(EtcFormat::kEtc2Rgb8A1));
+  EXPECT_EQ(transcode.flags, kEtc2ToBcRefine ? kEtc2BcJobRefine : 0U);
+  EXPECT_EQ(transcode.group_begin, 0U);
+  EXPECT_EQ(transcode.block_count, 30U);
+  EXPECT_EQ(transcode.dst_word, 0U);
+  EXPECT_EQ(transcode.dst_row_words, 5U * 2U);
+  EXPECT_EQ(transcode.dst_layer_words, 5U * 2U * 3U);
+  // The input still follows the recording order: the BC upload's span
+  // first, the fallback's after it, in one merged copy region.
+  EXPECT_EQ(transcode.src_word, 0U);
+  EXPECT_EQ(decode.src_word, 240U / 4);
+  ASSERT_EQ(pass.copies.size(), 1U);
+  ASSERT_EQ(pass.copies[0].regions.size(), 1U);
+  EXPECT_EQ(pass.copies[0].regions[0].size, 240U + 64U);
 }
 
 TEST(BuildDecodePassTest, RejectsUploadsWithoutOutput) {

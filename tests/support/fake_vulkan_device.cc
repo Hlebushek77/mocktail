@@ -8,8 +8,11 @@
 #include <mutex>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
+#include "generated/etc2_shaders_spv.h"
+#include "mocktail/graphics/bc_encoder.h"
 #include "mocktail/graphics/etc2_decoder.h"
 
 namespace mocktail::graphics::testing {
@@ -268,11 +271,12 @@ struct FakeVulkanDevice::Impl {
     std::vector<std::uint64_t> values;
     std::vector<bool> written;
   };
-  // The decode shader's Job (etc2_decode.comp), as 16 words.
+  // The decode shader's Job (etc2_decode.comp and etc2_bc.comp), as 16
+  // words.
   struct DecodeJob {
-    std::uint32_t format, src_word, src_row_words, src_layer_words,
-        blocks_wide, blocks_high, block_count, dst_word, dst_row_words,
-        dst_layer_words, group_begin, pad[5];
+    std::uint32_t format, src_word, src_row_words, src_layer_words, blocks_wide,
+        blocks_high, block_count, dst_word, dst_row_words, dst_layer_words,
+        group_begin, flags, pad[4];
   };
   // What a command buffer has bound while it executes.
   struct ComputeState {
@@ -309,6 +313,10 @@ struct FakeVulkanDevice::Impl {
   std::unordered_map<VkFence, bool> fences;
   std::unordered_map<VkShaderModule, std::size_t> shader_modules;
   std::unordered_map<VkPipeline, VkShaderModule> pipelines;
+  // Modules made of etc2_bc.comp's SPIR-V, and the pipelines made of them:
+  // their dispatches transcode to BC rather than decode.
+  std::unordered_set<VkShaderModule> bc_modules;
+  std::unordered_set<VkPipeline> bc_pipelines;
   std::unordered_map<VkPipelineLayout, std::uint32_t> pipeline_layouts;
   std::unordered_map<VkDescriptorSetLayout, std::uint32_t> set_layouts;
   std::unordered_map<VkDescriptorPool, DescriptorPool> descriptor_pools;
@@ -1346,9 +1354,10 @@ struct FakeVulkanDevice::Impl {
     return bytes + info->second.offset;
   }
 
-  // etc2_decode.comp on the CPU: each workgroup finds its job by binary
-  // search over group_begin, each invocation decodes one 4x4 block and
-  // writes its rows; anything outside a binding is an error.
+  // etc2_decode.comp (or etc2_bc.comp) on the CPU: each workgroup finds its
+  // job by binary search over group_begin, each invocation decodes one 4x4
+  // block and writes its rows (or transcodes it and writes its BC block);
+  // anything outside a binding is an error.
   void Dispatch(const ComputeState& compute, const std::uint32_t groups[3]) {
     ++counts.dispatches;
     if (pipelines.count(compute.pipeline) == 0) {
@@ -1382,6 +1391,7 @@ struct FakeVulkanDevice::Impl {
       std::memcpy(&value, jobs + static_cast<std::size_t>(index) * 64, 64);
       return value;
     };
+    const bool bc = bc_pipelines.count(compute.pipeline) != 0;
     const std::uint64_t total =
         static_cast<std::uint64_t>(groups[0]) * groups[1] * groups[2];
     for (std::uint64_t group = 0; group < total; ++group) {
@@ -1403,8 +1413,10 @@ struct FakeVulkanDevice::Impl {
         const std::uint64_t block =
             (group - current.group_begin) * 64 + local;
         if (block < current.block_count &&
-            !DecodeBlock(current, block, source, source_size, output,
-                         output_size)) {
+            !(bc ? TranscodeBlock(current, block, source, source_size, output,
+                                  output_size)
+                 : DecodeBlock(current, block, source, source_size, output,
+                               output_size))) {
           return;
         }
       }
@@ -1448,6 +1460,46 @@ struct FakeVulkanDevice::Impl {
       std::memcpy(output + at, texels + y * 4 * texel, 4 * texel);
     }
     ++counts.decoded_blocks;
+    return true;
+  }
+
+  // etc2_bc.comp's invocation: one ETC2/EAC block to its BC block (the
+  // production encoder, which equals the shader), written at the job's
+  // block position.
+  bool TranscodeBlock(const DecodeJob& job, std::uint64_t block,
+                      const std::uint8_t* source, VkDeviceSize source_size,
+                      std::uint8_t* output, VkDeviceSize output_size) {
+    if (job.format > static_cast<std::uint32_t>(EtcFormat::kEacRg11Signed) ||
+        job.blocks_wide == 0 || job.blocks_high == 0) {
+      Error("vkCmdDispatch", "a job with a bad format or extent");
+      return false;
+    }
+    const auto format = static_cast<EtcFormat>(job.format);
+    const std::uint64_t block_bytes = EtcBlockBytes(format);
+    const std::uint64_t per_layer =
+        static_cast<std::uint64_t>(job.blocks_wide) * job.blocks_high;
+    const std::uint64_t layer = block / per_layer;
+    const std::uint64_t rest = block - layer * per_layer;
+    const std::uint64_t by = rest / job.blocks_wide;
+    const std::uint64_t bx = rest - by * job.blocks_wide;
+    const std::uint64_t word = job.src_word + layer * job.src_layer_words +
+                               by * job.src_row_words + bx * block_bytes / 4;
+    if ((word * 4) + block_bytes > source_size) {
+      Error("vkCmdDispatch", "a job reads past its input binding");
+      return false;
+    }
+    const std::uint64_t at =
+        (static_cast<std::uint64_t>(job.dst_word) +
+         layer * job.dst_layer_words + by * job.dst_row_words) *
+            4 +
+        bx * block_bytes;
+    if (at + block_bytes > output_size) {
+      Error("vkCmdDispatch", "a job writes past its output binding");
+      return false;
+    }
+    TranscodeEtcBlockToBc(format, source + word * 4, (job.flags & 1U) != 0,
+                          output + at);
+    ++counts.bc_blocks;
     return true;
   }
 
@@ -1974,6 +2026,10 @@ VKAPI_ATTR VkResult VKAPI_CALL FakeCreateShaderModule(
   }
   *module = NextHandle<VkShaderModule>();
   impl->shader_modules[*module] = info->codeSize;
+  if (info->codeSize == sizeof(kEtc2BcSpv) &&
+      std::memcmp(info->pCode, kEtc2BcSpv, sizeof(kEtc2BcSpv)) == 0) {
+    impl->bc_modules.insert(*module);
+  }
   ++impl->counts.shader_modules.created;
   return VK_SUCCESS;
 }
@@ -1982,6 +2038,7 @@ VKAPI_ATTR void VKAPI_CALL FakeDestroyShaderModule(
     VkDevice device, VkShaderModule module, const VkAllocationCallbacks*) {
   FAKE_ENTER(device, "vkDestroyShaderModule", );
   if (module != VK_NULL_HANDLE) {
+    impl->bc_modules.erase(module);
     if (impl->shader_modules.erase(module) == 0) {
       impl->Error("vkDestroyShaderModule", "unknown shader module");
       return;
@@ -2064,6 +2121,9 @@ VKAPI_ATTR VkResult VKAPI_CALL FakeCreateComputePipelines(
     }
     pipelines[index] = NextHandle<VkPipeline>();
     impl->pipelines[pipelines[index]] = infos[index].stage.module;
+    if (impl->bc_modules.count(infos[index].stage.module) != 0) {
+      impl->bc_pipelines.insert(pipelines[index]);
+    }
     ++impl->counts.pipelines.created;
   }
   return VK_SUCCESS;
@@ -2074,6 +2134,7 @@ VKAPI_ATTR void VKAPI_CALL FakeDestroyPipeline(VkDevice device,
                                                const VkAllocationCallbacks*) {
   FAKE_ENTER(device, "vkDestroyPipeline", );
   if (pipeline != VK_NULL_HANDLE) {
+    impl->bc_pipelines.erase(pipeline);
     if (impl->pipelines.erase(pipeline) == 0) {
       impl->Error("vkDestroyPipeline", "unknown pipeline");
       return;

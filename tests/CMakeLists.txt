@@ -752,6 +752,10 @@ add_library(mocktail_etc2_test_support STATIC
 target_include_directories(mocktail_etc2_test_support PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}
 )
+# The fake device tells the etc2_bc pipeline by its committed SPIR-V.
+target_include_directories(mocktail_etc2_test_support PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/graphics
+)
 target_link_libraries(mocktail_etc2_test_support PUBLIC
   mocktail_etc2_emulation_for_tests
   ${CMAKE_DL_LIBS}

@@ -18,9 +18,9 @@
 // are read back and must equal both the reference model and the golden
 // hashes the fake device produces. The runner's default options pin the
 // CPU route (gpu = false); the GPU route and its rescue get runs of their
-// own. The same scenarios run in ETC2->BC mode too: BC host images, whose
-// blocks read back must equal the references' and the fake device's BC
-// goldens.
+// own. The same scenarios run in ETC2->BC mode too, on both routes (the
+// GPU route's etc2_bc pass and its rescue): BC host images, whose blocks
+// read back must equal the references' and the fake device's BC goldens.
 // The tests skip without a loader, driver or device, and while a live
 // Mocktail or Sober session runs (CR-25).
 
@@ -281,36 +281,76 @@ TEST_P(Etc2EmulationGpuBcTest, CpuRouteMatchesModelAndBcGolden) {
       << GoldenLine(scenario->name, run.hash);
 }
 
-// The same with the GPU route on and ready: it has no BC pipeline yet
-// (WP3b), so BC images keep the CPU route and the same blocks.
-TEST_P(Etc2EmulationGpuBcTest, GpuRouteKeepsBcImagesOnTheCpuRoute) {
+// Whether the GPU route serves one of the scenario's uploads in BC mode: as
+// GpuRouteServes, except that BC images are never upscaled.
+bool BcGpuRouteServes(const HeadlessVulkanDevice& device,
+                      const Scenario& scenario) {
+  if (!scenario.emulated || !ComputeQueue(device, scenario)) {
+    return false;
+  }
+  for (const ScenarioStep& step : scenario.steps) {
+    if (step.kind != ScenarioStep::Kind::kCopyBufferToImage) {
+      continue;
+    }
+    Etc2EmulatedFormat format;
+    if (!LookupEmulatedEtc2Format(scenario.images[step.image].format,
+                                  &format)) {
+      continue;
+    }
+    const bool colour = format.etc_format == EtcFormat::kEtc2Rgb8 ||
+                        format.etc_format == EtcFormat::kEtc2Rgb8A1 ||
+                        format.etc_format == EtcFormat::kEtc2Rgba8;
+    if (!(scenario.overrides && colour)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// The same with the GPU route on and ready (DESIGN C4.4): the etc2_bc pass
+// in front of each batch, or with no slot free after the warm-up the
+// rescue's CPU encoder, must leave exactly the CPU route's BC blocks.
+TEST_P(Etc2EmulationGpuBcTest, GpuRouteMatchesCpuRouteAndBcGolden) {
   const Scenario* scenario = FindEtc2EmulationScenario(GetParam());
   ASSERT_NE(scenario, nullptr);
-  Etc2GpuBackend backend(device_);
-  ScenarioOptions options;
-  options.emulation.to_bc = true;
-  options.emulation.gpu = true;
-  const ScenarioRun run = RunEtc2Scenario(*scenario, &backend, options);
-  if (run.skipped) {
-    GTEST_SKIP() << run.skip_reason;
+  for (const bool rescue : {false, true}) {
+    SCOPED_TRACE(rescue ? "rescued" : "etc2_bc pass");
+    Etc2GpuBackend backend(device_);
+    ScenarioOptions options;
+    options.emulation.to_bc = true;
+    options.emulation.gpu = true;
+    if (rescue) {
+      options.after_warm_up = [] { Etc2GpuTesting().fail_slot_acquire = true; };
+    }
+    const ScenarioRun run = RunEtc2Scenario(*scenario, &backend, options);
+    Etc2GpuTesting().fail_slot_acquire = false;
+    if (run.skipped) {
+      GTEST_SKIP() << run.skip_reason;
+    }
+    for (const std::string& failure : run.failures) {
+      ADD_FAILURE() << failure;
+    }
+    std::uint64_t golden = 0;
+    ASSERT_TRUE(FindEtc2BcEmulationGolden(scenario->name, &golden))
+        << GoldenLine(scenario->name, run.hash);
+    EXPECT_EQ(run.hash, golden)
+        << "the GPU route's BC images differ from the CPU route's; this run "
+           "gives "
+        << GoldenLine(scenario->name, run.hash);
+    if (!scenario->emulated) {
+      continue;
+    }
+    ASSERT_TRUE(run.gpu_route);
+    EXPECT_EQ(run.gpu_state,
+              ComputeQueue(*device_, *scenario) ? "ready" : "built");
+    if (BcGpuRouteServes(*device_, *scenario)) {
+      EXPECT_GT(run.gpu_stats.passes, 0U) << "no BC upload took the GPU route";
+      EXPECT_EQ(run.gpu_stats.rescues, rescue ? run.gpu_stats.passes : 0U);
+    } else {
+      EXPECT_EQ(run.gpu_stats.passes, 0U);
+    }
+    EXPECT_EQ(run.gpu_stats.dropped_uploads, 0U);
   }
-  for (const std::string& failure : run.failures) {
-    ADD_FAILURE() << failure;
-  }
-  std::uint64_t golden = 0;
-  ASSERT_TRUE(FindEtc2BcEmulationGolden(scenario->name, &golden))
-      << GoldenLine(scenario->name, run.hash);
-  EXPECT_EQ(run.hash, golden)
-      << "the GPU's BC images differ with the GPU route on; this run gives "
-      << GoldenLine(scenario->name, run.hash);
-  if (!scenario->emulated) {
-    return;
-  }
-  ASSERT_TRUE(run.gpu_route);
-  EXPECT_EQ(run.gpu_state,
-            ComputeQueue(*device_, *scenario) ? "ready" : "built");
-  EXPECT_EQ(run.gpu_stats.passes, 0U) << "a BC upload took the GPU route";
-  EXPECT_EQ(run.gpu_stats.dropped_uploads, 0U);
 }
 
 INSTANTIATE_TEST_SUITE_P(Scenarios, Etc2EmulationGpuBcTest,

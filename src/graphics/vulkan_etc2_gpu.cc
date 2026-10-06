@@ -13,6 +13,7 @@
 #include <utility>
 
 #include "generated/etc2_shaders_spv.h"
+#include "mocktail/graphics/bc_encoder.h"
 #include "mocktail/graphics/etc2_decoder.h"
 #include "mocktail/graphics/vulkan_etc2_gpu_plan.h"
 
@@ -163,6 +164,10 @@ struct Selftest {
   std::vector<std::uint8_t> expected;
   VkDeviceSize output_offsets[kSelftestFormats] = {};
   VkDeviceSize output_bytes[kSelftestFormats] = {};
+  // ETC2->BC mode: the same blocks transcoded by the etc2_bc pipeline.
+  bool bc = false;
+  VkDeviceSize bc_offsets[kSelftestFormats] = {};
+  VkDeviceSize bc_bytes[kSelftestFormats] = {};
   Clock::time_point started{};
 };
 
@@ -291,6 +296,8 @@ struct Etc2GpuDevice::Impl {
   VkDescriptorSetLayout set_layout1 = VK_NULL_HANDLE;  // output
   VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
   VkPipeline decode_pipeline = VK_NULL_HANDLE;
+  // ETC2->BC mode only (info.bc): the etc2_bc pipeline, same layout.
+  VkPipeline bc_pipeline = VK_NULL_HANDLE;
 
   // [CR-9] Leaf lock: sets come from recording threads (an output chunk's
   // set 1), submit threads (slot set 0) and the trim path.
@@ -630,22 +637,41 @@ struct Etc2GpuDevice::Impl {
 
   // ---- the build ------------------------------------------------------------
 
+  // A compute pipeline of `code` with the shared layout.
+  VkResult CreatePipeline(const std::uint32_t* code, std::size_t bytes,
+                          VkPipeline* pipeline) {
+    VkShaderModuleCreateInfo module_info{};
+    module_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    module_info.codeSize = bytes;
+    module_info.pCode = code;
+    VkShaderModule module = VK_NULL_HANDLE;
+    VkResult result = fns().create_shader_module(info.device, &module_info,
+                                                 nullptr, &module);
+    if (result != VK_SUCCESS) {
+      return result;
+    }
+    VkComputePipelineCreateInfo pipeline_info{};
+    pipeline_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    pipeline_info.stage.sType =
+        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    pipeline_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    pipeline_info.stage.module = module;
+    pipeline_info.stage.pName = "main";
+    pipeline_info.layout = pipeline_layout;
+    result = fns().create_compute_pipelines(info.device, VK_NULL_HANDLE, 1,
+                                            &pipeline_info, nullptr, pipeline);
+    if (result != VK_SUCCESS) {
+      *pipeline = VK_NULL_HANDLE;
+    }
+    fns().destroy_shader_module(info.device, module, nullptr);
+    return result;
+  }
+
   void Build() {
     if (const int delay = Etc2GpuTesting().build_delay_ms.load(); delay > 0) {
       std::this_thread::sleep_for(std::chrono::milliseconds(delay));
     }
     const Clock::time_point start = Clock::now();
-    VkShaderModuleCreateInfo module_info{};
-    module_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-    module_info.codeSize = sizeof(kEtc2DecodeSpv);
-    module_info.pCode = kEtc2DecodeSpv;
-    VkShaderModule module = VK_NULL_HANDLE;
-    VkResult result = fns().create_shader_module(info.device, &module_info,
-                                                 nullptr, &module);
-    if (result != VK_SUCCESS) {
-      Fail("vkCreateShaderModule returned " + std::to_string(result));
-      return;
-    }
     VkDescriptorSetLayoutBinding bindings[2]{};
     for (std::uint32_t index = 0; index < 2; ++index) {
       bindings[index].binding = index;
@@ -657,8 +683,8 @@ struct Etc2GpuDevice::Impl {
     layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     layout_info.bindingCount = 2;
     layout_info.pBindings = bindings;
-    result = fns().create_descriptor_set_layout(info.device, &layout_info,
-                                                nullptr, &set_layout0);
+    VkResult result = fns().create_descriptor_set_layout(
+        info.device, &layout_info, nullptr, &set_layout0);
     if (result == VK_SUCCESS) {
       layout_info.bindingCount = 1;
       result = fns().create_descriptor_set_layout(info.device, &layout_info,
@@ -678,26 +704,25 @@ struct Etc2GpuDevice::Impl {
       result = fns().create_pipeline_layout(info.device, &pipeline_layout_info,
                                             nullptr, &pipeline_layout);
     }
-    if (result == VK_SUCCESS) {
-      VkComputePipelineCreateInfo pipeline_info{};
-      pipeline_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-      pipeline_info.stage.sType =
-          VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-      pipeline_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-      pipeline_info.stage.module = module;
-      pipeline_info.stage.pName = "main";
-      pipeline_info.layout = pipeline_layout;
-      result = fns().create_compute_pipelines(info.device, VK_NULL_HANDLE, 1,
-                                              &pipeline_info, nullptr,
-                                              &decode_pipeline);
-      if (result != VK_SUCCESS) {
-        decode_pipeline = VK_NULL_HANDLE;
-      }
-    }
-    fns().destroy_shader_module(info.device, module, nullptr);
     if (result != VK_SUCCESS) {
       Fail("building the decode pipeline returned " + std::to_string(result));
       return;
+    }
+    result = CreatePipeline(kEtc2DecodeSpv, sizeof(kEtc2DecodeSpv),
+                            &decode_pipeline);
+    if (result != VK_SUCCESS) {
+      Fail("building the decode pipeline returned " + std::to_string(result));
+      return;
+    }
+    // ETC2->BC mode transcodes BC images with a pipeline of its own; the
+    // device's RGBA fallback images (CR-14) still decode.
+    if (info.bc) {
+      result = CreatePipeline(kEtc2BcSpv, sizeof(kEtc2BcSpv), &bc_pipeline);
+      if (result != VK_SUCCESS) {
+        Fail("building the BC transcode pipeline returned " +
+             std::to_string(result));
+        return;
+      }
     }
     const std::uint64_t built_ns = Nanoseconds(Clock::now() - start);
     {
@@ -1232,8 +1257,9 @@ struct Etc2GpuDevice::Impl {
     return fns().begin_command_buffer(command_buffer, &begin) == VK_SUCCESS;
   }
 
-  // Records one batch's decode pass (DESIGN C3.2): copy-in, decode, and the
-  // barrier that orders the decode before Roblox's copies.
+  // Records one batch's decode pass (DESIGN C3.2): copy-in, decode (and in
+  // ETC2->BC mode the BC transcode), and the barrier that orders them before
+  // Roblox's copies.
   // `begun`: the command buffer left its initial state, so a rescue after a
   // failure here needs another one.
   bool RecordDecode(Slot& slot, VkCommandBuffer command_buffer,
@@ -1251,7 +1277,8 @@ struct Etc2GpuDevice::Impl {
     std::vector<VkDescriptorSet> outputs;
     for (const Etc2DecodeDispatch& dispatch : pass.dispatches) {
       outputs.push_back(OutputSet(dispatch.output));
-      if (outputs.back() == VK_NULL_HANDLE) {
+      if (outputs.back() == VK_NULL_HANDLE ||
+          (dispatch.bc && bc_pipeline == VK_NULL_HANDLE)) {
         return false;
       }
     }
@@ -1286,12 +1313,22 @@ struct Etc2GpuDevice::Impl {
     Barrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
             VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VK_ACCESS_SHADER_READ_BIT);
-    fns().bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                        decode_pipeline);
-    fns().bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                               pipeline_layout, 0, 1, &slot.set0, 0, nullptr);
+    // Both pipelines share one layout, so the sets and push constants stay
+    // bound when the BC dispatches (which come last) switch pipelines.
+    VkPipeline bound = VK_NULL_HANDLE;
     for (std::size_t index = 0; index < pass.dispatches.size(); ++index) {
       const Etc2DecodeDispatch& dispatch = pass.dispatches[index];
+      const VkPipeline pipeline = dispatch.bc ? bc_pipeline : decode_pipeline;
+      if (pipeline != bound) {
+        fns().bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            pipeline);
+        if (bound == VK_NULL_HANDLE) {
+          fns().bind_descriptor_sets(
+              command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout,
+              0, 1, &slot.set0, 0, nullptr);
+        }
+        bound = pipeline;
+      }
       fns().bind_descriptor_sets(command_buffer,
                                  VK_PIPELINE_BIND_POINT_COMPUTE,
                                  pipeline_layout, 1, 1, &outputs[index], 0,
@@ -1510,10 +1547,13 @@ struct Etc2GpuDevice::Impl {
 
   // Deterministic blocks of every format: random bytes cover every ETC2
   // mode (individual, differential, T, H, planar), punch-through both ways
-  // and EAC with every multiplier, signed and unsigned.
+  // and EAC with every multiplier, signed and unsigned. In ETC2->BC mode the
+  // etc2_bc pipeline transcodes the same blocks too, against the CPU
+  // encoder (DESIGN C3.4).
   bool SetUpSelftest(std::uint32_t family) {
     Selftest& test = selftest;
     test.family = family;
+    test.bc = bc_pipeline != VK_NULL_HANDLE;
     const std::uint32_t blocks = kSelftestBlocksWide * kSelftestBlocksHigh;
     const std::uint32_t width = 4 * kSelftestBlocksWide;
     const std::uint32_t height = 4 * kSelftestBlocksHigh;
@@ -1530,9 +1570,20 @@ struct Etc2GpuDevice::Impl {
                                   EtcDecodedTexelBytes(etc);
       output_bytes = test.output_offsets[format] + test.output_bytes[format];
     }
+    if (test.bc) {
+      for (std::uint32_t format = 0; format < kSelftestFormats; ++format) {
+        const auto etc = static_cast<EtcFormat>(format);
+        test.bc_offsets[format] =
+            AlignUp(output_bytes, kEtc2GpuRegionAlignment);
+        test.bc_bytes[format] =
+            static_cast<VkDeviceSize>(blocks) * EtcBlockBytes(etc);
+        output_bytes = test.bc_offsets[format] + test.bc_bytes[format];
+      }
+    }
+    const std::uint32_t job_count = (test.bc ? 2 : 1) * kSelftestFormats;
     if (!CreateBuffer(input_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                       MemoryKind::kHost, &test.input) ||
-        !CreateBuffer(kSelftestFormats * sizeof(Etc2DecodeJob),
+        !CreateBuffer(job_count * sizeof(Etc2DecodeJob),
                       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryKind::kHost,
                       &test.jobs) ||
         !CreateBuffer(output_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
@@ -1546,8 +1597,9 @@ struct Etc2GpuDevice::Impl {
     }
     std::memset(test.output.mapped, 0, output_bytes);
     test.expected.assign(output_bytes, 0);
-    std::vector<Etc2DecodeJob> jobs(kSelftestFormats);
+    std::vector<Etc2DecodeJob> jobs(job_count);
     std::uint32_t groups = 0;
+    std::uint32_t bc_groups = 0;
     for (std::uint32_t format = 0; format < kSelftestFormats; ++format) {
       const auto etc = static_cast<EtcFormat>(format);
       const VkDeviceSize block_bytes = EtcBlockBytes(etc);
@@ -1571,6 +1623,24 @@ struct Etc2GpuDevice::Impl {
                           blocks * block_bytes, width, height,
                           test.expected.data() + test.output_offsets[format],
                           test.output_bytes[format])) {
+        return false;
+      }
+      if (!test.bc) {
+        continue;
+      }
+      // The same blocks, transcoded: tight BC blocks, row after row.
+      Etc2DecodeJob& bc_job = jobs[kSelftestFormats + format];
+      bc_job = job;
+      bc_job.dst_word = static_cast<std::uint32_t>(test.bc_offsets[format] / 4);
+      bc_job.dst_row_words = job.src_row_words;
+      bc_job.dst_layer_words = job.src_layer_words;
+      bc_job.group_begin = bc_groups;
+      bc_job.flags = kEtc2ToBcRefine ? kEtc2BcJobRefine : 0;
+      bc_groups += Etc2DecodeGroups(blocks);
+      if (!TranscodeEtcToBc(etc, test.input.mapped + input_offsets[format],
+                            blocks * block_bytes,
+                            test.expected.data() + test.bc_offsets[format],
+                            test.bc_bytes[format], kEtc2ToBcRefine)) {
         return false;
       }
     }
@@ -1613,18 +1683,25 @@ struct Etc2GpuDevice::Impl {
     if (!Begin(command_buffer)) {
       return false;
     }
-    fns().bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                        decode_pipeline);
     const VkDescriptorSet sets[2] = {test.set0, test.set1};
-    fns().bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                               pipeline_layout, 0, 2, sets, 0, nullptr);
-    const std::uint32_t push[2] = {0, kSelftestFormats};
-    fns().push_constants(command_buffer, pipeline_layout,
-                         VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), push);
-    std::uint32_t x = 0;
-    std::uint32_t y = 0;
-    Etc2SplitDispatch(groups, &x, &y);
-    fns().dispatch(command_buffer, x, y, 1);
+    const auto dispatch = [&](VkPipeline pipeline, std::uint32_t first,
+                              std::uint32_t dispatch_groups) {
+      fns().bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          pipeline);
+      fns().bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                 pipeline_layout, 0, 2, sets, 0, nullptr);
+      const std::uint32_t push[2] = {first, kSelftestFormats};
+      fns().push_constants(command_buffer, pipeline_layout,
+                           VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), push);
+      std::uint32_t x = 0;
+      std::uint32_t y = 0;
+      Etc2SplitDispatch(dispatch_groups, &x, &y);
+      fns().dispatch(command_buffer, x, y, 1);
+    };
+    dispatch(decode_pipeline, 0, groups);
+    if (test.bc) {
+      dispatch(bc_pipeline, kSelftestFormats, bc_groups);
+    }
     Barrier(command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_HOST_BIT,
             VK_ACCESS_HOST_READ_BIT);
@@ -1686,39 +1763,54 @@ struct Etc2GpuDevice::Impl {
     if (Etc2GpuTesting().corrupt_selftest.load() && !test.expected.empty()) {
       test.expected[test.output_offsets[2] + 17] ^= 0x10;
     }
-    for (std::uint32_t format = 0; format < kSelftestFormats; ++format) {
-      const std::uint8_t* gpu = test.output.mapped + test.output_offsets[format];
-      const std::uint8_t* cpu = test.expected.data() + test.output_offsets[format];
-      const VkDeviceSize bytes = test.output_bytes[format];
-      if (std::memcmp(gpu, cpu, bytes) == 0) {
-        continue;
+    if (Etc2GpuTesting().corrupt_bc_selftest.load() && test.bc) {
+      test.expected[test.bc_offsets[5] + 37] ^= 0x04;
+    }
+    // Decoded texels, then (ETC2->BC mode) BC blocks: the first difference
+    // names the format, the block and the bytes around it.
+    for (std::uint32_t part = 0; part < (test.bc ? 2U : 1U); ++part) {
+      const bool bc = part == 1;
+      for (std::uint32_t format = 0; format < kSelftestFormats; ++format) {
+        const VkDeviceSize offset =
+            bc ? test.bc_offsets[format] : test.output_offsets[format];
+        const VkDeviceSize bytes =
+            bc ? test.bc_bytes[format] : test.output_bytes[format];
+        const std::uint8_t* gpu = test.output.mapped + offset;
+        const std::uint8_t* cpu = test.expected.data() + offset;
+        if (std::memcmp(gpu, cpu, bytes) == 0) {
+          continue;
+        }
+        VkDeviceSize first = 0;
+        while (first < bytes && gpu[first] == cpu[first]) {
+          ++first;
+        }
+        const auto etc = static_cast<EtcFormat>(format);
+        VkDeviceSize block = first / EtcBlockBytes(etc);
+        if (!bc) {
+          const VkDeviceSize row_bytes =
+              4ULL * kSelftestBlocksWide * EtcDecodedTexelBytes(etc);
+          const VkDeviceSize texel_y = first / row_bytes;
+          const VkDeviceSize texel_x =
+              (first % row_bytes) / EtcDecodedTexelBytes(etc);
+          block = (texel_y / 4) * kSelftestBlocksWide + texel_x / 4;
+        }
+        char reason[192];
+        const VkDeviceSize at = first & ~VkDeviceSize{3};
+        std::snprintf(reason, sizeof(reason),
+                      "selftest mismatch: %s%s block %llu, byte %llu: gpu "
+                      "%02x%02x%02x%02x, cpu %02x%02x%02x%02x",
+                      bc ? "BC from " : "", kFormatNames[format],
+                      static_cast<unsigned long long>(block),
+                      static_cast<unsigned long long>(first), gpu[at],
+                      gpu[at + 1], gpu[at + 2], gpu[at + 3], cpu[at],
+                      cpu[at + 1], cpu[at + 2], cpu[at + 3]);
+        DestroySelftest();
+        Fail(reason);
+        return;
       }
-      VkDeviceSize first = 0;
-      while (first < bytes && gpu[first] == cpu[first]) {
-        ++first;
-      }
-      const auto etc = static_cast<EtcFormat>(format);
-      const VkDeviceSize row_bytes =
-          4ULL * kSelftestBlocksWide * EtcDecodedTexelBytes(etc);
-      const VkDeviceSize texel_y = first / row_bytes;
-      const VkDeviceSize texel_x =
-          (first % row_bytes) / EtcDecodedTexelBytes(etc);
-      char reason[192];
-      const VkDeviceSize at = first & ~VkDeviceSize{3};
-      std::snprintf(reason, sizeof(reason),
-                    "selftest mismatch: %s block %llu, byte %llu: gpu "
-                    "%02x%02x%02x%02x, cpu %02x%02x%02x%02x",
-                    kFormatNames[format],
-                    static_cast<unsigned long long>(
-                        (texel_y / 4) * kSelftestBlocksWide + texel_x / 4),
-                    static_cast<unsigned long long>(first), gpu[at],
-                    gpu[at + 1], gpu[at + 2], gpu[at + 3], cpu[at],
-                    cpu[at + 1], cpu[at + 2], cpu[at + 3]);
-      DestroySelftest();
-      Fail(reason);
-      return;
     }
     const std::uint32_t family = test.family;
+    const bool bc = test.bc;
     DestroySelftest();
     std::uint64_t build_ms = 0;
     {
@@ -1729,8 +1821,9 @@ struct Etc2GpuDevice::Impl {
     if (state.load() == State::kReady) {
       std::fprintf(stderr,
                    "  [vulkan] ETC2 GPU decode ready on family %u (build %llu "
-                   "ms, selftest ok)\n",
-                   family, static_cast<unsigned long long>(build_ms));
+                   "ms, selftest ok%s)\n",
+                   family, static_cast<unsigned long long>(build_ms),
+                   bc ? ", BC transcode too" : "");
     }
   }
 
@@ -1809,8 +1902,10 @@ struct Etc2GpuDevice::Impl {
       descriptor_pools.clear();
       set_pools.clear();
     }
-    if (decode_pipeline != VK_NULL_HANDLE) {
-      fns().destroy_pipeline(info.device, decode_pipeline, nullptr);
+    for (VkPipeline pipeline : {decode_pipeline, bc_pipeline}) {
+      if (pipeline != VK_NULL_HANDLE) {
+        fns().destroy_pipeline(info.device, pipeline, nullptr);
+      }
     }
     if (pipeline_layout != VK_NULL_HANDLE) {
       fns().destroy_pipeline_layout(info.device, pipeline_layout, nullptr);
@@ -1821,6 +1916,7 @@ struct Etc2GpuDevice::Impl {
       }
     }
     decode_pipeline = VK_NULL_HANDLE;
+    bc_pipeline = VK_NULL_HANDLE;
     pipeline_layout = VK_NULL_HANDLE;
     set_layout0 = VK_NULL_HANDLE;
     set_layout1 = VK_NULL_HANDLE;

@@ -2,7 +2,8 @@
 # Copyright 2026 Mocktail Project Authors
 # Apache 2.0 License
 #
-# scripts/gen-etc2-shaders.sh — Compiles the ETC2/EAC GPU decode shaders.
+# scripts/gen-etc2-shaders.sh — Compiles the ETC2/EAC GPU decode and ETC2->BC
+# transcode shaders.
 #
 #   ./scripts/gen-etc2-shaders.sh           regenerate the header (needs glslc)
 #   ./scripts/gen-etc2-shaders.sh --check   exit 1 when the header is stale
@@ -23,6 +24,7 @@ HEADER="${PROJECT_ROOT}/src/graphics/generated/etc2_shaders_spv.h"
 # Shader stages that become pipelines, with the array name they get.
 STAGES=(
   "etc2_decode.comp:kEtc2DecodeSpv"
+  "etc2_bc.comp:kEtc2BcSpv"
 )
 
 # Every GLSL source, in byte order of the file names: the hash covers the

@@ -99,6 +99,8 @@ struct Etc2GpuDeviceInfo {
   VkPhysicalDeviceMemoryProperties memory{};
   VkPhysicalDeviceProperties properties{};  // limits, timestampPeriod
   std::vector<VkQueueFamilyProperties> families;
+  // ETC2->BC mode: the device's BC images get their blocks from the
+  // etc2_bc pipeline, which the build and the selftest then include.
   bool bc = false;
   // Device-local bytes the output arenas of all families may hold
   // together (MOCKTAIL_ETC2_GPU_ARENA_MB); 0: min(256 MiB, VRAM / 24).
@@ -121,6 +123,7 @@ struct Etc2GpuTestHooks {
   std::atomic<bool> fail_slot_acquire{false};  // as if no slot came free
   std::atomic<bool> fail_rescue_slot{false};   // nor the rescue slot
   std::atomic<bool> corrupt_selftest{false};   // the selftest must mismatch
+  std::atomic<bool> corrupt_bc_selftest{false};  // ... in its BC part
   std::atomic<int> build_delay_ms{0};          // the build thread sleeps first
   std::mutex mutex;
   Etc2RescueDecode rescue_decode;  // replaces the emulation's, when set
@@ -128,11 +131,12 @@ struct Etc2GpuTestHooks {
 Etc2GpuTestHooks& Etc2GpuTesting();
 
 // The GPU decode runtime of one emulated device (DESIGN C3): the decode
-// pipeline, output arenas per queue family, and per-queue submit slots that
-// record the decode pass put in front of Roblox's batches. The emulation
-// makes one per emulated device; its pipelines are built on a background
-// thread from the first emulated image on, and a selftest on the GPU must
-// match the CPU decoder before any upload takes the GPU route.
+// pipeline (and in ETC2->BC mode, `bc`, the etc2_bc transcode pipeline),
+// output arenas per queue family, and per-queue submit slots that record
+// the decode pass put in front of Roblox's batches. The emulation makes one
+// per emulated device; its pipelines are built on a background thread from
+// the first emulated image on, and a selftest on the GPU must match the CPU
+// decoder (and the CPU BC encoder) before any upload takes the GPU route.
 class Etc2GpuDevice {
  public:
   enum class State : int {

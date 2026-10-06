@@ -31,9 +31,11 @@ VkPhysicalDeviceProperties Rtx3060Properties();
 // in malloc'd storage, record transfer commands into command buffers, and run
 // them against a CPU model of every image when the test submits: copies and
 // same-size NEAREST blits move bytes, filtered blits are only recorded, and a
-// compute dispatch runs the ETC2 decode shader's job list on the CPU (the
-// only pipeline Mocktail builds; DecodeEtcImage per 4x4 block, written the
-// way etc2_decode.comp writes it), so the GPU route runs here too. Misuse
+// compute dispatch runs the ETC2 decode shader's job list on the CPU
+// (DecodeEtcImage per 4x4 block, written the way etc2_decode.comp writes
+// it; for a pipeline made of etc2_bc.comp's SPIR-V, TranscodeEtcBlockToBc
+// per block, as etc2_bc.comp writes it), so the GPU route runs here too.
+// Misuse
 // that a validation layer would flag is collected in errors() instead of
 // crashing, so a test can name the rule that broke.
 //
@@ -93,6 +95,7 @@ class FakeVulkanDevice {
     ObjectCount query_pools;
     std::uint64_t dispatches = 0;
     std::uint64_t decoded_blocks = 0;
+    std::uint64_t bc_blocks = 0;  // transcoded by etc2_bc dispatches
     // Of the buffers and memory, those created through the entry points
     // (that is, by the code under test rather than by the test).
     ObjectCount entry_point_buffers;
