@@ -1437,7 +1437,10 @@ set_tests_properties(Etc2EmulationGpuTest.ValidationLayerReportsNothing
 # enables the layer and VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION
 # itself, and each validation message fails the test that caused it. A
 # control test checks that a missing barrier is reported. Without the layer
-# the tests skip. Only these: work/ctest.sh <build> <home> -L validation
+# the tests skip, and a run in which every test skipped shows as skipped
+# (the CR-25 guard also skips while any process named mocktail runs, which
+# the full suite's own tests start). Only these: work/ctest.sh <build>
+# <home> -L validation
 foreach(gpu_test etc2_emulation_gpu_test etc2_gpu_parity_test
                  etc2_gpu_route_test)
   add_test(NAME ${gpu_test}.SyncValidation COMMAND ${gpu_test})
@@ -1445,6 +1448,7 @@ foreach(gpu_test etc2_emulation_gpu_test etc2_gpu_parity_test
     LABELS "gpu;validation"
     ENVIRONMENT "MOCKTAIL_TEST_VALIDATION=sync"
     FAIL_REGULAR_EXPRESSION "\\[  FAILED  \\]"
+    SKIP_REGULAR_EXPRESSION "\\[  PASSED  \\] 0 tests"
   )
 endforeach()
 gtest_discover_tests(video_driver_policy_test)
