@@ -119,11 +119,23 @@ TEST_P(Etc2EmulationGpuTest, CpuRouteMatchesModelAndGolden) {
       << GoldenLine(scenario->name, run.hash);
 }
 
+// Whether the scenario's queue can run the GPU route: its family has
+// compute. On a transfer-only family the route never even runs its
+// selftest, and every upload takes the CPU route (DESIGN §3.2).
+bool ComputeQueue(const HeadlessVulkanDevice& device,
+                  const Scenario& scenario) {
+  return scenario.queue_family < device.queue_families().size() &&
+         (device.queue_families()[scenario.queue_family].queueFlags &
+          VK_QUEUE_COMPUTE_BIT) != 0;
+}
+
 // Whether the GPU route can serve one of the scenario's uploads: an ETC2
 // copy into an image that is not upscaled, and not a colour one while
-// texture overrides are active (both stay on the CPU route, DESIGN §3.2).
-bool GpuRouteServes(const Scenario& scenario) {
-  if (!scenario.emulated) {
+// texture overrides are active (both stay on the CPU route, DESIGN §3.2),
+// recorded for a queue with compute.
+bool GpuRouteServes(const HeadlessVulkanDevice& device,
+                    const Scenario& scenario) {
+  if (!scenario.emulated || !ComputeQueue(device, scenario)) {
     return false;
   }
   for (const ScenarioStep& step : scenario.steps) {
@@ -175,8 +187,8 @@ TEST_P(Etc2EmulationGpuTest, GpuRouteMatchesCpuRouteAndGolden) {
     return;
   }
   ASSERT_TRUE(run.gpu_route);
-  EXPECT_EQ(run.gpu_state, "ready");
-  if (GpuRouteServes(*scenario)) {
+  EXPECT_EQ(run.gpu_state, ComputeQueue(*device_, *scenario) ? "ready" : "built");
+  if (GpuRouteServes(*device_, *scenario)) {
     EXPECT_GT(run.gpu_stats.passes, 0U) << "no upload took the GPU route";
   } else {
     EXPECT_EQ(run.gpu_stats.passes, 0U);
