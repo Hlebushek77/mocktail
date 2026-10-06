@@ -737,6 +737,13 @@ target_link_libraries(resample_rgba_test PRIVATE
 )
 mocktail_apply_compile_options(resample_rgba_test)
 
+add_executable(vulkan_etc2_planning_test vulkan_etc2_planning_test.cc)
+target_link_libraries(vulkan_etc2_planning_test PRIVATE
+  mocktail_etc2_emulation_for_tests
+  GTest::gtest_main
+)
+mocktail_apply_compile_options(vulkan_etc2_planning_test)
+
 add_executable(vulkan_etc2_emulation_test vulkan_etc2_emulation_test.cc)
 target_link_libraries(vulkan_etc2_emulation_test PRIVATE
   mocktail_etc2_test_support
@@ -1294,6 +1301,7 @@ gtest_discover_tests(chunk_arena_test)
 gtest_discover_tests(vulkan_etc2_diagnostics_test)
 gtest_discover_tests(etc2_decoder_test)
 gtest_discover_tests(resample_rgba_test)
+gtest_discover_tests(vulkan_etc2_planning_test)
 gtest_discover_tests(vulkan_etc2_emulation_test)
 # Real GPU: skipped without a loader, driver or device, and while a live game
 # runs (CR-25). Hold these back with -LE gpu while a live measurement runs.
