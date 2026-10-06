@@ -316,6 +316,8 @@ struct FakeVulkanDevice::Impl {
   std::unordered_map<VkQueryPool, QueryPool> query_pools;
   std::uint64_t fake_time = 0;
   std::vector<VkResult> submit_results;
+  bool hold_fences = false;
+  std::vector<VkFence> held_fences;
   std::map<std::pair<std::uint32_t, std::uint32_t>, VkQueue> queues;
   Counts counts;
   std::map<std::string, std::uint64_t> calls;
@@ -1892,6 +1894,10 @@ VKAPI_ATTR void VKAPI_CALL FakeDestroyFence(VkDevice device, VkFence fence,
   if (fence == VK_NULL_HANDLE) {
     return;
   }
+  // A held fence may go: teardown gives up on a GPU that does not finish.
+  impl->held_fences.erase(std::remove(impl->held_fences.begin(),
+                                      impl->held_fences.end(), fence),
+                          impl->held_fences.end());
   if (impl->fences.erase(fence) == 0) {
     impl->Error("vkDestroyFence", "unknown fence");
     return;
@@ -1936,6 +1942,11 @@ VKAPI_ATTR VkResult VKAPI_CALL FakeResetFences(VkDevice device,
                                                const VkFence* fences) {
   FAKE_ENTER(device, "vkResetFences", VK_ERROR_DEVICE_LOST);
   for (std::uint32_t index = 0; index < count; ++index) {
+    if (std::find(impl->held_fences.begin(), impl->held_fences.end(),
+                  fences[index]) != impl->held_fences.end()) {
+      impl->Error("vkResetFences", "the fence is still pending",
+                  "VUID-vkResetFences-pFences-01123");
+    }
     impl->fences[fences[index]] = false;
   }
   return VK_SUCCESS;
@@ -2033,6 +2044,10 @@ VKAPI_ATTR VkResult VKAPI_CALL FakeCreateComputePipelines(
     const VkComputePipelineCreateInfo* infos, const VkAllocationCallbacks*,
     VkPipeline* pipelines) {
   FAKE_ENTER(device, "vkCreateComputePipelines", VK_ERROR_DEVICE_LOST);
+  if (impl->config.fail_compute_pipelines) {
+    std::fill(pipelines, pipelines + count, VK_NULL_HANDLE);
+    return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+  }
   for (std::uint32_t index = 0; index < count; ++index) {
     if (impl->shader_modules.count(infos[index].stage.module) == 0 ||
         impl->pipeline_layouts.count(infos[index].layout) == 0) {
@@ -2363,9 +2378,15 @@ void SignalFence(FakeVulkanDevice::Impl* impl, VkFence fence) {
     impl->Error("vkQueueSubmit", "unknown fence");
     return;
   }
-  if (found->second) {
+  if (found->second ||
+      std::find(impl->held_fences.begin(), impl->held_fences.end(), fence) !=
+          impl->held_fences.end()) {
     impl->Error("vkQueueSubmit", "fence is already signalled",
                 "VUID-vkQueueSubmit-fence-00063");
+  }
+  if (impl->hold_fences) {
+    impl->held_fences.push_back(fence);
+    return;
   }
   found->second = true;
 }
@@ -2765,6 +2786,21 @@ VkQueue FakeVulkanDevice::GetQueue(std::uint32_t family, std::uint32_t index) {
 void FakeVulkanDevice::FailNextSubmits(std::vector<VkResult> results) {
   std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
   impl_->submit_results = std::move(results);
+}
+
+void FakeVulkanDevice::HoldFences(bool hold) {
+  std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
+  impl_->hold_fences = hold;
+  if (hold) {
+    return;
+  }
+  for (VkFence fence : impl_->held_fences) {
+    const auto found = impl_->fences.find(fence);
+    if (found != impl_->fences.end()) {
+      found->second = true;
+    }
+  }
+  impl_->held_fences.clear();
 }
 
 VkResult FakeVulkanDevice::Submit(

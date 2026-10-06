@@ -61,6 +61,9 @@ class FakeVulkanDevice {
     // A descriptor pool holds at most this many sets, whatever its maxSets
     // (0: maxSets).
     std::uint32_t max_sets_per_pool = 0;
+    // vkCreateComputePipelines fails, as on a driver whose compiler
+    // rejects the shader.
+    bool fail_compute_pipelines = false;
   };
 
   struct ObjectCount {
@@ -156,6 +159,10 @@ class FakeVulkanDevice {
   // The next vkQueueSubmit(2) calls return these results in order, and
   // execute and signal nothing unless the result is VK_SUCCESS.
   void FailNextSubmits(std::vector<VkResult> results);
+  // While held, the fences of submits stay unsignalled, as on a GPU that
+  // fell behind (the commands still run at submit). Letting go signals
+  // every held fence.
+  void HoldFences(bool hold);
   VkResult QueueSubmit(VkQueue queue, std::uint32_t count,
                        const VkSubmitInfo* submits, VkFence fence);
   VkResult QueueSubmit2(VkQueue queue, std::uint32_t count,

@@ -675,6 +675,90 @@ TEST_F(Etc2GpuRouteFakeTest, FallbackMatrix) {
   EXPECT_EQ(Reasons(UploadOnce(GpuOptions(), small_memory, kRgb, 64)),
             "gpu_disabled=0 gpu_not_ready=0 gpu_unavailable=0 upscaled=0 "
             "overrides=0 no_compute_queue=0 too_large=0 arena_full=1 gpu=0");
+  // A driver that cannot build the pipeline.
+  FakeVulkanDevice::Config no_pipeline;
+  no_pipeline.fail_compute_pipelines = true;
+  const std::string unbuilt = UploadOnce(GpuOptions(), no_pipeline, kRgb, 64);
+  EXPECT_EQ(Reasons(unbuilt),
+            "gpu_disabled=0 gpu_not_ready=0 gpu_unavailable=1 upscaled=0 "
+            "overrides=0 no_compute_queue=0 too_large=0 arena_full=0 gpu=0");
+  EXPECT_NE(unbuilt.find("[vulkan] ETC2 GPU decode unavailable: building the "
+                         "decode pipeline returned"),
+            std::string::npos)
+      << unbuilt;
+  // Memory the selftest needs cannot be had (its 91 KiB of output); the
+  // CPU route's one-off staging still fits.
+  FakeVulkanDevice::Config tiny_memory;
+  tiny_memory.max_allocation_bytes = 4096;
+  const std::string untested = UploadOnce(GpuOptions(), tiny_memory, kRgb, 16);
+  EXPECT_EQ(Reasons(untested),
+            "gpu_disabled=0 gpu_not_ready=0 gpu_unavailable=1 upscaled=0 "
+            "overrides=0 no_compute_queue=0 too_large=0 arena_full=0 gpu=0");
+  EXPECT_NE(untested.find("[vulkan] ETC2 GPU decode unavailable: the selftest "
+                          "could not be set up"),
+            std::string::npos)
+      << untested;
+}
+
+// A GPU that falls behind (DESIGN C3.3, CR-6, §6): with every fence held,
+// 32 calls fill the queue's 32 slots, and the 33rd waits for the oldest
+// (50 ms at most; the fake answers at once), gives up and is rescued on
+// the reserved slot with the right texels. Once the GPU catches up the
+// slots are used again without a wait. vkDestroyDevice with a pass still
+// pending waits 1 s at most for it, logs, and destroys everything anyway.
+TEST_F(Etc2GpuRouteFakeTest, AGpuThatFallsBehindIsRescuedThenTornDown) {
+  ::testing::internal::CaptureStderr();
+  {
+    FakeRig rig(GpuOptions());
+    ASSERT_TRUE(rig.WarmUp());
+    const VkCommandPool pool = rig.Pool(0);
+    RigImage* image =
+        rig.Image(VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK, 24, 24, 2);
+    RigSource* source = rig.Source(4096, 43);
+    const std::uint64_t slots = rig.gpu()->stats().slots_created;
+    rig.fake().HoldFences(true);
+    for (int call = 0; call < 33; ++call) {
+      const VkCommandBuffer command_buffer = rig.Begin(pool);
+      const auto regions = rig.Upload(command_buffer, *image, *source);
+      rig.End(command_buffer);
+      ASSERT_EQ(rig.Submit(rig.queue(), {{command_buffer}}, VK_NULL_HANDLE),
+                VK_SUCCESS);
+      rig.Check(*image, *source, regions);
+    }
+    Etc2GpuDevice::Stats stats = rig.gpu()->stats();
+    EXPECT_EQ(stats.slots_created, slots + 33) << "32 slots and the rescue's";
+    EXPECT_EQ(stats.slot_waits, 1U);
+    EXPECT_EQ(stats.slot_timeouts, 1U);
+    EXPECT_EQ(stats.rescues, 1U);
+    EXPECT_EQ(stats.rescued_uploads, 2U);
+    EXPECT_EQ(stats.dropped_uploads, 0U);
+
+    rig.fake().HoldFences(false);
+    const VkCommandBuffer caught_up = rig.Begin(pool);
+    const auto regions = rig.Upload(caught_up, *image, *source);
+    rig.End(caught_up);
+    ASSERT_EQ(rig.Submit(rig.queue(), {{caught_up}}, VK_NULL_HANDLE),
+              VK_SUCCESS);
+    rig.Check(*image, *source, regions);
+    stats = rig.gpu()->stats();
+    EXPECT_EQ(stats.slots_created, slots + 33);
+    EXPECT_EQ(stats.slot_waits, 1U);
+
+    rig.fake().HoldFences(true);
+    const VkCommandBuffer pending = rig.Begin(pool);
+    rig.Upload(pending, *image, *source);
+    rig.End(pending);
+    ASSERT_EQ(rig.Submit(rig.queue(), {{pending}}, VK_NULL_HANDLE),
+              VK_SUCCESS);
+    rig.Teardown();
+    ExpectEverythingReleased(rig.fake());
+    EXPECT_TRUE(rig.fake().errors().empty()) << rig.fake().errors().front();
+  }
+  const std::string log = ::testing::internal::GetCapturedStderr();
+  EXPECT_NE(log.find("[vulkan] ETC2 GPU decode: a decode pass still pending "
+                     "after 1 s"),
+            std::string::npos)
+      << log;
 }
 
 // [CR-1] Three batches in one call, two with uploads: two passes, one
