@@ -1019,8 +1019,11 @@ struct VulkanEtc2Emulation::State {
                               VkImage destination, std::uint32_t count,
                               const Region* regions, HostCopy& host_copy) {
     GpuCopyResult result;
-    std::vector<Region> rewritten;
-    std::vector<Etc2GpuUpload> uploads;
+    // Kept per thread, so that a warm copy hook allocates nothing here.
+    thread_local std::vector<Region> rewritten;
+    thread_local std::vector<Etc2GpuUpload> uploads;
+    rewritten.clear();
+    uploads.clear();
     VkDeviceSize total = 0;
     if (!PlanGpuRegions(target.image, source, count, regions, target.image.bc,
                         &rewritten, &uploads, &total)) {
@@ -1044,8 +1047,8 @@ struct VulkanEtc2Emulation::State {
       upload.pool_family = target.pool_family;
       result.compressed += upload.compressed;
     }
-    result.first_upload = RecordGpu(command_buffer, dev.device, destination,
-                                    std::move(uploads), output);
+    result.first_upload =
+        RecordGpu(command_buffer, dev.device, destination, uploads, output);
     result.recorded = true;
     host_copy(output.buffer, rewritten.data());
     return result;
@@ -1205,7 +1208,7 @@ struct VulkanEtc2Emulation::State {
   // Keeps the GPU-route uploads and their output range with the command
   // buffer. True when these are the command buffer's first uploads.
   bool RecordGpu(VkCommandBuffer command_buffer, VkDevice device,
-                 VkImage destination, std::vector<Etc2GpuUpload> uploads,
+                 VkImage destination, const std::vector<Etc2GpuUpload>& uploads,
                  const ArenaRef& output) {
     std::lock_guard<std::mutex> lock(mutex);
     CommandRecord& record = commands[command_buffer];

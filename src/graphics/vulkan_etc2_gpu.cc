@@ -300,6 +300,11 @@ struct Etc2GpuDevice::Impl {
 
   std::mutex arenas_mutex;
   std::map<std::uint32_t, std::unique_ptr<ChunkArena>> arenas;  // by family
+  // The arenas of the first families again, read without arenas_mutex by
+  // every record-time TakeOutput. Set once an arena exists; cleared before
+  // Destroy frees them.
+  static constexpr std::uint32_t kCachedArenas = 16;
+  std::atomic<ChunkArena*> arena_cache[kCachedArenas] = {};
   // [CR-5] One device-local cap for the arenas of every family.
   std::atomic<VkDeviceSize> cap_used{0};
   std::mutex output_sets_mutex;
@@ -761,6 +766,12 @@ struct Etc2GpuDevice::Impl {
   }
 
   ChunkArena* Arena(std::uint32_t family) {
+    if (family < kCachedArenas) {
+      if (ChunkArena* cached =
+              arena_cache[family].load(std::memory_order_acquire)) {
+        return cached;
+      }
+    }
     std::lock_guard<std::mutex> lock(arenas_mutex);
     std::unique_ptr<ChunkArena>& arena = arenas[family];
     if (arena == nullptr) {
@@ -785,6 +796,9 @@ struct Etc2GpuDevice::Impl {
         return epoch;
       };
       arena = std::make_unique<ChunkArena>(config, std::move(backend));
+      if (family < kCachedArenas) {
+        arena_cache[family].store(arena.get(), std::memory_order_release);
+      }
     }
     return arena.get();
   }
@@ -1779,6 +1793,9 @@ struct Etc2GpuDevice::Impl {
     std::map<std::uint32_t, std::unique_ptr<ChunkArena>> doomed_arenas;
     {
       std::lock_guard<std::mutex> lock(arenas_mutex);
+      for (std::atomic<ChunkArena*>& cached : arena_cache) {
+        cached.store(nullptr, std::memory_order_release);
+      }
       doomed_arenas.swap(arenas);
     }
     for (auto& [family, arena] : doomed_arenas) {

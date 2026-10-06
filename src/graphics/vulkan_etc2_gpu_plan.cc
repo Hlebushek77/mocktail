@@ -55,6 +55,8 @@ bool PlanGpuRegions(const Etc2ImageShape& image, VkBuffer source,
   const EtcFormat format = image.format.etc_format;
   const VkDeviceSize block_bytes = EtcBlockBytes(format);
   const VkDeviceSize texel_bytes = EtcDecodedTexelBytes(format);
+  rewritten->reserve(rewritten->size() + count);
+  uploads->reserve(uploads->size() + count);
   for (std::uint32_t index = 0; index < count; ++index) {
     const Region& region = regions[index];
     Etc2GpuUpload upload;
