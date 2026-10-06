@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -11,8 +12,10 @@
 #include <vector>
 
 #include "generated/etc2_shaders_spv.h"
+#include "mocktail/graphics/bc_encoder.h"
 #include "mocktail/graphics/etc2_decoder.h"
 #include "mocktail/graphics/vulkan_etc2_gpu_plan.h"
+#include "support/bc_reference.h"
 #include "support/vulkan_test_device.h"
 
 // The decode shader on a real GPU (DESIGN §9.3, ctest label "gpu"), ported
@@ -23,6 +26,13 @@
 //  - ShaderParity: every format, random blocks of every mode, sizes 1-140,
 //    row and image padding, 1-3 layers, odd source offsets: bit-exact
 //    against the CPU decoder.
+//  - BcParity: the etc2_bc shader (ETC2->BC mode) against the CPU BC
+//    encoder: every format, 16384+ blocks each (random ones of every mode,
+//    and blocks with flat, two-colour and transparent texels), refinement
+//    on and off, through the production planner's BC jobs: bit-exact.
+//  - BcHardwareDecodes: the blocks ETC2->BC mode writes, decoded by the GPU
+//    itself (a NEAREST blit from the BC image to a float image), within one
+//    8-bit step of the reference BC decoders (D3D10 rules).
 //  - PrependE2E: the integration's batch shape, [decode pass, "Roblox"
 //    command buffer with layout barriers and the rewritten padded-row copy]
 //    submitted without a fence and followed by a fence-only submit, on the
@@ -150,11 +160,12 @@ class Gpu {
     return image;
   }
 
-  bool BuildPipeline() {
+  // The decode pipeline, or with `bc` the etc2_bc one (same layout).
+  bool BuildPipeline(bool bc = false) {
     VkShaderModuleCreateInfo module_info{};
     module_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-    module_info.codeSize = sizeof(kEtc2DecodeSpv);
-    module_info.pCode = kEtc2DecodeSpv;
+    module_info.codeSize = bc ? sizeof(kEtc2BcSpv) : sizeof(kEtc2DecodeSpv);
+    module_info.pCode = bc ? kEtc2BcSpv : kEtc2DecodeSpv;
     VkShaderModule module = VK_NULL_HANDLE;
     if (vk().vkCreateShaderModule(device(), &module_info, nullptr, &module) !=
         VK_SUCCESS) {
@@ -626,6 +637,520 @@ TEST_F(Etc2GpuShaderTest, ShaderParity) {
   for (const std::uint64_t count : modes) {
     EXPECT_GT(count, 1000U) << "every colour mode is covered";
   }
+}
+
+// A block for BcParity: random bytes, or (one in two) random bytes with
+// their texel indices changed so that the BC encoders' special cases come
+// up: every texel on one modifier (flat EAC blocks, two-colour ETC2
+// sub-blocks), an EAC multiplier of 0, or (punch-through) the index that
+// makes a texel transparent on every texel.
+void BcParityBlock(EtcFormat format, std::mt19937_64& random,
+                   std::uint8_t* block) {
+  const std::uint32_t bytes = EtcBlockBytes(format);
+  for (std::uint32_t byte = 0; byte < bytes; ++byte) {
+    block[byte] = static_cast<std::uint8_t>(random());
+  }
+  const std::uint64_t pick = random() % 8;
+  const auto eac = [&](std::uint8_t* half) {
+    if (pick == 4) {
+      std::memset(half + 2, 0, 6);  // every texel on index 0
+    } else if (pick == 5) {
+      half[1] &= 0x0F;  // multiplier 0: one value
+    }
+  };
+  switch (format) {
+    case EtcFormat::kEtc2Rgb8:
+    case EtcFormat::kEtc2Rgb8A1:
+    case EtcFormat::kEtc2Rgba8: {
+      std::uint8_t* colour = block + (format == EtcFormat::kEtc2Rgba8 ? 8 : 0);
+      if (pick == 4) {
+        std::memset(colour + 4, 0, 4);
+      } else if (pick == 5 || pick == 6) {
+        // msb 1, lsb 0 everywhere; with the opaque bit clear that is
+        // transparent in punch-through blocks (all modes but planar).
+        colour[4] = colour[5] = 0xFF;
+        colour[6] = colour[7] = 0x00;
+        if (pick == 6) {
+          colour[3] &= static_cast<std::uint8_t>(~2U);
+        }
+      }
+      if (format == EtcFormat::kEtc2Rgba8) {
+        eac(block);
+      }
+      break;
+    }
+    case EtcFormat::kEacR11:
+    case EtcFormat::kEacR11Signed:
+      eac(block);
+      break;
+    case EtcFormat::kEacRg11:
+    case EtcFormat::kEacRg11Signed:
+      eac(block);
+      eac(block + 8);
+      break;
+  }
+}
+
+// DESIGN §9.3 BcParity: GPU BC equals CPU BC, 16384 blocks or more per
+// format, with the BC1 refinement on and off.
+TEST_F(Etc2GpuShaderTest, BcParity) {
+  Gpu gpu(device_);
+  ASSERT_TRUE(gpu.BuildPipeline(/*bc=*/true));
+  const auto& vk = device_->vk();
+  std::mt19937_64 random(3);
+  // How often the encoders' special cases came up (CPU side): BC1 blocks
+  // whose endpoints are equal, fully transparent BC1 blocks, BC1 blocks in
+  // 3-colour mode, and BC4 blocks with a single value.
+  std::uint64_t flat_bc1 = 0;
+  std::uint64_t transparent_bc1 = 0;
+  std::uint64_t three_colour_bc1 = 0;
+  std::uint64_t flat_bc4 = 0;
+  std::uint64_t total_blocks = 0;
+  for (const bool refine : {true, false}) {
+    for (int f = 0; f < 7; ++f) {
+      SCOPED_TRACE(std::string(kFormatNames[f]) +
+                   (refine ? ", refined" : ", not refined"));
+      const auto format = static_cast<EtcFormat>(f);
+      const VkDeviceSize block_bytes = EtcBlockBytes(format);
+      // Uploads of 1-140 texels, padded rows (some far apart, copied block
+      // row by block row), 1-3 layers, until 16384 blocks.
+      std::vector<Upload> uploads;
+      std::uint64_t format_blocks = 0;
+      const std::uint32_t fixed[][2] = {{1, 1}, {4, 4}, {7, 3}, {128, 128}};
+      for (const auto& size : fixed) {
+        uploads.push_back({format, size[0], size[1], 1, size[0], size[1], {}});
+        format_blocks += ((size[0] + 3) / 4) * ((size[1] + 3) / 4);
+      }
+      while (format_blocks < 16384) {
+        Upload upload;
+        upload.format = format;
+        upload.width = 1 + random() % 140;
+        upload.height = 1 + random() % 140;
+        upload.layers = random() % 4 == 0 ? 1 + random() % 3 : 1;
+        upload.row_texels =
+            upload.width +
+            (random() % 2 != 0 ? 4 * (random() % 4) + random() % 4 : 0);
+        if (random() % 8 == 0) {
+          upload.row_texels += 512;
+        }
+        upload.layer_rows =
+            upload.height + (random() % 3 == 0 ? 4 * (random() % 3) : 0);
+        format_blocks += static_cast<std::uint64_t>((upload.width + 3) / 4) *
+                         ((upload.height + 3) / 4) * upload.layers;
+        uploads.push_back(upload);
+      }
+      // Sizes first, then the buffers, then the real placement (the same
+      // draws); BC output is the blocks themselves.
+      std::mt19937_64 placement = random;
+      auto sizes = Place(&uploads, VK_NULL_HANDLE, VK_NULL_HANDLE, placement);
+      const Buffer source =
+          gpu.CreateBuffer(sizes.first, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
+      Place(&uploads, source.buffer, VK_NULL_HANDLE, random);
+      VkDeviceSize output_bytes = 0;
+      for (Upload& upload : uploads) {
+        Etc2GpuUpload& g = upload.gpu;
+        g.bc = true;
+        g.output_offset = AlignUp(output_bytes, kEtc2GpuRegionAlignment);
+        g.output_bytes = g.compressed;
+        output_bytes = g.output_offset + g.output_bytes;
+      }
+      const Buffer output = gpu.CreateBuffer(
+          output_bytes,
+          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+          false);
+      for (VkDeviceSize byte = 0; byte < sizes.first; ++byte) {
+        source.mapped[byte] = static_cast<std::uint8_t>(random());
+      }
+      for (const Upload& upload : uploads) {
+        const Etc2GpuUpload& g = upload.gpu;
+        for (std::uint32_t layer = 0; layer < g.layers; ++layer) {
+          for (std::uint32_t by = 0; by < g.blocks_high; ++by) {
+            for (std::uint32_t bx = 0; bx < g.blocks_wide; ++bx) {
+              BcParityBlock(format, random,
+                            source.mapped + g.source_offset +
+                                layer * g.source_layer_stride +
+                                by * g.source_row_stride + bx * block_bytes);
+            }
+          }
+        }
+      }
+      const std::vector<std::uint8_t> bytes(source.mapped,
+                                            source.mapped + sizes.first);
+      std::vector<Etc2GpuUpload> gpu_uploads;
+      for (Upload& upload : uploads) {
+        upload.gpu.output = output.buffer;
+        gpu_uploads.push_back(upload.gpu);
+      }
+      Etc2DecodePass pass;
+      ASSERT_TRUE(BuildDecodePass(gpu_uploads, 0, 0, &pass));
+      ASSERT_EQ(pass.dispatches.size(), 1U);
+      EXPECT_TRUE(pass.dispatches[0].bc);
+      for (Etc2DecodeJob& job : pass.jobs) {
+        // The production jobs refine (ETC2->BC mode's choice); the other
+        // way round is the shader's flag cleared.
+        EXPECT_EQ(job.flags, kEtc2ToBcRefine ? kEtc2BcJobRefine : 0U);
+        job.flags = refine ? kEtc2BcJobRefine : 0;
+      }
+      const Buffer input = gpu.CreateBuffer(
+          std::max<VkDeviceSize>(pass.input_bytes, 16),
+          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+          false);
+      const Buffer jobs =
+          gpu.CreateBuffer(pass.jobs.size() * sizeof(Etc2DecodeJob),
+                           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
+      std::memcpy(jobs.mapped, pass.jobs.data(),
+                  pass.jobs.size() * sizeof(Etc2DecodeJob));
+      const Buffer readback = gpu.CreateBuffer(
+          output_bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
+      std::memset(readback.mapped, 0xCD, output_bytes);
+      const VkDescriptorSet set0 = gpu.AllocateSet(false, {&input, &jobs});
+      const VkDescriptorSet set1 = gpu.AllocateSet(true, {&output});
+      const VkCommandBuffer command_buffer =
+          gpu.CommandBuffer(device_->queue_family());
+      gpu.RecordPass(command_buffer, pass, input, set0, set1);
+      const VkBufferCopy all{0, 0, output_bytes};
+      vk.vkCmdCopyBuffer(command_buffer, output.buffer, readback.buffer, 1,
+                         &all);
+      gpu.Barrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                  VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                  VK_ACCESS_HOST_READ_BIT);
+      vk.vkEndCommandBuffer(command_buffer);
+      const VkFence fence = gpu.Fence();
+      VkSubmitInfo submit{};
+      submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+      submit.commandBufferCount = 1;
+      submit.pCommandBuffers = &command_buffer;
+      ASSERT_EQ(vk.vkQueueSubmit(device_->queue(), 1, &submit, fence),
+                VK_SUCCESS);
+      ASSERT_EQ(vk.vkWaitForFences(device_->device(), 1, &fence, VK_TRUE,
+                                   30ULL * 1000000000ULL),
+                VK_SUCCESS);
+
+      int failures = 0;
+      for (const Upload& upload : uploads) {
+        const Etc2GpuUpload& g = upload.gpu;
+        std::uint64_t index = 0;
+        for (std::uint32_t layer = 0; layer < g.layers; ++layer) {
+          for (std::uint32_t by = 0; by < g.blocks_high; ++by) {
+            for (std::uint32_t bx = 0; bx < g.blocks_wide; ++bx, ++index) {
+              std::uint8_t cpu[16] = {};
+              TranscodeEtcBlockToBc(format,
+                                    bytes.data() + g.source_offset +
+                                        layer * g.source_layer_stride +
+                                        by * g.source_row_stride +
+                                        bx * block_bytes,
+                                    refine, cpu);
+              const std::uint8_t* gpu_block =
+                  readback.mapped + g.output_offset + index * block_bytes;
+              if (std::memcmp(gpu_block, cpu, block_bytes) != 0 &&
+                  failures++ < 5) {
+                std::string hex;
+                char digits[4];
+                for (VkDeviceSize byte = 0; byte < block_bytes; ++byte) {
+                  std::snprintf(digits, sizeof(digits), "%02x",
+                                gpu_block[byte]);
+                  hex += digits;
+                  hex += byte + 1 == block_bytes ? " vs cpu " : "";
+                }
+                for (VkDeviceSize byte = 0; byte < block_bytes; ++byte) {
+                  std::snprintf(digits, sizeof(digits), "%02x", cpu[byte]);
+                  hex += digits;
+                }
+                ADD_FAILURE() << upload.width << "x" << upload.height
+                              << " layer " << layer << " block (" << bx << ", "
+                              << by << "): gpu " << hex;
+              }
+              // The colour (BC1) half and the BC4 halves.
+              const std::uint8_t* bc1 =
+                  format == EtcFormat::kEtc2Rgba8 ? cpu + 8 : cpu;
+              if (f <= 2) {
+                const std::uint16_t c0 =
+                    static_cast<std::uint16_t>(bc1[0] | (bc1[1] << 8));
+                const std::uint16_t c1 =
+                    static_cast<std::uint16_t>(bc1[2] | (bc1[3] << 8));
+                flat_bc1 += c0 == c1 ? 1 : 0;
+                three_colour_bc1 += c0 < c1 ? 1 : 0;
+                transparent_bc1 += c0 == 0 && c1 == 0 && bc1[4] == 0xFF &&
+                                           bc1[5] == 0xFF && bc1[6] == 0xFF &&
+                                           bc1[7] == 0xFF
+                                       ? 1
+                                       : 0;
+              }
+              if (f >= 2) {
+                for (VkDeviceSize half = 0; half < (f >= 5 ? 2U : 1U); ++half) {
+                  const std::uint8_t* bc4 = cpu + 8 * half;
+                  flat_bc4 += bc4[0] == bc4[1] ? 1 : 0;
+                }
+              }
+            }
+          }
+        }
+        total_blocks += index;
+      }
+      EXPECT_EQ(failures, 0);
+      EXPECT_GE(format_blocks, 16384U);
+    }
+  }
+  std::printf(
+      "blocks=%llu bc1: flat=%llu three-colour=%llu transparent=%llu "
+      "bc4: flat=%llu\n",
+      static_cast<unsigned long long>(total_blocks),
+      static_cast<unsigned long long>(flat_bc1),
+      static_cast<unsigned long long>(three_colour_bc1),
+      static_cast<unsigned long long>(transparent_bc1),
+      static_cast<unsigned long long>(flat_bc4));
+  EXPECT_GT(flat_bc1, 100U);
+  EXPECT_GT(three_colour_bc1, 100U);
+  EXPECT_GT(transparent_bc1, 100U);
+  EXPECT_GT(flat_bc4, 100U);
+}
+
+// DESIGN §9.3 (BcParity, optional part): the BC blocks the CPU encoder
+// (and so the etc2_bc shader) writes mean on the GPU what the reference
+// decoders say: punch-through texels transparent, BC3 colour in 4-colour
+// mode, BC4/BC5 SNORM endpoints as mapped. The hardware decodes them in a
+// NEAREST blit to a float image, which keeps its values unrounded. An
+// endpoint texel and every alpha of BC1 must be within one 8-bit step (one
+// 127th for SNORM) of the reference; an interpolated one may also be off by
+// kSpanTolerance of its two endpoints' distance, because GPUs approximate
+// the D3D10 thirds and sevenths (NVIDIA's BC1 green is up to 5 steps off on
+// a 231-step span, its BC4 up to about 2). A wrong mode, byte order or
+// SNORM mapping is far outside that. Formats the device cannot blit are
+// skipped.
+constexpr double kSpanTolerance = 0.04;
+
+TEST_F(Etc2GpuShaderTest, BcHardwareDecodesTheBlocksAsTheReference) {
+  Gpu gpu(device_);
+  const auto& vk = device_->vk();
+  constexpr std::uint32_t kSize = 64;  // 16 x 16 blocks
+  constexpr std::uint32_t kBlocks = (kSize / 4) * (kSize / 4);
+  struct Case {
+    VkFormat bc;
+    VkFormat decoded;
+    std::uint32_t channels;
+  };
+  const Case cases[7] = {
+      {VK_FORMAT_BC1_RGB_UNORM_BLOCK, VK_FORMAT_R32G32B32A32_SFLOAT, 4},
+      {VK_FORMAT_BC1_RGBA_UNORM_BLOCK, VK_FORMAT_R32G32B32A32_SFLOAT, 4},
+      {VK_FORMAT_BC3_UNORM_BLOCK, VK_FORMAT_R32G32B32A32_SFLOAT, 4},
+      {VK_FORMAT_BC4_UNORM_BLOCK, VK_FORMAT_R32_SFLOAT, 1},
+      {VK_FORMAT_BC4_SNORM_BLOCK, VK_FORMAT_R32_SFLOAT, 1},
+      {VK_FORMAT_BC5_UNORM_BLOCK, VK_FORMAT_R32G32_SFLOAT, 2},
+      {VK_FORMAT_BC5_SNORM_BLOCK, VK_FORMAT_R32G32_SFLOAT, 2},
+  };
+  std::mt19937_64 random(5);
+  int checked = 0;
+  double worst_interpolated = 0;  // (error - 1 step) / span
+  for (int f = 0; f < 7; ++f) {
+    SCOPED_TRACE(kFormatNames[f]);
+    const auto format = static_cast<EtcFormat>(f);
+    const Case& c = cases[f];
+    if (!device_->OptimalTilingSupports(
+            c.bc, VK_FORMAT_FEATURE_BLIT_SRC_BIT |
+                      VK_FORMAT_FEATURE_TRANSFER_DST_BIT) ||
+        !device_->OptimalTilingSupports(c.decoded,
+                                        VK_FORMAT_FEATURE_BLIT_DST_BIT)) {
+      std::printf("%s: the device cannot blit it, skipped\n", kFormatNames[f]);
+      continue;
+    }
+    const VkDeviceSize block_bytes = EtcBlockBytes(format);
+    std::vector<std::uint8_t> etc(kBlocks * block_bytes);
+    for (std::uint32_t block = 0; block < kBlocks; ++block) {
+      BcParityBlock(format, random, etc.data() + block * block_bytes);
+    }
+    const Buffer upload =
+        gpu.CreateBuffer(etc.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
+    ASSERT_TRUE(TranscodeEtcToBc(format, etc.data(), etc.size(), upload.mapped,
+                                 etc.size(), kEtc2ToBcRefine));
+    const std::vector<std::uint8_t> bc(upload.mapped,
+                                       upload.mapped + etc.size());
+    const VkDeviceSize texel_bytes = 4ULL * c.channels;
+    const Buffer readback = gpu.CreateBuffer(
+        kSize * kSize * texel_bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
+    const VkImage source = gpu.CreateImage(c.bc, kSize, kSize, 1, 1);
+    const VkImage decoded = gpu.CreateImage(c.decoded, kSize, kSize, 1, 1);
+    const VkCommandBuffer command_buffer =
+        gpu.CommandBuffer(device_->queue_family());
+    const auto transition = [&](VkImage image, VkImageLayout from,
+                                VkImageLayout to, VkAccessFlags source_access,
+                                VkAccessFlags destination_access) {
+      VkImageMemoryBarrier barrier{};
+      barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+      barrier.oldLayout = from;
+      barrier.newLayout = to;
+      barrier.srcAccessMask = source_access;
+      barrier.dstAccessMask = destination_access;
+      barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.image = image;
+      barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+      vk.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                              VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                              nullptr, 1, &barrier);
+    };
+    transition(source, VK_IMAGE_LAYOUT_UNDEFINED,
+               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+               VK_ACCESS_TRANSFER_WRITE_BIT);
+    transition(decoded, VK_IMAGE_LAYOUT_UNDEFINED,
+               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+               VK_ACCESS_TRANSFER_WRITE_BIT);
+    VkBufferImageCopy region{};
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = {kSize, kSize, 1};
+    vk.vkCmdCopyBufferToImage(command_buffer, upload.buffer, source,
+                              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    transition(source, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+               VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    VkImageBlit blit{};
+    blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    blit.srcOffsets[1] = {static_cast<std::int32_t>(kSize),
+                          static_cast<std::int32_t>(kSize), 1};
+    blit.dstSubresource = blit.srcSubresource;
+    blit.dstOffsets[1] = blit.srcOffsets[1];
+    const auto blit_image = reinterpret_cast<PFN_vkCmdBlitImage>(
+        vk.vkGetDeviceProcAddr(device_->device(), "vkCmdBlitImage"));
+    ASSERT_NE(blit_image, nullptr);
+    blit_image(command_buffer, source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+               decoded, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+               VK_FILTER_NEAREST);
+    transition(decoded, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+               VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    vk.vkCmdCopyImageToBuffer(command_buffer, decoded,
+                              VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                              readback.buffer, 1, &region);
+    gpu.Barrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                VK_ACCESS_HOST_READ_BIT);
+    vk.vkEndCommandBuffer(command_buffer);
+    const VkFence fence = gpu.Fence();
+    VkSubmitInfo submit{};
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &command_buffer;
+    ASSERT_EQ(vk.vkQueueSubmit(device_->queue(), 1, &submit, fence),
+              VK_SUCCESS);
+    ASSERT_EQ(vk.vkWaitForFences(device_->device(), 1, &fence, VK_TRUE,
+                                 30ULL * 1000000000ULL),
+              VK_SUCCESS);
+
+    const bool snorm = format == EtcFormat::kEacR11Signed ||
+                       format == EtcFormat::kEacRg11Signed;
+    int failures = 0;
+    for (std::uint32_t block = 0; block < kBlocks; ++block) {
+      const std::uint8_t* bytes = bc.data() + block * block_bytes;
+      std::uint32_t words[4] = {};
+      std::memcpy(words, bytes, block_bytes);
+      // Each channel's endpoint distance, and which texels sit on an
+      // endpoint (BC1 indices 0 and 1, BC4 indices 0 and 1).
+      double span[4] = {};
+      bool on_endpoint[16][4] = {};
+      const auto bc4_span = [&](const std::uint32_t* half, int channel) {
+        int e0 = static_cast<int>(half[0] & 0xFF);
+        int e1 = static_cast<int>((half[0] >> 8) & 0xFF);
+        if (snorm) {
+          e0 = std::max<int>(static_cast<std::int8_t>(e0), -127);
+          e1 = std::max<int>(static_cast<std::int8_t>(e1), -127);
+        }
+        span[channel] = std::abs(e0 - e1);
+        const std::uint64_t indices =
+            (static_cast<std::uint64_t>(half[1]) << 16) | (half[0] >> 16);
+        for (int texel = 0; texel < 16; ++texel) {
+          on_endpoint[texel][channel] = ((indices >> (3 * texel)) & 7) < 2;
+        }
+      };
+      if (f <= 2) {
+        const std::uint32_t* colour = f == 2 ? words + 2 : words;
+        const bcref::Rgb e0 = bcref::Unpack565(colour[0] & 0xFFFF);
+        const bcref::Rgb e1 = bcref::Unpack565(colour[0] >> 16);
+        span[0] = std::abs(e0.r - e1.r);
+        span[1] = std::abs(e0.g - e1.g);
+        span[2] = std::abs(e0.b - e1.b);
+        for (int texel = 0; texel < 16; ++texel) {
+          const bool endpoint = ((colour[1] >> (2 * texel)) & 3) < 2;
+          on_endpoint[texel][0] = on_endpoint[texel][1] =
+              on_endpoint[texel][2] = endpoint;
+          on_endpoint[texel][3] = true;  // BC1 alpha is 0 or 1
+        }
+        if (f == 2) {
+          bc4_span(words, 3);
+        }
+      } else {
+        for (std::uint32_t channel = 0; channel < c.channels; ++channel) {
+          bc4_span(words + 2 * channel, static_cast<int>(channel));
+        }
+      }
+      // The reference, per texel (row-major) and channel, in 8-bit steps
+      // (SNORM: steps of 1/127, from -127).
+      double expected[16][4] = {};
+      if (f <= 2) {
+        std::uint8_t rgba[64];
+        bcref::DecodeBc1(f == 2 ? words + 2 : words, f == 2, rgba);
+        for (int texel = 0; texel < 16; ++texel) {
+          for (int channel = 0; channel < 4; ++channel) {
+            expected[texel][channel] = rgba[texel * 4 + channel];
+          }
+        }
+        if (f == 0) {
+          for (auto& texel : expected) {
+            texel[3] = 255;  // BC1_RGB: alpha is 1
+          }
+        } else if (f == 2) {
+          int alpha[16];
+          bcref::DecodeBc4Fixed(words, false, alpha);
+          for (int texel = 0; texel < 16; ++texel) {
+            expected[texel][3] = alpha[texel] / 256.0;
+          }
+        }
+      } else {
+        for (std::uint32_t channel = 0; channel < c.channels; ++channel) {
+          int values[16];
+          bcref::DecodeBc4Fixed(words + 2 * channel, snorm, values);
+          for (int texel = 0; texel < 16; ++texel) {
+            expected[texel][channel] =
+                values[texel] / 256.0 - (snorm ? 127.0 : 0.0);
+          }
+        }
+      }
+      const std::uint32_t bx = block % (kSize / 4);
+      const std::uint32_t by = block / (kSize / 4);
+      for (int texel = 0; texel < 16; ++texel) {
+        const std::uint32_t x = 4 * bx + texel % 4;
+        const std::uint32_t y = 4 * by + texel / 4;
+        float hardware[4] = {};
+        std::memcpy(hardware, readback.mapped + (y * kSize + x) * texel_bytes,
+                    texel_bytes);
+        for (std::uint32_t channel = 0; channel < c.channels; ++channel) {
+          const double got = hardware[channel] * (snorm ? 127.0 : 255.0);
+          const double want = expected[texel][channel];
+          const double error = std::abs(got - want);
+          ++checked;
+          if (!on_endpoint[texel][channel] && span[channel] > 0) {
+            worst_interpolated =
+                std::max(worst_interpolated, (error - 1.0) / span[channel]);
+          }
+          const double allowed = 1.0 + (on_endpoint[texel][channel]
+                                            ? 0.0
+                                            : kSpanTolerance * span[channel]);
+          if (error > allowed && failures++ < 5) {
+            char words_hex[48];
+            std::snprintf(words_hex, sizeof(words_hex), "%08x %08x %08x %08x",
+                          words[0], words[1], words[2], words[3]);
+            ADD_FAILURE() << "block " << block << " (" << words_hex
+                          << ") texel " << texel << " channel " << channel
+                          << ": the GPU decodes " << got << ", the reference "
+                          << want;
+          }
+        }
+      }
+    }
+    EXPECT_EQ(failures, 0);
+  }
+  std::printf(
+      "%d channel values checked; interpolated ones off by at most "
+      "1 step + %.1f %% of their endpoints' distance\n",
+      checked, 100.0 * worst_interpolated);
 }
 
 VkFormat HostFormat(EtcFormat format) {
