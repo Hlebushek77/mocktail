@@ -1155,13 +1155,20 @@ struct VulkanEtc2Emulation::State {
       const bool emulated = images.count(image) != 0;
       MemoryRecord& record = memories[memory];
       record.device = dev.device;
-      for (auto bound = record.images.begin();
-           bound != record.images.end() && bound->first < end; ++bound) {
-        if (bound->second.end > offset && bound->second.image != image &&
-            (emulated || bound->second.emulated)) {
-          aliased = true;
-          break;
-        }
+      const auto counts = [&](const BoundImage& other) {
+        return other.image != image && (emulated || other.emulated);
+      };
+      // Images that start inside the new range, and the one right before
+      // it, which may reach into it. (Behind an alias that already exists
+      // a longer one can hide: the count is then a lower bound.)
+      auto bound = record.images.lower_bound(offset);
+      if (bound != record.images.begin()) {
+        const auto& before = std::prev(bound)->second;
+        aliased = before.end > offset && counts(before);
+      }
+      for (; !aliased && bound != record.images.end() && bound->first < end;
+           ++bound) {
+        aliased = counts(bound->second);
       }
       record.images.emplace(offset, BoundImage{image, end, emulated});
       image_bindings[image] = {dev.device, memory, offset};
