@@ -122,21 +122,45 @@ struct Etc2GpuUpload {
   std::uint32_t blocks_wide = 0;
   std::uint32_t blocks_high = 0;
   std::uint32_t layers = 0;
-  VkDeviceSize output_offset = 0;  // inside the call's output range
+  // PlanGpuRegions: inside the call's output range. Once the copy is
+  // recorded: inside `output`, the arena buffer the rewritten copy reads.
+  VkDeviceSize output_offset = 0;
   VkDeviceSize output_bytes = 0;
+  VkBuffer output = VK_NULL_HANDLE;
   VkImage image = VK_NULL_HANDLE;
   std::uint32_t mip_level = 0;
   bool bc = false;
+  // What the copy writes into the host image (the totals' host bytes), and
+  // the queue family of the recording command buffer's pool.
+  VkDeviceSize decoded = 0;
+  std::uint32_t pool_family = kEtc2UnknownQueueFamily;
 };
+
+// The GPU route's output regions start on this boundary: a multiple of
+// every texel size and of the 4 bytes transfer-only queues require
+// (VUID-vkCmdCopyBufferToImage-bufferOffset-07975 and -07737).
+inline constexpr VkDeviceSize kEtc2GpuRegionAlignment = 256;
 
 // Plans the GPU route of one copy: padded rows of 4 x blocks_wide texels,
 // 256-byte aligned regions, extents clamped to the mip; in BC mode tight BC
-// blocks. Declared here for the GPU route; defined with it.
+// blocks. The rewritten regions' bufferOffset and the uploads'
+// output_offset are relative to the start of a `total`-byte output range.
+// False when a region cannot be served (bad extent, region outside the
+// mip, short row length, an upscaled image).
 template <typename Region>
 bool PlanGpuRegions(const Etc2ImageShape& image, VkBuffer source,
                     std::uint32_t count, const Region* regions, bool bc,
                     std::vector<Region>* rewritten,
                     std::vector<Etc2GpuUpload>* uploads, VkDeviceSize* total);
+
+extern template bool PlanGpuRegions<VkBufferImageCopy>(
+    const Etc2ImageShape&, VkBuffer, std::uint32_t, const VkBufferImageCopy*,
+    bool, std::vector<VkBufferImageCopy>*, std::vector<Etc2GpuUpload>*,
+    VkDeviceSize*);
+extern template bool PlanGpuRegions<VkBufferImageCopy2>(
+    const Etc2ImageShape&, VkBuffer, std::uint32_t, const VkBufferImageCopy2*,
+    bool, std::vector<VkBufferImageCopy2>*, std::vector<Etc2GpuUpload>*,
+    VkDeviceSize*);
 
 }  // namespace mocktail::graphics
 

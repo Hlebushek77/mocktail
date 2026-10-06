@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "mocktail/graphics/vulkan_etc2_emulation.h"
+#include "mocktail/graphics/vulkan_etc2_gpu.h"
 #include "support/etc2_emulation_scenarios.h"
 #include "support/fake_vulkan_device.h"
 
@@ -189,6 +190,12 @@ struct ScenarioOptions {
   // Once the command buffers and their pool are gone, before the images,
   // sources and device (not with kDestroyDeviceFirst).
   std::function<void()> after_command_buffers;
+  // With emulation.gpu: wait for the GPU route's pipelines, then run its
+  // selftest with empty submits, so that every upload can take the route.
+  bool wait_for_gpu_route = true;
+  // After that warm-up (or where it would be), before the first step: for
+  // test hooks that must not touch the selftest.
+  std::function<void()> after_warm_up;
 };
 
 struct ScenarioRun {
@@ -213,6 +220,11 @@ struct ScenarioRun {
   std::uint64_t hash = 0;
   std::vector<std::string> failures;  // empty when every check passed
   Calls calls;
+  // The device's GPU route after the steps, before any teardown: whether it
+  // had one, its state ("ready", "failed", ...) and its counters.
+  bool gpu_route = false;
+  std::string gpu_state;
+  Etc2GpuDevice::Stats gpu_stats;
 };
 
 ScenarioRun RunEtc2Scenario(const Scenario& scenario, EmulationBackend* backend,

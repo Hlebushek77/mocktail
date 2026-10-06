@@ -685,6 +685,8 @@ add_executable(vulkan_etc2_diagnostics_test
   vulkan_etc2_diagnostics_test.cc
   ${PROJECT_SOURCE_DIR}/src/graphics/vulkan_etc2_emulation.cc
   ${PROJECT_SOURCE_DIR}/src/graphics/vulkan_etc2_planning.cc
+  ${PROJECT_SOURCE_DIR}/src/graphics/vulkan_etc2_gpu.cc
+  ${PROJECT_SOURCE_DIR}/src/graphics/vulkan_etc2_gpu_plan.cc
   ${PROJECT_SOURCE_DIR}/src/graphics/chunk_arena.cc
   ${PROJECT_SOURCE_DIR}/src/graphics/etc2_decode_totals.cc
   ${PROJECT_SOURCE_DIR}/src/graphics/etc2_decoder.cc
@@ -710,6 +712,8 @@ mocktail_apply_compile_options(vulkan_etc2_diagnostics_test)
 add_library(mocktail_etc2_emulation_for_tests STATIC
   ${PROJECT_SOURCE_DIR}/src/graphics/vulkan_etc2_emulation.cc
   ${PROJECT_SOURCE_DIR}/src/graphics/vulkan_etc2_planning.cc
+  ${PROJECT_SOURCE_DIR}/src/graphics/vulkan_etc2_gpu.cc
+  ${PROJECT_SOURCE_DIR}/src/graphics/vulkan_etc2_gpu_plan.cc
   ${PROJECT_SOURCE_DIR}/src/graphics/chunk_arena.cc
   ${PROJECT_SOURCE_DIR}/src/graphics/etc2_decode_totals.cc
   ${PROJECT_SOURCE_DIR}/src/graphics/etc2_decoder.cc
@@ -776,6 +780,29 @@ target_link_libraries(vulkan_etc2_emulation_test PRIVATE
 )
 mocktail_apply_compile_options(vulkan_etc2_emulation_test)
 
+# The GPU route's pure planning (plus.2 WP2).
+add_executable(vulkan_etc2_gpu_plan_test vulkan_etc2_gpu_plan_test.cc)
+target_link_libraries(vulkan_etc2_gpu_plan_test PRIVATE
+  mocktail_etc2_emulation_for_tests
+  GTest::gtest_main
+)
+mocktail_apply_compile_options(vulkan_etc2_gpu_plan_test)
+
+# The GPU route's record, submit and teardown paths on the fake device,
+# which runs the decode jobs on the CPU (plus.2 WP2).
+add_executable(vulkan_etc2_gpu_route_test vulkan_etc2_gpu_route_test.cc)
+target_link_libraries(vulkan_etc2_gpu_route_test PRIVATE
+  mocktail_etc2_test_support
+  GTest::gtest_main
+)
+mocktail_apply_compile_options(vulkan_etc2_gpu_route_test)
+
+# The GPU route's manual benchmark (not a test: it needs a GPU and an idle
+# machine, and prints timings).
+add_executable(etc2_gpu_perf etc2_gpu_perf.cc)
+target_link_libraries(etc2_gpu_perf PRIVATE mocktail_etc2_test_support)
+mocktail_apply_compile_options(etc2_gpu_perf)
+
 add_executable(etc2_emulation_gpu_test etc2_emulation_gpu_test.cc)
 target_link_libraries(etc2_emulation_gpu_test PRIVATE
   mocktail_etc2_test_support
@@ -803,6 +830,25 @@ mocktail_apply_compile_options(mapped_memory_copy_test)
 add_executable(etc2_cpu_perf etc2_cpu_perf.cc)
 target_link_libraries(etc2_cpu_perf PRIVATE mocktail_etc2_test_support)
 mocktail_apply_compile_options(etc2_cpu_perf)
+
+# The GPU route on a real device (plus.2 WP2): the decode shader against the
+# CPU decoder, and the integration's batch shape.
+add_executable(etc2_gpu_parity_test etc2_gpu_parity_test.cc)
+target_include_directories(etc2_gpu_parity_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/graphics
+)
+target_link_libraries(etc2_gpu_parity_test PRIVATE
+  mocktail_etc2_test_support
+  GTest::gtest_main
+)
+mocktail_apply_compile_options(etc2_gpu_parity_test)
+
+add_executable(etc2_gpu_route_test etc2_gpu_route_test.cc)
+target_link_libraries(etc2_gpu_route_test PRIVATE
+  mocktail_etc2_test_support
+  GTest::gtest_main
+)
+mocktail_apply_compile_options(etc2_gpu_route_test)
 
 add_executable(video_driver_policy_test
   video_driver_policy_test.cc
@@ -1353,9 +1399,18 @@ gtest_discover_tests(vulkan_etc2_planning_test)
 gtest_discover_tests(vulkan_etc2_emulation_test)
 gtest_discover_tests(worker_pool_test)
 gtest_discover_tests(mapped_memory_copy_test)
+gtest_discover_tests(vulkan_etc2_gpu_plan_test)
+gtest_discover_tests(vulkan_etc2_gpu_route_test)
+# The committed SPIR-V header must match the GLSL it was generated from;
+# the check needs no shader compiler.
+add_test(NAME etc2_shader_header_test
+  COMMAND ${PROJECT_SOURCE_DIR}/scripts/gen-etc2-shaders.sh --check
+)
 # Real GPU: skipped without a loader, driver or device, and while a live game
 # runs (CR-25). Hold these back with -LE gpu while a live measurement runs.
 gtest_discover_tests(etc2_emulation_gpu_test PROPERTIES LABELS gpu)
+gtest_discover_tests(etc2_gpu_parity_test PROPERTIES LABELS gpu)
+gtest_discover_tests(etc2_gpu_route_test PROPERTIES LABELS gpu)
 # Without a driver every GPU test must skip rather than fail.
 add_test(NAME Etc2EmulationGpuTest.SkipsWithoutAVulkanDriver
   COMMAND etc2_emulation_gpu_test
@@ -1377,6 +1432,25 @@ set_tests_properties(Etc2EmulationGpuTest.ValidationLayerReportsNothing
   PASS_REGULAR_EXPRESSION "\\[  PASSED  \\] [0-9]+ tests?\\."
   FAIL_REGULAR_EXPRESSION "Validation (Error|Warning)|\\[  FAILED  \\]"
 )
+# Every GPU test again under the Khronos layer with synchronization
+# validation (MOCKTAIL_TEST_VALIDATION=sync, plus.2 WP2): the test device
+# enables the layer and VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION
+# itself, and each validation message fails the test that caused it. A
+# control test checks that a missing barrier is reported. Without the layer
+# the tests skip, and a run in which every test skipped shows as skipped
+# (the CR-25 guard also skips while any process named mocktail runs, which
+# the full suite's own tests start). Only these: work/ctest.sh <build>
+# <home> -L validation
+foreach(gpu_test etc2_emulation_gpu_test etc2_gpu_parity_test
+                 etc2_gpu_route_test)
+  add_test(NAME ${gpu_test}.SyncValidation COMMAND ${gpu_test})
+  set_tests_properties(${gpu_test}.SyncValidation PROPERTIES
+    LABELS "gpu;validation"
+    ENVIRONMENT "MOCKTAIL_TEST_VALIDATION=sync"
+    FAIL_REGULAR_EXPRESSION "\\[  FAILED  \\]"
+    SKIP_REGULAR_EXPRESSION "\\[  PASSED  \\] 0 tests"
+  )
+endforeach()
 gtest_discover_tests(video_driver_policy_test)
 gtest_discover_tests(wayland_global_probe_test)
 gtest_discover_tests(wayland_surface_commit_guard_test)

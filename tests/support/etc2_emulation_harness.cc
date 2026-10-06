@@ -2,6 +2,7 @@
 
 #include <stdlib.h>
 
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -548,6 +549,43 @@ ScenarioRun RunEtc2Scenario(const Scenario& scenario, EmulationBackend* backend,
     ++checkpoints;
   };
 
+  // The adapter's submit hooks: the plan's pre-submits go first.
+  const auto submit_pre = [&](const Etc2SubmitPlan& plan) {
+    for (const Etc2PreSubmit& pre : plan.pre_submits()) {
+      if (backend->QueueSubmit(queue, 1, &pre.info, pre.fence) != VK_SUCCESS) {
+        fail("a pre-submit of the plan failed");
+      }
+    }
+  };
+  // The GPU route serves uploads only once its pipelines are built and its
+  // selftest passed, which the first submit on the queue starts.
+  Etc2GpuDevice* gpu = Etc2GpuDevice::Find(device);
+  if (gpu != nullptr && options.emulation.gpu && options.wait_for_gpu_route &&
+      run.failures.empty()) {
+    if (!gpu->WaitForBuild(std::chrono::seconds(60))) {
+      fail("the GPU route's pipelines did not build within 60 s");
+    }
+    for (int round = 0;
+         round < 3 && (gpu->state() == Etc2GpuDevice::State::kBuilt ||
+                       gpu->state() == Etc2GpuDevice::State::kTesting);
+         ++round) {
+      Etc2SubmitPlan plan;
+      emulation.PrepareSubmit(queue, 0, nullptr, VK_NULL_HANDLE, &plan);
+      submit_pre(plan);
+      const VkResult result = backend->QueueSubmit(
+          queue, plan.count(0), plan.submits(nullptr), plan.fence(VK_NULL_HANDLE));
+      emulation.FinishSubmit(&plan, result, [&](VkFence fence) {
+        return backend->QueueSubmit(queue, 0, nullptr, fence);
+      });
+      if (result != VK_SUCCESS || !backend->WaitIdle(queue)) {
+        fail("the GPU route's warm-up submit failed");
+      }
+    }
+  }
+  if (options.after_warm_up) {
+    options.after_warm_up();
+  }
+
   const VkImageLayout layout = VK_IMAGE_LAYOUT_GENERAL;
   for (const ScenarioStep& step : scenario.steps) {
     if (!run.failures.empty()) {
@@ -660,14 +698,7 @@ ScenarioRun RunEtc2Scenario(const Scenario& scenario, EmulationBackend* backend,
         // ---- the adapter's vkQueueSubmit and vkQueueSubmit2 hooks ----
         const auto count = static_cast<std::uint32_t>(batches.size());
         Etc2SubmitPlan plan;
-        const auto pre_submit = [&]() {
-          for (const Etc2PreSubmit& pre : plan.pre_submits()) {
-            if (backend->QueueSubmit(queue, 1, &pre.info, pre.fence) !=
-                VK_SUCCESS) {
-              fail("a pre-submit of the plan failed");
-            }
-          }
-        };
+        const auto pre_submit = [&]() { submit_pre(plan); };
         VkResult result = VK_SUCCESS;
         std::vector<VkSubmitInfo> infos;
         std::vector<std::vector<VkCommandBufferSubmitInfo>> buffer_infos;
@@ -814,6 +845,13 @@ ScenarioRun RunEtc2Scenario(const Scenario& scenario, EmulationBackend* backend,
         }
       }
     }
+  }
+
+  gpu = Etc2GpuDevice::Find(device);
+  if (gpu != nullptr) {
+    run.gpu_route = true;
+    run.gpu_state = Etc2GpuStateName(gpu->state());
+    run.gpu_stats = gpu->stats();
   }
 
   if (options.after_steps) {

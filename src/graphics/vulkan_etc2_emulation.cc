@@ -8,6 +8,7 @@
 #include "mocktail/graphics/mapped_memory_copy.h"
 #include "mocktail/graphics/texture_override.h"
 #include "mocktail/graphics/vulkan_etc2_gpu.h"
+#include "mocktail/graphics/vulkan_etc2_gpu_plan.h"
 #include "mocktail/graphics/vulkan_etc2_planning.h"
 #include "mocktail/graphics/worker_pool.h"
 
@@ -288,6 +289,8 @@ struct HostDevice {
   PFN_vkGetPhysicalDeviceImageFormatProperties get_image_format_properties =
       nullptr;
   PFN_vkGetPhysicalDeviceMemoryProperties2 get_memory_properties2 = nullptr;
+  PFN_vkEnumerateDeviceExtensionProperties enumerate_device_extensions =
+      nullptr;
 
   // Created lazily, or by RegisterDevice; guarded by `mutex`. Lock order:
   // State::devices_mutex, then this, then an arena's own.
@@ -968,18 +971,87 @@ struct VulkanEtc2Emulation::State {
     if (!options.gpu) {
       return {Etc2Route::kCpu, Etc2CpuReason::kGpuDisabled};
     }
-    // The GPU route is not built yet: no device has an Etc2GpuDevice.
-    static_cast<void>(target);
-    return {Etc2Route::kCpu, Etc2CpuReason::kGpuUnavailable};
+    if (dev.gpu == nullptr) {
+      return {Etc2Route::kCpu, Etc2CpuReason::kGpuUnavailable};
+    }
+    switch (dev.gpu->state()) {
+      case Etc2GpuDevice::State::kReady:
+        break;
+      case Etc2GpuDevice::State::kFailed:
+        return {Etc2Route::kCpu, Etc2CpuReason::kGpuUnavailable};
+      default:  // building, or the selftest not done yet
+        return {Etc2Route::kCpu, Etc2CpuReason::kGpuNotReady};
+    }
+    // Upscaled small textures need the CPU's resampling (DESIGN C3.5).
+    if (target.image.scale > 1) {
+      return {Etc2Route::kCpu, Etc2CpuReason::kUpscaled};
+    }
+    // Override lookups hash the decoded colour texels on the CPU. Only a
+    // dump directory or an override PNG makes them active: the runtime sets
+    // MOCKTAIL_TEXTURE_OVERRIDE_DIR in every session.
+    if (overrides.active() && IsColorFormat(target.image.format.etc_format)) {
+      return {Etc2Route::kCpu, Etc2CpuReason::kOverrides};
+    }
+    const std::uint32_t family = target.pool_family;
+    if (family >= dev.queue_families.size() ||
+        (dev.queue_families[family].queueFlags & VK_QUEUE_COMPUTE_BIT) == 0) {
+      return {Etc2Route::kCpu, Etc2CpuReason::kNoComputeQueue};
+    }
+    return {Etc2Route::kGpu, Etc2CpuReason::kCount};
   }
 
-  // Records the GPU route of one copy. False: the CPU route serves it.
+  struct GpuCopyResult {
+    bool recorded = false;
+    bool first_upload = false;  // the command buffer's first
+    VkDeviceSize compressed = 0;
+    // Why the CPU route serves it after all; kCount when the regions
+    // cannot be planned (the CPU route then drops the copy and says why).
+    Etc2CpuReason reason = Etc2CpuReason::kCount;
+  };
+
+  // Records the GPU route of one copy (DESIGN C3.1): the rewritten copy
+  // reads padded rows from an output arena range that the decode pass in
+  // front of the batch fills. Nothing reads Roblox's memory here.
   template <typename Region, typename HostCopy>
-  bool RecordGpuCopy(const HostDevice& dev, VkCommandBuffer command_buffer,
-                     const CopyTarget& target, VkBuffer source,
-                     VkImage destination, std::uint32_t count,
-                     const Region* regions, HostCopy& host_copy) {
-    return false;
+  GpuCopyResult RecordGpuCopy(const HostDevice& dev,
+                              VkCommandBuffer command_buffer,
+                              const CopyTarget& target, VkBuffer source,
+                              VkImage destination, std::uint32_t count,
+                              const Region* regions, HostCopy& host_copy) {
+    GpuCopyResult result;
+    // Kept per thread, so that a warm copy hook allocates nothing here.
+    thread_local std::vector<Region> rewritten;
+    thread_local std::vector<Etc2GpuUpload> uploads;
+    rewritten.clear();
+    uploads.clear();
+    VkDeviceSize total = 0;
+    if (!PlanGpuRegions(target.image, source, count, regions, target.image.bc,
+                        &rewritten, &uploads, &total)) {
+      return result;
+    }
+    if (total > dev.gpu->max_output_bytes()) {
+      result.reason = Etc2CpuReason::kTooLarge;
+      return result;
+    }
+    ArenaRef output;
+    if (!dev.gpu->TakeOutput(target.pool_family, total, &output)) {
+      result.reason = Etc2CpuReason::kArenaFull;
+      return result;
+    }
+    for (std::size_t index = 0; index < uploads.size(); ++index) {
+      rewritten[index].bufferOffset += output.offset;
+      Etc2GpuUpload& upload = uploads[index];
+      upload.output = output.buffer;
+      upload.output_offset += output.offset;
+      upload.image = destination;
+      upload.pool_family = target.pool_family;
+      result.compressed += upload.compressed;
+    }
+    result.first_upload =
+        RecordGpu(command_buffer, dev.device, destination, uploads, output);
+    result.recorded = true;
+    host_copy(output.buffer, rewritten.data());
+    return result;
   }
 
   struct CpuCopyResult {
@@ -1066,15 +1138,25 @@ struct VulkanEtc2Emulation::State {
                   const Region* regions, HostCopy host_copy) {
     const Clock::time_point start =
         options.frame_stats ? Clock::now() : Clock::time_point{};
-    const RouteChoice choice = ChooseRoute(dev, target);
-    if (choice.route == Etc2Route::kGpu &&
-        RecordGpuCopy(dev, command_buffer, target, source, destination,
-                      count, regions, host_copy)) {
-      return;
+    RouteChoice choice = ChooseRoute(dev, target);
+    CpuCopyResult result;
+    bool gpu = false;
+    if (choice.route == Etc2Route::kGpu) {
+      const GpuCopyResult recorded =
+          RecordGpuCopy(dev, command_buffer, target, source, destination,
+                        count, regions, host_copy);
+      gpu = recorded.recorded;
+      result.recorded = recorded.recorded;
+      result.first_upload = recorded.first_upload;
+      result.compressed = recorded.compressed;
+      if (!gpu) {
+        choice = {Etc2Route::kCpu, recorded.reason};
+      }
     }
-    const CpuCopyResult result =
-        RecordCpuCopy(dev, command_buffer, target, source, destination, count,
-                      regions, host_copy);
+    if (!gpu) {
+      result = RecordCpuCopy(dev, command_buffer, target, source, destination,
+                             count, regions, host_copy);
+    }
     if (!options.frame_stats) {
       return;
     }
@@ -1121,6 +1203,30 @@ struct VulkanEtc2Emulation::State {
         totals.uploads_after_dispatch += count;
       }
     });
+  }
+
+  // Keeps the GPU-route uploads and their output range with the command
+  // buffer. True when these are the command buffer's first uploads.
+  bool RecordGpu(VkCommandBuffer command_buffer, VkDevice device,
+                 VkImage destination, const std::vector<Etc2GpuUpload>& uploads,
+                 const ArenaRef& output) {
+    std::lock_guard<std::mutex> lock(mutex);
+    CommandRecord& record = commands[command_buffer];
+    if (record.device == VK_NULL_HANDLE) {
+      record.device = device;
+    }
+    const bool first = !record.HasUploads();
+    record.gpu_uploads.insert(record.gpu_uploads.end(), uploads.begin(),
+                              uploads.end());
+    record.gpu_regions.push_back(output);
+    if (options.frame_stats) {
+      const auto image = images.find(destination);
+      if (image != images.end()) {
+        ++image->second.copies;
+      }
+    }
+    has_commands.store(true, std::memory_order_release);
+    return first;
   }
 
   // Keeps the uploads and their staging (a one-off buffer or an arena
@@ -1194,8 +1300,210 @@ struct VulkanEtc2Emulation::State {
   // CreateImage, once per device: the first emulated image. Roblox's probe
   // device never creates one, so work started here never runs for it.
   void OnFirstEmulatedImage(HostDevice& dev) {
-    // The GPU route starts building its pipelines here.
-    static_cast<void>(dev);
+    if (dev.gpu != nullptr) {
+      dev.gpu->StartBuild();
+    }
+  }
+
+  // RegisterDevice of an emulated device with MOCKTAIL_ETC2_GPU on: the GPU
+  // route's runtime, which builds nothing until the first emulated image.
+  // A host without every entry point it needs is no real Vulkan driver;
+  // the CPU route then serves the device, as with MOCKTAIL_ETC2_GPU=0.
+  void MakeGpuDevice(HostDevice& dev) {
+    Etc2GpuDeviceInfo info;
+    info.device = dev.device;
+    info.physical_device = dev.physical_device;
+    Etc2GpuFunctions& fns = info.fns;
+    fns.create_buffer = dev.create_buffer;
+    fns.destroy_buffer = dev.destroy_buffer;
+    fns.get_buffer_memory_requirements = dev.get_buffer_memory_requirements;
+    fns.allocate_memory = dev.allocate_memory;
+    fns.free_memory = dev.free_memory;
+    fns.bind_buffer_memory = dev.bind_buffer_memory;
+    fns.map_memory = dev.map_memory;
+    fns.create_command_pool = dev.create_command_pool;
+    fns.destroy_command_pool = dev.destroy_command_pool;
+    fns.reset_command_pool = dev.reset_command_pool;
+    fns.allocate_command_buffers = dev.allocate_command_buffers;
+    fns.begin_command_buffer = dev.begin_command_buffer;
+    fns.end_command_buffer = dev.end_command_buffer;
+    fns.copy_buffer = dev.copy_buffer;
+    fns.pipeline_barrier = dev.pipeline_barrier;
+    fns.bind_pipeline = dev.bind_pipeline;
+    fns.bind_descriptor_sets = dev.bind_descriptor_sets;
+    fns.push_constants = dev.push_constants;
+    fns.dispatch = dev.dispatch;
+    fns.write_timestamp = dev.write_timestamp;
+    fns.reset_query_pool = dev.reset_query_pool;
+    fns.create_query_pool = dev.create_query_pool;
+    fns.destroy_query_pool = dev.destroy_query_pool;
+    fns.get_query_pool_results = dev.get_query_pool_results;
+    fns.create_fence = dev.create_fence;
+    fns.destroy_fence = dev.destroy_fence;
+    fns.reset_fences = dev.reset_fences;
+    fns.get_fence_status = dev.get_fence_status;
+    fns.wait_for_fences = dev.wait_for_fences;
+    fns.create_shader_module = dev.create_shader_module;
+    fns.destroy_shader_module = dev.destroy_shader_module;
+    fns.create_compute_pipelines = dev.create_compute_pipelines;
+    fns.destroy_pipeline = dev.destroy_pipeline;
+    fns.create_pipeline_layout = dev.create_pipeline_layout;
+    fns.destroy_pipeline_layout = dev.destroy_pipeline_layout;
+    fns.create_descriptor_set_layout = dev.create_descriptor_set_layout;
+    fns.destroy_descriptor_set_layout = dev.destroy_descriptor_set_layout;
+    fns.create_descriptor_pool = dev.create_descriptor_pool;
+    fns.destroy_descriptor_pool = dev.destroy_descriptor_pool;
+    fns.allocate_descriptor_sets = dev.allocate_descriptor_sets;
+    fns.free_descriptor_sets = dev.free_descriptor_sets;
+    fns.update_descriptor_sets = dev.update_descriptor_sets;
+    if (fns.Missing() != nullptr) {
+      return;
+    }
+    // [CR-5] The VRAM budget, when the physical device reports one.
+    if (dev.get_memory_properties2 != nullptr &&
+        dev.enumerate_device_extensions != nullptr &&
+        dev.properties.apiVersion >= VK_API_VERSION_1_1) {
+      std::uint32_t count = 0;
+      dev.enumerate_device_extensions(dev.physical_device, nullptr, &count,
+                                      nullptr);
+      std::vector<VkExtensionProperties> extensions(count);
+      if (count != 0 &&
+          dev.enumerate_device_extensions(dev.physical_device, nullptr, &count,
+                                          extensions.data()) == VK_SUCCESS) {
+        for (const VkExtensionProperties& extension : extensions) {
+          if (std::strcmp(extension.extensionName,
+                          VK_EXT_MEMORY_BUDGET_EXTENSION_NAME) == 0) {
+            fns.get_memory_properties2 = dev.get_memory_properties2;
+          }
+        }
+      }
+    }
+    info.memory = dev.memory;
+    info.properties = dev.properties;
+    info.families = dev.queue_families;
+    info.arena_cap_bytes = options.gpu_arena_bytes;
+    info.frame_stats = options.frame_stats;
+    info.count = [this](const std::function<void(Etc2DecodeTotals&)>& update) {
+      CountTotals([&update](Etc2DecodeTotals& totals) { update(totals); });
+    };
+    // The runtime is destroyed before `dev`, and calls this only from
+    // inside a submit on the device. It runs with a queue's lock of the
+    // runtime held, so it must not take devices_mutex (the totals' arena
+    // peaks hold that one while they read the runtime's stats).
+    info.rescue_decode = [this, host = &dev](
+                             const std::vector<VkCommandBuffer>& buffers,
+                             const std::vector<Etc2GpuUpload>& uploads,
+                             std::vector<Etc2RescueSource>* sources) {
+      return RescueDecode(*host, buffers, uploads, sources);
+    };
+    dev.gpu = Etc2GpuDevice::Create(std::move(info));
+  }
+
+  // Inside vkQueueSubmit(2), after the CPU route: the GPU route's decode
+  // passes for every batch that holds GPU-route uploads (its command
+  // buffers and their recorded secondaries), and the selftest. Marks those
+  // batches in `upload_batches`.
+  template <typename Submit>
+  void PlanGpuSubmit(VkQueue queue, std::uint32_t count,
+                     const Submit* submits, VkFence fence,
+                     Etc2SubmitPlan* plan, std::vector<bool>* upload_batches) {
+    if (plan == nullptr) {
+      return;
+    }
+    QueueRecord queue_record;
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      const auto found = queues.find(queue);
+      if (found == queues.end()) {
+        return;
+      }
+      queue_record = found->second;
+    }
+    HostDevice* dev = Find(queue_record.device);
+    if (dev == nullptr || dev->gpu == nullptr) {
+      return;
+    }
+    Etc2GpuDevice& gpu = *dev->gpu;
+    plan->device = queue_record.device;
+    plan->queue_family = queue_record.family;
+    gpu.PollSelftest();
+    gpu.MaybeRunSelftest(queue, queue_record.family, plan);
+    if (submits == nullptr || !has_commands.load(std::memory_order_acquire)) {
+      return;
+    }
+    std::vector<Etc2GpuBatch> batches;
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      std::vector<VkCommandBuffer> buffers;
+      for (std::uint32_t index = 0; index < count; ++index) {
+        BatchCommandBuffers(submits[index], &buffers);
+        Etc2GpuBatch batch;
+        batch.batch = index;
+        const auto collect =
+            [&](VkCommandBuffer command_buffer) -> const CommandRecord* {
+          const auto record = commands.find(command_buffer);
+          if (record == commands.end()) {
+            return nullptr;
+          }
+          batch.uploads.insert(batch.uploads.end(),
+                               record->second.gpu_uploads.begin(),
+                               record->second.gpu_uploads.end());
+          return &record->second;
+        };
+        for (VkCommandBuffer command_buffer : buffers) {
+          const CommandRecord* record = collect(command_buffer);
+          if (record == nullptr) {
+            continue;
+          }
+          const std::vector<VkCommandBuffer> secondaries = record->secondaries;
+          for (VkCommandBuffer secondary : secondaries) {
+            collect(secondary);
+          }
+        }
+        if (!batch.uploads.empty()) {
+          batch.command_buffers = buffers;
+          if (upload_batches != nullptr && index < upload_batches->size()) {
+            (*upload_batches)[index] = true;
+          }
+          batches.push_back(std::move(batch));
+        }
+      }
+    }
+    if (!batches.empty()) {
+      PlanGpuPasses(gpu, queue, queue_record.family, count, submits, batches,
+                    fence, plan);
+    }
+  }
+
+  static void BatchCommandBuffers(const VkSubmitInfo& submit,
+                                  std::vector<VkCommandBuffer>* out) {
+    out->assign(submit.pCommandBuffers,
+                submit.pCommandBuffers != nullptr
+                    ? submit.pCommandBuffers + submit.commandBufferCount
+                    : submit.pCommandBuffers);
+  }
+  static void BatchCommandBuffers(const VkSubmitInfo2& submit,
+                                  std::vector<VkCommandBuffer>* out) {
+    out->clear();
+    for (std::uint32_t index = 0; index < submit.commandBufferInfoCount &&
+                                  submit.pCommandBufferInfos != nullptr;
+         ++index) {
+      out->push_back(submit.pCommandBufferInfos[index].commandBuffer);
+    }
+  }
+  static void PlanGpuPasses(Etc2GpuDevice& gpu, VkQueue queue,
+                            std::uint32_t family, std::uint32_t count,
+                            const VkSubmitInfo* submits,
+                            const std::vector<Etc2GpuBatch>& batches,
+                            VkFence fence, Etc2SubmitPlan* plan) {
+    gpu.PlanSubmit(queue, family, count, submits, batches, fence, plan);
+  }
+  static void PlanGpuPasses(Etc2GpuDevice& gpu, VkQueue queue,
+                            std::uint32_t family, std::uint32_t count,
+                            const VkSubmitInfo2* submits,
+                            const std::vector<Etc2GpuBatch>& batches,
+                            VkFence fence, Etc2SubmitPlan* plan) {
+    gpu.PlanSubmit2(queue, family, count, submits, batches, fence, plan);
   }
 
   // The size of every arena, for the peaks in the totals and the window.
@@ -1210,6 +1518,11 @@ struct VulkanEtc2Emulation::State {
           const ChunkArena::Stats stats = dev->host_staging->stats();
           bytes += stats.bytes;
           over_cap += stats.over_cap_bytes;
+        }
+        if (dev->gpu != nullptr) {
+          const Etc2GpuDevice::Stats stats = dev->gpu->stats();
+          bytes += stats.arena_bytes;
+          over_cap += stats.arena_over_cap_bytes;
         }
       }
     }
@@ -1351,6 +1664,13 @@ struct VulkanEtc2Emulation::State {
   // At most once a second, from OnPresent and the CPU route: trims the
   // host staging arenas and gives back idle scratch.
   void Housekeeping(Clock::time_point now);
+  // The GPU route's rescue, its CPU half (DESIGN §6, CR-7): decodes the
+  // GPU-route uploads of one batch of `dev` into host staging, in the
+  // output arena's layout, for the rescue pass to copy into the arena.
+  bool RescueDecode(const HostDevice& dev,
+                    const std::vector<VkCommandBuffer>& command_buffers,
+                    const std::vector<Etc2GpuUpload>& uploads,
+                    std::vector<Etc2RescueSource>* sources);
 };
 
 VulkanEtc2Emulation::VulkanEtc2Emulation(Etc2EmulationOptions options)
@@ -1489,6 +1809,11 @@ void VulkanEtc2Emulation::RegisterDevice(
     instance_proc(dev->get_memory_properties2,
                   "vkGetPhysicalDeviceMemoryProperties2",
                   "vkGetPhysicalDeviceMemoryProperties2KHR");
+    instance_proc(dev->enumerate_device_extensions,
+                  "vkEnumerateDeviceExtensionProperties");
+  }
+  if (emulated && state_->options.gpu) {
+    state_->MakeGpuDevice(*dev);
   }
   if (emulated && state_->options.fast_path) {
     // The CPU route's staging (DESIGN C1). Chunks come on first use.
@@ -2891,34 +3216,239 @@ void VulkanEtc2Emulation::State::Housekeeping(Clock::time_point now) {
   }
 }
 
-void VulkanEtc2Emulation::PrepareSubmit(VkQueue queue, std::uint32_t count,
-                                        const VkSubmitInfo* submits,
-                                        VkFence fence, Etc2SubmitPlan* plan) {
-  static_cast<void>(fence);
-  if (plan != nullptr) {
-    plan->queue = queue;
+// The rescue copies each upload with one region, so the CPU writes what the
+// decode pass would have: whole blocks, 4 x blocks_wide texels per row and
+// 4 x blocks_high rows per layer, layer after layer. The source bytes are
+// read now, inside vkQueueSubmit, as on the CPU route. The staging goes to
+// the record of a command buffer of the batch that holds GPU-route
+// uploads: its copies read the arena after the rescue pass's barrier, so
+// once Roblox has reset or freed it the rescue copy read the staging too.
+bool VulkanEtc2Emulation::State::RescueDecode(
+    const HostDevice& dev, const std::vector<VkCommandBuffer>& command_buffers,
+    const std::vector<Etc2GpuUpload>& uploads,
+    std::vector<Etc2RescueSource>* sources) {
+  if (uploads.empty()) {
+    return false;
   }
-  std::uint32_t upload_batches = 0;
-  if (submits != nullptr) {
-    for (std::uint32_t index = 0; index < count; ++index) {
-      if (state_->RunCpuUploads(submits[index].pCommandBuffers,
-                                submits[index].commandBufferCount) != 0) {
-        ++upload_batches;
+  for (const Etc2GpuUpload& upload : uploads) {
+    if (upload.bc) {
+      // BC mode's CPU encode is not part of the GPU route yet.
+      LogFailure("cannot rescue a BC upload on the CPU");
+      return false;
+    }
+  }
+  struct Source {
+    const std::uint8_t* mapped = nullptr;  // Roblox's mapping, or null
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkDeviceSize memory_offset = 0;
+  };
+  std::vector<Source> where(uploads.size());
+  VkCommandBuffer owner = VK_NULL_HANDLE;
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    for (std::size_t index = 0; index < uploads.size(); ++index) {
+      const Etc2GpuUpload& upload = uploads[index];
+      const auto binding = buffers.find(upload.source);
+      if (binding == buffers.end()) {
+        LogFailure("upload source buffer has no tracked memory binding");
+        return false;
+      }
+      const VkDeviceSize absolute =
+          binding->second.offset + upload.source_offset;
+      const auto mapping = mappings.find(binding->second.memory);
+      if (mapping == mappings.end()) {
+        where[index].memory = binding->second.memory;
+        where[index].memory_offset = absolute;
+      } else if (absolute >= mapping->second.offset &&
+                 (mapping->second.size == VK_WHOLE_SIZE ||
+                  (absolute - mapping->second.offset <=
+                       mapping->second.size &&
+                   upload.source_span <= mapping->second.size -
+                                            (absolute -
+                                             mapping->second.offset)))) {
+        where[index].mapped =
+            static_cast<const std::uint8_t*>(mapping->second.data) +
+            (absolute - mapping->second.offset);
+      } else {
+        LogFailure("upload source lies outside the mapped range");
+        return false;
+      }
+    }
+    const auto holds_gpu_uploads = [&](VkCommandBuffer command_buffer) {
+      const auto record = commands.find(command_buffer);
+      return record != commands.end() && !record->second.gpu_uploads.empty();
+    };
+    for (VkCommandBuffer command_buffer : command_buffers) {
+      if (owner != VK_NULL_HANDLE) {
+        break;
+      }
+      if (holds_gpu_uploads(command_buffer)) {
+        owner = command_buffer;
+        break;
+      }
+      const auto record = commands.find(command_buffer);
+      if (record == commands.end()) {
+        continue;
+      }
+      for (VkCommandBuffer secondary : record->second.secondaries) {
+        if (holds_gpu_uploads(secondary)) {
+          owner = secondary;
+          break;
+        }
       }
     }
   }
-  state_->NoteSubmit(queue, false, count, upload_batches);
-  // The GPU route plans its decode passes into `plan` here (DESIGN §3.4).
+  if (owner == VK_NULL_HANDLE) {
+    LogFailure("a rescued batch holds no GPU-route uploads");
+    return false;
+  }
+
+  // Staging: decoded texels at 16-byte aligned offsets.
+  std::vector<VkDeviceSize> offsets(uploads.size());
+  VkDeviceSize total = 0;
+  VkDeviceSize compressed_total = 0;
+  for (std::size_t index = 0; index < uploads.size(); ++index) {
+    offsets[index] = (total + kEtc2StagingRegionAlignment - 1) /
+                     kEtc2StagingRegionAlignment * kEtc2StagingRegionAlignment;
+    total = offsets[index] + uploads[index].output_bytes;
+    compressed_total += uploads[index].compressed;
+  }
+  ArenaRef range;
+  Staging staging;
+  std::uint8_t* mapped = nullptr;
+  VkBuffer buffer = VK_NULL_HANDLE;
+  VkDeviceSize base = 0;
+  if (dev.host_staging != nullptr) {
+    if (dev.host_staging->Take(total, &range) && range.mapped != nullptr) {
+      mapped = range.mapped;
+      buffer = range.buffer;
+      base = range.offset;
+    } else {
+      ChunkArena::ReleaseRef(range);
+      range = ArenaRef{};
+    }
+  }
+  if (mapped == nullptr) {
+    if (!CreateStaging(dev, total, &staging, &mapped)) {
+      LogFailure("could not allocate staging for a rescue");
+      return false;
+    }
+    buffer = staging.buffer;
+  }
+  const auto give_back = [&]() {
+    if (range.arena_id != 0) {
+      ChunkArena::ReleaseRef(range);
+    } else {
+      DestroyStaging(dev, staging);
+    }
+  };
+
+  // Copy-in from Roblox's memory (streaming loads, whole block rows), then
+  // decode on the pool.
+  std::vector<std::uint8_t> compressed(
+      static_cast<std::size_t>(compressed_total));
+  std::vector<EtcDecodeJob> jobs;
+  {
+    TemporaryMappings temporary;
+    VkDeviceSize packed_offset = 0;
+    for (std::size_t index = 0; index < uploads.size(); ++index) {
+      const Etc2GpuUpload& upload = uploads[index];
+      const std::uint8_t* source = where[index].mapped;
+      if (source == nullptr) {
+        source = temporary.Map(&dev, where[index].memory,
+                               where[index].memory_offset);
+        if (source == nullptr) {
+          LogFailure("could not map an unmapped upload source");
+          give_back();
+          return false;
+        }
+      }
+      const std::size_t row_bytes =
+          static_cast<std::size_t>(upload.blocks_wide) *
+          EtcBlockBytes(upload.format);
+      const VkDeviceSize packed_layer =
+          static_cast<VkDeviceSize>(row_bytes) * upload.blocks_high;
+      const VkDeviceSize output_layer = upload.output_bytes / upload.layers;
+      for (std::uint32_t layer = 0; layer < upload.layers; ++layer) {
+        std::uint8_t* packed = compressed.data() + packed_offset;
+        CopyStridedFromMappedMemory(
+            packed, source + layer * upload.source_layer_stride, row_bytes,
+            upload.blocks_high,
+            static_cast<std::size_t>(upload.source_row_stride));
+        EtcDecodeJob job;
+        job.format = upload.format;
+        job.source = packed;
+        job.source_bytes = static_cast<std::size_t>(packed_layer);
+        job.width = 4 * upload.blocks_wide;
+        job.height = 4 * upload.blocks_high;
+        job.destination = mapped + offsets[index] + layer * output_layer;
+        job.destination_bytes = static_cast<std::size_t>(output_layer);
+        jobs.push_back(job);
+        packed_offset += packed_layer;
+      }
+    }
+  }
+  DecodeEtcJobs(jobs.data(), jobs.size(), WorkerCount());
+  for (const EtcDecodeJob& job : jobs) {
+    if (!job.ok) {
+      LogFailure("could not decode a rescued upload");
+      give_back();
+      return false;
+    }
+  }
+
+  bool kept = false;
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    const auto record = commands.find(owner);
+    if (record != commands.end()) {
+      if (range.arena_id != 0) {
+        record->second.staging_refs.push_back(range);
+      } else {
+        record->second.staging.push_back(staging);
+      }
+      kept = true;
+    }
+  }
+  if (!kept) {
+    give_back();
+    return false;
+  }
+  sources->clear();
+  for (std::size_t index = 0; index < uploads.size(); ++index) {
+    sources->push_back({buffer, base + offsets[index]});
+  }
+  return true;
+}
+
+void VulkanEtc2Emulation::PrepareSubmit(VkQueue queue, std::uint32_t count,
+                                        const VkSubmitInfo* submits,
+                                        VkFence fence, Etc2SubmitPlan* plan) {
+  if (plan != nullptr) {
+    plan->queue = queue;
+  }
+  std::vector<bool> uploads(submits != nullptr ? count : 0, false);
+  if (submits != nullptr) {
+    for (std::uint32_t index = 0; index < count; ++index) {
+      uploads[index] =
+          state_->RunCpuUploads(submits[index].pCommandBuffers,
+                                submits[index].commandBufferCount) != 0;
+    }
+  }
+  // The GPU route puts its decode passes in front (DESIGN §3.4).
+  state_->PlanGpuSubmit(queue, count, submits, fence, plan, &uploads);
+  state_->NoteSubmit(queue, false, count,
+                     static_cast<std::uint32_t>(
+                         std::count(uploads.begin(), uploads.end(), true)));
 }
 
 void VulkanEtc2Emulation::PrepareSubmit2(VkQueue queue, std::uint32_t count,
                                          const VkSubmitInfo2* submits,
                                          VkFence fence, Etc2SubmitPlan* plan) {
-  static_cast<void>(fence);
   if (plan != nullptr) {
     plan->queue = queue;
   }
-  std::uint32_t upload_batches = 0;
+  std::vector<bool> uploads(submits != nullptr ? count : 0, false);
   if (submits != nullptr &&
       state_->has_commands.load(std::memory_order_acquire)) {
     // One decode pass, and one stall line, per batch, as for vkQueueSubmit.
@@ -2930,15 +3460,17 @@ void VulkanEtc2Emulation::PrepareSubmit2(VkQueue queue, std::uint32_t count,
         command_buffers.push_back(
             submits[index].pCommandBufferInfos[info].commandBuffer);
       }
-      if (state_->RunCpuUploads(
+      uploads[index] =
+          state_->RunCpuUploads(
               command_buffers.data(),
-              static_cast<std::uint32_t>(command_buffers.size())) != 0) {
-        ++upload_batches;
-      }
+              static_cast<std::uint32_t>(command_buffers.size())) != 0;
     }
   }
-  state_->NoteSubmit(queue, true, count, upload_batches);
-  // The GPU route plans its decode passes into `plan` here (DESIGN §3.4).
+  // The GPU route puts its decode passes in front (DESIGN §3.4).
+  state_->PlanGpuSubmit(queue, count, submits, fence, plan, &uploads);
+  state_->NoteSubmit(queue, true, count,
+                     static_cast<std::uint32_t>(
+                         std::count(uploads.begin(), uploads.end(), true)));
 }
 
 void VulkanEtc2Emulation::FinishSubmit(
@@ -2947,11 +3479,19 @@ void VulkanEtc2Emulation::FinishSubmit(
   if (plan == nullptr) {
     return;
   }
+  if (plan->gpu_slot != nullptr) {
+    // The GPU route's slot: its fence follows Roblox's, and the slot is
+    // in flight, or not submitted (DESIGN C3.3).
+    HostDevice* dev = state_->Find(plan->device);
+    if (dev != nullptr && dev->gpu != nullptr) {
+      dev->gpu->FinishSubmit(plan, host_result, submit_fence_only);
+      return;
+    }
+  }
   if (plan->trailing_fence != VK_NULL_HANDLE && host_result == VK_SUCCESS &&
       submit_fence_only) {
     submit_fence_only(plan->trailing_fence);
   }
-  // The GPU route marks its slot submitted, or not, here (DESIGN C3.3).
 }
 
 void VulkanEtc2Emulation::ReleaseCommandBuffer(VkCommandBuffer command_buffer) {

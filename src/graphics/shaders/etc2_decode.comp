@@ -1,0 +1,132 @@
+#version 450
+// One invocation per 4x4 block. A dispatch covers a contiguous range of jobs
+// (uploads or upload layers); each workgroup belongs to exactly one job, so
+// the job lookup is uniform per workgroup.
+//
+// Output layout: "padded" rows, i.e. whole 4x4 blocks are written and the
+// rewritten vkCmdCopyBufferToImage region uses
+//   bufferRowLength   = 4 * blocks_wide   (texels)
+//   bufferImageHeight = 4 * blocks_high
+// so no edge checks are needed and no two invocations ever share a 32-bit
+// word, even for 2-byte R16 texels.
+#include "etc2_common.glsl"
+
+layout(local_size_x = 64) in;
+
+struct Job {
+  uint format;
+  uint src_word;         // first block, in 32-bit words of `src`
+  uint src_row_words;    // words per source block row
+  uint src_layer_words;  // words per source layer
+  uint blocks_wide;
+  uint blocks_high;
+  uint block_count;      // blocks_wide * blocks_high * layers
+  uint dst_word;         // first output word
+  uint dst_row_words;    // words per output texel row
+  uint dst_layer_words;  // words per output layer
+  uint group_begin;      // first workgroup of this job in the dispatch
+  uint pad0;
+  uint pad1;
+  uint pad2;
+  uint pad3;
+  uint pad4;
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer Source { uint src[]; };
+layout(std430, set = 0, binding = 1) readonly buffer Jobs { Job jobs[]; };
+// The output, seen as 8- and 16-byte texel rows of one block: each
+// invocation writes a whole row of its block with one store, so a subgroup's
+// stores cover whole cache lines. That matters most when the output lives in
+// system memory, where scalar stores made partial PCIe writes (about 40x
+// slower). Rows start on 16 bytes (8 for R11): output ranges are 256-byte
+// aligned and hold padded rows of 4 x blocks_wide texels.
+layout(std430, set = 1, binding = 0) writeonly buffer Destination2 { uvec2 dst2[]; };
+layout(std430, set = 1, binding = 0) writeonly buffer Destination4 { uvec4 dst4[]; };
+
+layout(push_constant) uniform Push {
+  uint job_first;
+  uint job_count;
+} pc;
+
+shared uint s_job;
+
+void main() {
+  const uint group = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+  if (gl_LocalInvocationIndex == 0u) {
+    uint lo = pc.job_first;
+    uint hi = pc.job_first + pc.job_count - 1u;
+    while (lo < hi) {
+      const uint mid = (lo + hi + 1u) >> 1;
+      if (jobs[mid].group_begin <= group) {
+        lo = mid;
+      } else {
+        hi = mid - 1u;
+      }
+    }
+    s_job = lo;
+  }
+  barrier();
+  const Job job = jobs[s_job];
+  const uint local = (group - job.group_begin) * 64u + gl_LocalInvocationIndex;
+  if (local >= job.block_count) {
+    return;
+  }
+  const uint per_layer = job.blocks_wide * job.blocks_high;
+  const uint layer = local / per_layer;
+  const uint rem = local - layer * per_layer;
+  const uint by = rem / job.blocks_wide;
+  const uint bx = rem - by * job.blocks_wide;
+  const uint format = job.format;
+  const uint s = job.src_word + layer * job.src_layer_words +
+                 by * job.src_row_words + bx * EtcBlockWords(format);
+  const uint row0 = job.dst_word + layer * job.dst_layer_words +
+                    by * 4u * job.dst_row_words;
+
+  if (format <= FMT_ETC2_RGBA8) {
+    uint px[16];
+    const uint c = format == FMT_ETC2_RGBA8 ? 2u : 0u;
+    DecodeRgbBlock(src[s + c], src[s + c + 1u], format == FMT_ETC2_RGB8A1, px);
+    if (format == FMT_ETC2_RGBA8) {
+      const uint a0 = src[s];
+      const uint a1 = src[s + 1u];
+      const int base = BlockByte(a0, a1, 0);
+      const int multiplier = BlockByte(a0, a1, 1) >> 4;
+      for (int t = 0; t < 16; ++t) {
+        const int alpha = clamp(base + EacModifier(a0, a1, t) * multiplier, 0, 255);
+        px[t] = (px[t] & 0x00FFFFFFu) | (uint(alpha) << 24);
+      }
+    }
+    for (uint y = 0u; y < 4u; ++y) {
+      const uint d = row0 + y * job.dst_row_words + bx * 4u;
+      dst4[d >> 2] = uvec4(px[0u * 4u + y], px[1u * 4u + y], px[2u * 4u + y],
+                           px[3u * 4u + y]);
+    }
+    return;
+  }
+
+  const bool is_signed = format == FMT_EAC_R11_SIGNED || format == FMT_EAC_RG11_SIGNED;
+  const uint r0 = src[s];
+  const uint r1 = src[s + 1u];
+  if (format == FMT_EAC_R11 || format == FMT_EAC_R11_SIGNED) {
+    for (int y = 0; y < 4; ++y) {
+      const uint d = row0 + uint(y) * job.dst_row_words + bx * 2u;
+      dst2[d >> 1] = uvec2(DecodeR11(r0, r1, 0 * 4 + y, is_signed) |
+                               (DecodeR11(r0, r1, 1 * 4 + y, is_signed) << 16),
+                           DecodeR11(r0, r1, 2 * 4 + y, is_signed) |
+                               (DecodeR11(r0, r1, 3 * 4 + y, is_signed) << 16));
+    }
+    return;
+  }
+  const uint g0 = src[s + 2u];
+  const uint g1 = src[s + 3u];
+  for (int y = 0; y < 4; ++y) {
+    const uint d = row0 + uint(y) * job.dst_row_words + bx * 4u;
+    uvec4 row;
+    for (int x = 0; x < 4; ++x) {
+      const int t = x * 4 + y;
+      row[x] = DecodeR11(r0, r1, t, is_signed) |
+               (DecodeR11(g0, g1, t, is_signed) << 16);
+    }
+    dst4[d >> 2] = row;
+  }
+}

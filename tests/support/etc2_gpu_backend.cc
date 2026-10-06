@@ -99,10 +99,9 @@ std::string Etc2GpuBackend::Unsupported(const Scenario& scenario) const {
   if (pool_ == VK_NULL_HANDLE || fence_ == VK_NULL_HANDLE) {
     return "could not create a command pool and a fence";
   }
-  if (scenario.queue_family != device_->queue_family()) {
+  if (device_->Queue(scenario.queue_family) == VK_NULL_HANDLE) {
     return "needs queue family " + std::to_string(scenario.queue_family) +
-           ", the test device has a queue in family " +
-           std::to_string(device_->queue_family());
+           ", the test device has no queue there";
   }
   if (scenario.needs_copy_commands2 && !device_->copy_commands2()) {
     return "the device has no vkCmdCopyBufferToImage2 / vkCmdCopyImage2";
@@ -219,7 +218,7 @@ bool Etc2GpuBackend::RunOnce(Record record) {
 }
 
 VkQueue Etc2GpuBackend::Queue(std::uint32_t family) {
-  return family == device_->queue_family() ? device_->queue() : VK_NULL_HANDLE;
+  return device_->Queue(family);
 }
 
 bool Etc2GpuBackend::CreateSource(VkDeviceSize size, VkDeviceSize bind_offset,

@@ -10,6 +10,8 @@
 #include <unordered_map>
 #include <utility>
 
+#include "mocktail/graphics/etc2_decoder.h"
+
 namespace mocktail::graphics::testing {
 
 bool LookupFormatBlock(VkFormat format, FormatBlock* out) {
@@ -224,6 +226,12 @@ struct FakeVulkanDevice::Impl {
       kCopyBuffer,
       kExecuteCommands,
       kPipelineBarrier,
+      kBindPipeline,
+      kBindDescriptorSets,
+      kPushConstants,
+      kDispatch,
+      kResetQueryPool,
+      kWriteTimestamp,
     };
     Kind kind = Kind::kPipelineBarrier;
     VkBuffer buffer = VK_NULL_HANDLE;
@@ -238,6 +246,39 @@ struct FakeVulkanDevice::Impl {
     std::vector<VkBufferCopy> buffer_regions;
     std::vector<VkCommandBuffer> secondaries;
     VkFilter filter = VK_FILTER_NEAREST;
+    // Compute and queries.
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    std::uint32_t first = 0;  // set, push-constant offset or query
+    std::uint32_t count = 0;  // queries
+    std::vector<VkDescriptorSet> sets;
+    std::vector<std::uint8_t> bytes;  // push constants
+    std::uint32_t groups[3] = {};
+    VkQueryPool queries = VK_NULL_HANDLE;
+  };
+  struct DescriptorPool {
+    std::uint32_t max_sets = 0;
+    VkDescriptorPoolCreateFlags flags = 0;
+    std::vector<VkDescriptorSet> sets;
+  };
+  struct DescriptorSet {
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    std::map<std::uint32_t, VkDescriptorBufferInfo> bindings;
+  };
+  struct QueryPool {
+    std::vector<std::uint64_t> values;
+    std::vector<bool> written;
+  };
+  // The decode shader's Job (etc2_decode.comp), as 16 words.
+  struct DecodeJob {
+    std::uint32_t format, src_word, src_row_words, src_layer_words,
+        blocks_wide, blocks_high, block_count, dst_word, dst_row_words,
+        dst_layer_words, group_begin, pad[5];
+  };
+  // What a command buffer has bound while it executes.
+  struct ComputeState {
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkDescriptorSet sets[2] = {};
+    std::uint8_t push[128] = {};
   };
   enum class CommandBufferState { kInitial, kRecording, kExecutable, kInvalid };
   struct CommandBuffer {
@@ -266,6 +307,18 @@ struct FakeVulkanDevice::Impl {
   std::unordered_map<VkCommandPool, Pool> pools;
   std::unordered_map<VkCommandBuffer, CommandBuffer> command_buffers;
   std::unordered_map<VkFence, bool> fences;
+  std::unordered_map<VkShaderModule, std::size_t> shader_modules;
+  std::unordered_map<VkPipeline, VkShaderModule> pipelines;
+  std::unordered_map<VkPipelineLayout, std::uint32_t> pipeline_layouts;
+  std::unordered_map<VkDescriptorSetLayout, std::uint32_t> set_layouts;
+  std::unordered_map<VkDescriptorPool, DescriptorPool> descriptor_pools;
+  std::unordered_map<VkDescriptorSet, DescriptorSet> descriptor_sets;
+  std::unordered_map<VkQueryPool, QueryPool> query_pools;
+  std::uint64_t fake_time = 0;
+  std::vector<VkResult> submit_results;
+  bool hold_fences = false;
+  std::vector<VkFence> held_fences;
+  bool lost = false;
   std::map<std::pair<std::uint32_t, std::uint32_t>, VkQueue> queues;
   Counts counts;
   std::map<std::string, std::uint64_t> calls;
@@ -314,6 +367,10 @@ struct FakeVulkanDevice::Impl {
     if (out == nullptr || size == 0 || type >= config.memory.memoryTypeCount) {
       Error("vkAllocateMemory", "size 0 or invalid memory type",
             "VUID-vkAllocateMemory-pAllocateInfo-01714");
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    }
+    if (config.max_allocation_bytes != 0 &&
+        size > config.max_allocation_bytes) {
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
     }
     const VkDeviceMemory memory = NextHandle<VkDeviceMemory>();
@@ -1105,8 +1162,52 @@ struct FakeVulkanDevice::Impl {
     const VkQueueFlags flags = FamilyFlags(found->second);
     // Copy: an executed secondary must not invalidate the iterator.
     const std::vector<Command> commands = found->second.commands;
+    ComputeState compute;
     for (const Command& command : commands) {
       switch (command.kind) {
+        case Command::Kind::kBindPipeline:
+          compute.pipeline = command.pipeline;
+          break;
+        case Command::Kind::kBindDescriptorSets:
+          for (std::size_t index = 0; index < command.sets.size(); ++index) {
+            if (command.first + index < 2) {
+              compute.sets[command.first + index] = command.sets[index];
+            }
+          }
+          break;
+        case Command::Kind::kPushConstants:
+          if (command.first + command.bytes.size() <= sizeof(compute.push)) {
+            std::memcpy(compute.push + command.first, command.bytes.data(),
+                        command.bytes.size());
+          }
+          break;
+        case Command::Kind::kDispatch:
+          if ((flags & VK_QUEUE_COMPUTE_BIT) == 0) {
+            Error("vkCmdDispatch", "dispatch on a queue without COMPUTE",
+                  "VUID-vkCmdDispatch-commandBuffer-cmdpool");
+            break;
+          }
+          Dispatch(compute, command.groups);
+          break;
+        case Command::Kind::kResetQueryPool: {
+          QueryPool* pool = Queries(command.queries, command.first,
+                                    command.count, "vkCmdResetQueryPool");
+          for (std::uint32_t query = 0; pool != nullptr && query < command.count;
+               ++query) {
+            pool->written[command.first + query] = false;
+          }
+          break;
+        }
+        case Command::Kind::kWriteTimestamp: {
+          QueryPool* pool =
+              Queries(command.queries, command.first, 1, "vkCmdWriteTimestamp");
+          if (pool != nullptr) {
+            fake_time += config.timestamp_step_ns;
+            pool->values[command.first] = fake_time;
+            pool->written[command.first] = true;
+          }
+          break;
+        }
         case Command::Kind::kCopyBufferToImage:
           for (const VkBufferImageCopy& region : command.buffer_image_regions) {
             if (ValidRegion("vkCmdCopyBufferToImage", command.image,
@@ -1208,6 +1309,146 @@ struct FakeVulkanDevice::Impl {
         depth == 0) {
       command_buffers[command_buffer].state = CommandBufferState::kInvalid;
     }
+  }
+
+  QueryPool* Queries(VkQueryPool handle, std::uint32_t first,
+                     std::uint32_t count, const char* function) {
+    const auto found = query_pools.find(handle);
+    if (found == query_pools.end() ||
+        first + count > found->second.values.size()) {
+      Error(function, "unknown query pool or queries out of range",
+            "VUID-vkCmdWriteTimestamp-query-04904");
+      return nullptr;
+    }
+    return &found->second;
+  }
+
+  // A storage-buffer binding of `set`: its bytes, and how many there are.
+  std::uint8_t* Binding(VkDescriptorSet set, std::uint32_t binding,
+                        VkDeviceSize* size) {
+    const auto found = descriptor_sets.find(set);
+    if (found == descriptor_sets.end()) {
+      return nullptr;
+    }
+    const auto info = found->second.bindings.find(binding);
+    if (info == found->second.bindings.end()) {
+      return nullptr;
+    }
+    std::uint8_t* bytes = BufferBytes(info->second.buffer, "vkCmdDispatch");
+    const auto buffer = buffers.find(info->second.buffer);
+    if (bytes == nullptr || buffer == buffers.end() ||
+        info->second.offset > buffer->second.size) {
+      return nullptr;
+    }
+    *size = info->second.range == VK_WHOLE_SIZE
+                ? buffer->second.size - info->second.offset
+                : info->second.range;
+    return bytes + info->second.offset;
+  }
+
+  // etc2_decode.comp on the CPU: each workgroup finds its job by binary
+  // search over group_begin, each invocation decodes one 4x4 block and
+  // writes its rows; anything outside a binding is an error.
+  void Dispatch(const ComputeState& compute, const std::uint32_t groups[3]) {
+    ++counts.dispatches;
+    if (pipelines.count(compute.pipeline) == 0) {
+      Error("vkCmdDispatch", "no compute pipeline bound",
+            "VUID-vkCmdDispatch-None-08606");
+      return;
+    }
+    VkDeviceSize source_size = 0;
+    VkDeviceSize jobs_size = 0;
+    VkDeviceSize output_size = 0;
+    const std::uint8_t* source = Binding(compute.sets[0], 0, &source_size);
+    const std::uint8_t* jobs = Binding(compute.sets[0], 1, &jobs_size);
+    std::uint8_t* output = Binding(compute.sets[1], 0, &output_size);
+    if (source == nullptr || jobs == nullptr || output == nullptr) {
+      Error("vkCmdDispatch", "a descriptor set is not bound or not written",
+            "VUID-vkCmdDispatch-None-08600");
+      return;
+    }
+    std::uint32_t first = 0;
+    std::uint32_t count = 0;
+    std::memcpy(&first, compute.push, 4);
+    std::memcpy(&count, compute.push + 4, 4);
+    if (count == 0 ||
+        (static_cast<VkDeviceSize>(first) + count) * sizeof(DecodeJob) >
+            jobs_size) {
+      Error("vkCmdDispatch", "the push constants name jobs past the buffer");
+      return;
+    }
+    const auto job = [&](std::uint32_t index) {
+      DecodeJob value;
+      std::memcpy(&value, jobs + static_cast<std::size_t>(index) * 64, 64);
+      return value;
+    };
+    const std::uint64_t total =
+        static_cast<std::uint64_t>(groups[0]) * groups[1] * groups[2];
+    for (std::uint64_t group = 0; group < total; ++group) {
+      std::uint32_t low = first;
+      std::uint32_t high = first + count - 1;
+      while (low < high) {
+        const std::uint32_t middle = (low + high + 1) >> 1;
+        if (job(middle).group_begin <= group) {
+          low = middle;
+        } else {
+          high = middle - 1;
+        }
+      }
+      const DecodeJob current = job(low);
+      if (group < current.group_begin) {
+        continue;
+      }
+      for (std::uint32_t local = 0; local < 64; ++local) {
+        const std::uint64_t block =
+            (group - current.group_begin) * 64 + local;
+        if (block < current.block_count &&
+            !DecodeBlock(current, block, source, source_size, output,
+                         output_size)) {
+          return;
+        }
+      }
+    }
+  }
+
+  bool DecodeBlock(const DecodeJob& job, std::uint64_t block,
+                   const std::uint8_t* source, VkDeviceSize source_size,
+                   std::uint8_t* output, VkDeviceSize output_size) {
+    if (job.format > static_cast<std::uint32_t>(EtcFormat::kEacRg11Signed) ||
+        job.blocks_wide == 0 || job.blocks_high == 0) {
+      Error("vkCmdDispatch", "a job with a bad format or extent");
+      return false;
+    }
+    const auto format = static_cast<EtcFormat>(job.format);
+    const std::uint64_t block_bytes = EtcBlockBytes(format);
+    const std::uint64_t texel = EtcDecodedTexelBytes(format);
+    const std::uint64_t per_layer =
+        static_cast<std::uint64_t>(job.blocks_wide) * job.blocks_high;
+    const std::uint64_t layer = block / per_layer;
+    const std::uint64_t rest = block - layer * per_layer;
+    const std::uint64_t by = rest / job.blocks_wide;
+    const std::uint64_t bx = rest - by * job.blocks_wide;
+    const std::uint64_t word = job.src_word + layer * job.src_layer_words +
+                               by * job.src_row_words + bx * block_bytes / 4;
+    if ((word * 4) + block_bytes > source_size) {
+      Error("vkCmdDispatch", "a job reads past its input binding");
+      return false;
+    }
+    std::uint8_t texels[16 * 4];
+    DecodeEtcImage(format, source + word * 4, block_bytes, 4, 4, texels,
+                   16 * texel);
+    const std::uint64_t row0 = job.dst_word + layer * job.dst_layer_words +
+                               by * 4 * job.dst_row_words;
+    for (std::uint64_t y = 0; y < 4; ++y) {
+      const std::uint64_t at = (row0 + y * job.dst_row_words) * 4 + bx * 4 * texel;
+      if (at + 4 * texel > output_size) {
+        Error("vkCmdDispatch", "a job writes past its output binding");
+        return false;
+      }
+      std::memcpy(output + at, texels + y * 4 * texel, 4 * texel);
+    }
+    ++counts.decoded_blocks;
+    return true;
   }
 
   VkResult Submit(const std::vector<std::vector<VkCommandBuffer>>& batches) {
@@ -1654,6 +1895,10 @@ VKAPI_ATTR void VKAPI_CALL FakeDestroyFence(VkDevice device, VkFence fence,
   if (fence == VK_NULL_HANDLE) {
     return;
   }
+  // A held fence may go: teardown gives up on a GPU that does not finish.
+  impl->held_fences.erase(std::remove(impl->held_fences.begin(),
+                                      impl->held_fences.end(), fence),
+                          impl->held_fences.end());
   if (impl->fences.erase(fence) == 0) {
     impl->Error("vkDestroyFence", "unknown fence");
     return;
@@ -1664,6 +1909,9 @@ VKAPI_ATTR void VKAPI_CALL FakeDestroyFence(VkDevice device, VkFence fence,
 VKAPI_ATTR VkResult VKAPI_CALL FakeGetFenceStatus(VkDevice device,
                                                   VkFence fence) {
   FAKE_ENTER(device, "vkGetFenceStatus", VK_ERROR_DEVICE_LOST);
+  if (impl->lost) {
+    return VK_ERROR_DEVICE_LOST;
+  }
   const auto found = impl->fences.find(fence);
   if (found == impl->fences.end()) {
     impl->Error("vkGetFenceStatus", "unknown fence");
@@ -1678,6 +1926,9 @@ VKAPI_ATTR VkResult VKAPI_CALL FakeWaitForFences(VkDevice device,
                                                  VkBool32 wait_all,
                                                  std::uint64_t) {
   FAKE_ENTER(device, "vkWaitForFences", VK_ERROR_DEVICE_LOST);
+  if (impl->lost) {
+    return VK_ERROR_DEVICE_LOST;
+  }
   std::uint32_t signalled = 0;
   for (std::uint32_t index = 0; index < count; ++index) {
     const auto found = impl->fences.find(fences[index]);
@@ -1698,9 +1949,431 @@ VKAPI_ATTR VkResult VKAPI_CALL FakeResetFences(VkDevice device,
                                                const VkFence* fences) {
   FAKE_ENTER(device, "vkResetFences", VK_ERROR_DEVICE_LOST);
   for (std::uint32_t index = 0; index < count; ++index) {
+    if (std::find(impl->held_fences.begin(), impl->held_fences.end(),
+                  fences[index]) != impl->held_fences.end()) {
+      impl->Error("vkResetFences", "the fence is still pending",
+                  "VUID-vkResetFences-pFences-01123");
+    }
     impl->fences[fences[index]] = false;
   }
   return VK_SUCCESS;
+}
+
+// ---- compute objects and queries (the ETC2 GPU route) ----------------------
+
+VKAPI_ATTR VkResult VKAPI_CALL FakeCreateShaderModule(
+    VkDevice device, const VkShaderModuleCreateInfo* info,
+    const VkAllocationCallbacks*, VkShaderModule* module) {
+  FAKE_ENTER(device, "vkCreateShaderModule", VK_ERROR_DEVICE_LOST);
+  if (info == nullptr || module == nullptr || info->codeSize == 0 ||
+      info->codeSize % 4 != 0 || info->pCode == nullptr ||
+      info->pCode[0] != 0x07230203U) {
+    impl->Error("vkCreateShaderModule", "not SPIR-V",
+                "VUID-VkShaderModuleCreateInfo-pCode-08737");
+    return VK_ERROR_INVALID_SHADER_NV;
+  }
+  *module = NextHandle<VkShaderModule>();
+  impl->shader_modules[*module] = info->codeSize;
+  ++impl->counts.shader_modules.created;
+  return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL FakeDestroyShaderModule(
+    VkDevice device, VkShaderModule module, const VkAllocationCallbacks*) {
+  FAKE_ENTER(device, "vkDestroyShaderModule", );
+  if (module != VK_NULL_HANDLE) {
+    if (impl->shader_modules.erase(module) == 0) {
+      impl->Error("vkDestroyShaderModule", "unknown shader module");
+      return;
+    }
+    ++impl->counts.shader_modules.destroyed;
+  }
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL FakeCreateDescriptorSetLayout(
+    VkDevice device, const VkDescriptorSetLayoutCreateInfo* info,
+    const VkAllocationCallbacks*, VkDescriptorSetLayout* layout) {
+  FAKE_ENTER(device, "vkCreateDescriptorSetLayout", VK_ERROR_DEVICE_LOST);
+  if (info == nullptr || layout == nullptr) {
+    return VK_ERROR_INITIALIZATION_FAILED;
+  }
+  *layout = NextHandle<VkDescriptorSetLayout>();
+  impl->set_layouts[*layout] = info->bindingCount;
+  ++impl->counts.descriptor_set_layouts.created;
+  return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL FakeDestroyDescriptorSetLayout(
+    VkDevice device, VkDescriptorSetLayout layout,
+    const VkAllocationCallbacks*) {
+  FAKE_ENTER(device, "vkDestroyDescriptorSetLayout", );
+  if (layout != VK_NULL_HANDLE) {
+    if (impl->set_layouts.erase(layout) == 0) {
+      impl->Error("vkDestroyDescriptorSetLayout", "unknown layout");
+      return;
+    }
+    ++impl->counts.descriptor_set_layouts.destroyed;
+  }
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL FakeCreatePipelineLayout(
+    VkDevice device, const VkPipelineLayoutCreateInfo* info,
+    const VkAllocationCallbacks*, VkPipelineLayout* layout) {
+  FAKE_ENTER(device, "vkCreatePipelineLayout", VK_ERROR_DEVICE_LOST);
+  if (info == nullptr || layout == nullptr) {
+    return VK_ERROR_INITIALIZATION_FAILED;
+  }
+  for (std::uint32_t index = 0; index < info->setLayoutCount; ++index) {
+    if (impl->set_layouts.count(info->pSetLayouts[index]) == 0) {
+      impl->Error("vkCreatePipelineLayout", "unknown set layout");
+    }
+  }
+  *layout = NextHandle<VkPipelineLayout>();
+  impl->pipeline_layouts[*layout] = info->setLayoutCount;
+  ++impl->counts.pipeline_layouts.created;
+  return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL FakeDestroyPipelineLayout(
+    VkDevice device, VkPipelineLayout layout, const VkAllocationCallbacks*) {
+  FAKE_ENTER(device, "vkDestroyPipelineLayout", );
+  if (layout != VK_NULL_HANDLE) {
+    if (impl->pipeline_layouts.erase(layout) == 0) {
+      impl->Error("vkDestroyPipelineLayout", "unknown pipeline layout");
+      return;
+    }
+    ++impl->counts.pipeline_layouts.destroyed;
+  }
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL FakeCreateComputePipelines(
+    VkDevice device, VkPipelineCache, std::uint32_t count,
+    const VkComputePipelineCreateInfo* infos, const VkAllocationCallbacks*,
+    VkPipeline* pipelines) {
+  FAKE_ENTER(device, "vkCreateComputePipelines", VK_ERROR_DEVICE_LOST);
+  if (impl->config.fail_compute_pipelines) {
+    std::fill(pipelines, pipelines + count, VK_NULL_HANDLE);
+    return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+  }
+  for (std::uint32_t index = 0; index < count; ++index) {
+    if (impl->shader_modules.count(infos[index].stage.module) == 0 ||
+        impl->pipeline_layouts.count(infos[index].layout) == 0) {
+      impl->Error("vkCreateComputePipelines",
+                  "unknown shader module or pipeline layout");
+      return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    pipelines[index] = NextHandle<VkPipeline>();
+    impl->pipelines[pipelines[index]] = infos[index].stage.module;
+    ++impl->counts.pipelines.created;
+  }
+  return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL FakeDestroyPipeline(VkDevice device,
+                                               VkPipeline pipeline,
+                                               const VkAllocationCallbacks*) {
+  FAKE_ENTER(device, "vkDestroyPipeline", );
+  if (pipeline != VK_NULL_HANDLE) {
+    if (impl->pipelines.erase(pipeline) == 0) {
+      impl->Error("vkDestroyPipeline", "unknown pipeline");
+      return;
+    }
+    ++impl->counts.pipelines.destroyed;
+  }
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL FakeCreateDescriptorPool(
+    VkDevice device, const VkDescriptorPoolCreateInfo* info,
+    const VkAllocationCallbacks*, VkDescriptorPool* pool) {
+  FAKE_ENTER(device, "vkCreateDescriptorPool", VK_ERROR_DEVICE_LOST);
+  if (info == nullptr || pool == nullptr || info->maxSets == 0) {
+    return VK_ERROR_INITIALIZATION_FAILED;
+  }
+  *pool = NextHandle<VkDescriptorPool>();
+  FakeVulkanDevice::Impl::DescriptorPool& record = impl->descriptor_pools[*pool];
+  record.max_sets = impl->config.max_sets_per_pool != 0
+                        ? std::min(impl->config.max_sets_per_pool,
+                                   info->maxSets)
+                        : info->maxSets;
+  record.flags = info->flags;
+  ++impl->counts.descriptor_pools.created;
+  return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL FakeDestroyDescriptorPool(
+    VkDevice device, VkDescriptorPool pool, const VkAllocationCallbacks*) {
+  FAKE_ENTER(device, "vkDestroyDescriptorPool", );
+  if (pool == VK_NULL_HANDLE) {
+    return;
+  }
+  const auto found = impl->descriptor_pools.find(pool);
+  if (found == impl->descriptor_pools.end()) {
+    impl->Error("vkDestroyDescriptorPool", "unknown descriptor pool");
+    return;
+  }
+  for (VkDescriptorSet set : found->second.sets) {
+    impl->descriptor_sets.erase(set);
+    ++impl->counts.descriptor_sets.destroyed;
+  }
+  impl->descriptor_pools.erase(found);
+  ++impl->counts.descriptor_pools.destroyed;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL FakeAllocateDescriptorSets(
+    VkDevice device, const VkDescriptorSetAllocateInfo* info,
+    VkDescriptorSet* sets) {
+  FAKE_ENTER(device, "vkAllocateDescriptorSets", VK_ERROR_DEVICE_LOST);
+  if (info == nullptr || sets == nullptr) {
+    return VK_ERROR_INITIALIZATION_FAILED;
+  }
+  const auto pool = impl->descriptor_pools.find(info->descriptorPool);
+  if (pool == impl->descriptor_pools.end()) {
+    impl->Error("vkAllocateDescriptorSets", "unknown descriptor pool");
+    return VK_ERROR_INITIALIZATION_FAILED;
+  }
+  if (pool->second.sets.size() + info->descriptorSetCount >
+      pool->second.max_sets) {
+    return VK_ERROR_OUT_OF_POOL_MEMORY;
+  }
+  for (std::uint32_t index = 0; index < info->descriptorSetCount; ++index) {
+    if (impl->set_layouts.count(info->pSetLayouts[index]) == 0) {
+      impl->Error("vkAllocateDescriptorSets", "unknown set layout");
+    }
+    sets[index] = NextHandle<VkDescriptorSet>();
+    impl->descriptor_sets[sets[index]].pool = info->descriptorPool;
+    pool->second.sets.push_back(sets[index]);
+    ++impl->counts.descriptor_sets.created;
+  }
+  return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL FakeFreeDescriptorSets(
+    VkDevice device, VkDescriptorPool pool, std::uint32_t count,
+    const VkDescriptorSet* sets) {
+  FAKE_ENTER(device, "vkFreeDescriptorSets", VK_ERROR_DEVICE_LOST);
+  const auto found = impl->descriptor_pools.find(pool);
+  if (found == impl->descriptor_pools.end()) {
+    impl->Error("vkFreeDescriptorSets", "unknown descriptor pool");
+    return VK_ERROR_INITIALIZATION_FAILED;
+  }
+  if ((found->second.flags & VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT) ==
+      0) {
+    impl->Error("vkFreeDescriptorSets",
+                "pool was created without FREE_DESCRIPTOR_SET",
+                "VUID-vkFreeDescriptorSets-descriptorPool-00312");
+  }
+  for (std::uint32_t index = 0; index < count; ++index) {
+    auto& owned = found->second.sets;
+    const auto at = std::find(owned.begin(), owned.end(), sets[index]);
+    if (at == owned.end()) {
+      impl->Error("vkFreeDescriptorSets", "set not from this pool");
+      continue;
+    }
+    owned.erase(at);
+    impl->descriptor_sets.erase(sets[index]);
+    ++impl->counts.descriptor_sets.destroyed;
+  }
+  return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL FakeUpdateDescriptorSets(
+    VkDevice device, std::uint32_t count, const VkWriteDescriptorSet* writes,
+    std::uint32_t, const VkCopyDescriptorSet*) {
+  FAKE_ENTER(device, "vkUpdateDescriptorSets", );
+  for (std::uint32_t index = 0; index < count; ++index) {
+    const VkWriteDescriptorSet& write = writes[index];
+    const auto set = impl->descriptor_sets.find(write.dstSet);
+    if (set == impl->descriptor_sets.end() ||
+        write.descriptorType != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ||
+        write.pBufferInfo == nullptr) {
+      impl->Error("vkUpdateDescriptorSets",
+                  "unknown set, or not a storage buffer");
+      continue;
+    }
+    for (std::uint32_t element = 0; element < write.descriptorCount;
+         ++element) {
+      const VkDescriptorBufferInfo& info = write.pBufferInfo[element];
+      if (impl->buffers.count(info.buffer) == 0) {
+        impl->Error("vkUpdateDescriptorSets", "unknown buffer");
+      }
+      set->second.bindings[write.dstBinding + element] = info;
+    }
+  }
+}
+
+VKAPI_ATTR void VKAPI_CALL FakeCmdBindPipeline(VkCommandBuffer command_buffer,
+                                               VkPipelineBindPoint point,
+                                               VkPipeline pipeline) {
+  FAKE_ENTER(command_buffer, "vkCmdBindPipeline", );
+  FakeVulkanDevice::Impl::CommandBuffer* record =
+      impl->Recording(command_buffer, "vkCmdBindPipeline");
+  if (record == nullptr) {
+    return;
+  }
+  if (point != VK_PIPELINE_BIND_POINT_COMPUTE ||
+      impl->pipelines.count(pipeline) == 0) {
+    impl->Error("vkCmdBindPipeline", "unknown or not a compute pipeline");
+  }
+  FakeVulkanDevice::Impl::Command command;
+  command.kind = FakeVulkanDevice::Impl::Command::Kind::kBindPipeline;
+  command.pipeline = pipeline;
+  record->commands.push_back(std::move(command));
+}
+
+VKAPI_ATTR void VKAPI_CALL FakeCmdBindDescriptorSets(
+    VkCommandBuffer command_buffer, VkPipelineBindPoint, VkPipelineLayout,
+    std::uint32_t first, std::uint32_t count, const VkDescriptorSet* sets,
+    std::uint32_t, const std::uint32_t*) {
+  FAKE_ENTER(command_buffer, "vkCmdBindDescriptorSets", );
+  FakeVulkanDevice::Impl::CommandBuffer* record =
+      impl->Recording(command_buffer, "vkCmdBindDescriptorSets");
+  if (record == nullptr) {
+    return;
+  }
+  FakeVulkanDevice::Impl::Command command;
+  command.kind = FakeVulkanDevice::Impl::Command::Kind::kBindDescriptorSets;
+  command.first = first;
+  command.sets.assign(sets, sets + count);
+  for (VkDescriptorSet set : command.sets) {
+    if (impl->descriptor_sets.count(set) == 0) {
+      impl->Error("vkCmdBindDescriptorSets", "unknown descriptor set");
+    }
+  }
+  record->commands.push_back(std::move(command));
+}
+
+VKAPI_ATTR void VKAPI_CALL FakeCmdPushConstants(
+    VkCommandBuffer command_buffer, VkPipelineLayout, VkShaderStageFlags,
+    std::uint32_t offset, std::uint32_t size, const void* values) {
+  FAKE_ENTER(command_buffer, "vkCmdPushConstants", );
+  FakeVulkanDevice::Impl::CommandBuffer* record =
+      impl->Recording(command_buffer, "vkCmdPushConstants");
+  if (record == nullptr) {
+    return;
+  }
+  FakeVulkanDevice::Impl::Command command;
+  command.kind = FakeVulkanDevice::Impl::Command::Kind::kPushConstants;
+  command.first = offset;
+  const auto* bytes = static_cast<const std::uint8_t*>(values);
+  command.bytes.assign(bytes, bytes + size);
+  record->commands.push_back(std::move(command));
+}
+
+VKAPI_ATTR void VKAPI_CALL FakeCmdDispatch(VkCommandBuffer command_buffer,
+                                           std::uint32_t x, std::uint32_t y,
+                                           std::uint32_t z) {
+  FAKE_ENTER(command_buffer, "vkCmdDispatch", );
+  FakeVulkanDevice::Impl::CommandBuffer* record =
+      impl->Recording(command_buffer, "vkCmdDispatch");
+  if (record == nullptr) {
+    return;
+  }
+  const std::uint32_t* limits =
+      impl->config.properties.limits.maxComputeWorkGroupCount;
+  if (x > limits[0] || y > limits[1] || z > limits[2]) {
+    impl->Error("vkCmdDispatch", "group count above the device limit",
+                "VUID-vkCmdDispatch-groupCountX-00386");
+  }
+  FakeVulkanDevice::Impl::Command command;
+  command.kind = FakeVulkanDevice::Impl::Command::Kind::kDispatch;
+  command.groups[0] = x;
+  command.groups[1] = y;
+  command.groups[2] = z;
+  record->commands.push_back(std::move(command));
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL FakeCreateQueryPool(
+    VkDevice device, const VkQueryPoolCreateInfo* info,
+    const VkAllocationCallbacks*, VkQueryPool* pool) {
+  FAKE_ENTER(device, "vkCreateQueryPool", VK_ERROR_DEVICE_LOST);
+  if (info == nullptr || pool == nullptr ||
+      info->queryType != VK_QUERY_TYPE_TIMESTAMP || info->queryCount == 0) {
+    return VK_ERROR_INITIALIZATION_FAILED;
+  }
+  *pool = NextHandle<VkQueryPool>();
+  FakeVulkanDevice::Impl::QueryPool& record = impl->query_pools[*pool];
+  record.values.assign(info->queryCount, 0);
+  record.written.assign(info->queryCount, false);
+  ++impl->counts.query_pools.created;
+  return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL FakeDestroyQueryPool(VkDevice device,
+                                                VkQueryPool pool,
+                                                const VkAllocationCallbacks*) {
+  FAKE_ENTER(device, "vkDestroyQueryPool", );
+  if (pool != VK_NULL_HANDLE) {
+    if (impl->query_pools.erase(pool) == 0) {
+      impl->Error("vkDestroyQueryPool", "unknown query pool");
+      return;
+    }
+    ++impl->counts.query_pools.destroyed;
+  }
+}
+
+void RecordQueries(FakeVulkanDevice::Impl* impl, VkCommandBuffer command_buffer,
+                   const char* function,
+                   FakeVulkanDevice::Impl::Command::Kind kind, VkQueryPool pool,
+                   std::uint32_t first, std::uint32_t count) {
+  FakeVulkanDevice::Impl::CommandBuffer* record =
+      impl->Recording(command_buffer, function);
+  if (record == nullptr) {
+    return;
+  }
+  FakeVulkanDevice::Impl::Command command;
+  command.kind = kind;
+  command.queries = pool;
+  command.first = first;
+  command.count = count;
+  record->commands.push_back(std::move(command));
+}
+
+VKAPI_ATTR void VKAPI_CALL FakeCmdResetQueryPool(VkCommandBuffer command_buffer,
+                                                 VkQueryPool pool,
+                                                 std::uint32_t first,
+                                                 std::uint32_t count) {
+  FAKE_ENTER(command_buffer, "vkCmdResetQueryPool", );
+  RecordQueries(impl, command_buffer, "vkCmdResetQueryPool",
+                FakeVulkanDevice::Impl::Command::Kind::kResetQueryPool, pool,
+                first, count);
+}
+
+VKAPI_ATTR void VKAPI_CALL FakeCmdWriteTimestamp(
+    VkCommandBuffer command_buffer, VkPipelineStageFlagBits, VkQueryPool pool,
+    std::uint32_t query) {
+  FAKE_ENTER(command_buffer, "vkCmdWriteTimestamp", );
+  RecordQueries(impl, command_buffer, "vkCmdWriteTimestamp",
+                FakeVulkanDevice::Impl::Command::Kind::kWriteTimestamp, pool,
+                query, 1);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL FakeGetQueryPoolResults(
+    VkDevice device, VkQueryPool pool, std::uint32_t first,
+    std::uint32_t count, std::size_t data_size, void* data,
+    VkDeviceSize stride, VkQueryResultFlags flags) {
+  FAKE_ENTER(device, "vkGetQueryPoolResults", VK_ERROR_DEVICE_LOST);
+  FakeVulkanDevice::Impl::QueryPool* record =
+      impl->Queries(pool, first, count, "vkGetQueryPoolResults");
+  if (record == nullptr || (flags & VK_QUERY_RESULT_64_BIT) == 0 ||
+      stride < 8 || static_cast<VkDeviceSize>(count - 1) * stride + 8 >
+                        data_size) {
+    impl->Error("vkGetQueryPoolResults", "bad query range or layout");
+    return VK_ERROR_INITIALIZATION_FAILED;
+  }
+  VkResult result = VK_SUCCESS;
+  for (std::uint32_t query = 0; query < count; ++query) {
+    if (!record->written[first + query]) {
+      if ((flags & VK_QUERY_RESULT_WAIT_BIT) != 0) {
+        impl->Error("vkGetQueryPoolResults",
+                    "waits for a query that was never written");
+      }
+      result = VK_NOT_READY;
+      continue;
+    }
+    std::memcpy(static_cast<std::uint8_t*>(data) + query * stride,
+                &record->values[first + query], 8);
+  }
+  return result;
 }
 
 void SignalFence(FakeVulkanDevice::Impl* impl, VkFence fence) {
@@ -1712,15 +2385,34 @@ void SignalFence(FakeVulkanDevice::Impl* impl, VkFence fence) {
     impl->Error("vkQueueSubmit", "unknown fence");
     return;
   }
-  if (found->second) {
+  if (found->second ||
+      std::find(impl->held_fences.begin(), impl->held_fences.end(), fence) !=
+          impl->held_fences.end()) {
     impl->Error("vkQueueSubmit", "fence is already signalled",
                 "VUID-vkQueueSubmit-fence-00063");
+  }
+  if (impl->hold_fences) {
+    impl->held_fences.push_back(fence);
+    return;
   }
   found->second = true;
 }
 
+// A result FailNextSubmits queued, or VK_SUCCESS.
+VkResult QueuedSubmitResult(FakeVulkanDevice::Impl* impl) {
+  if (impl->submit_results.empty()) {
+    return VK_SUCCESS;
+  }
+  const VkResult result = impl->submit_results.front();
+  impl->submit_results.erase(impl->submit_results.begin());
+  return result;
+}
+
 VkResult SubmitInfos(FakeVulkanDevice::Impl* impl, std::uint32_t count,
                      const VkSubmitInfo* submits, VkFence fence) {
+  if (const VkResult queued = QueuedSubmitResult(impl); queued != VK_SUCCESS) {
+    return queued;
+  }
   std::vector<std::vector<VkCommandBuffer>> batches;
   for (std::uint32_t index = 0; index < count; ++index) {
     batches.emplace_back(
@@ -1734,6 +2426,9 @@ VkResult SubmitInfos(FakeVulkanDevice::Impl* impl, std::uint32_t count,
 
 VkResult SubmitInfos2(FakeVulkanDevice::Impl* impl, std::uint32_t count,
                       const VkSubmitInfo2* submits, VkFence fence) {
+  if (const VkResult queued = QueuedSubmitResult(impl); queued != VK_SUCCESS) {
+    return queued;
+  }
   std::vector<std::vector<VkCommandBuffer>> batches;
   for (std::uint32_t index = 0; index < count; ++index) {
     std::vector<VkCommandBuffer> batch;
@@ -1835,6 +2530,28 @@ const ProcEntry kProcs[] = {
     FAKE_PROC("vkQueueSubmit2KHR", FakeQueueSubmit2),
     FAKE_PROC("vkQueueWaitIdle", FakeQueueWaitIdle),
     FAKE_PROC("vkDeviceWaitIdle", FakeDeviceWaitIdle),
+    FAKE_PROC("vkCreateShaderModule", FakeCreateShaderModule),
+    FAKE_PROC("vkDestroyShaderModule", FakeDestroyShaderModule),
+    FAKE_PROC("vkCreateDescriptorSetLayout", FakeCreateDescriptorSetLayout),
+    FAKE_PROC("vkDestroyDescriptorSetLayout", FakeDestroyDescriptorSetLayout),
+    FAKE_PROC("vkCreatePipelineLayout", FakeCreatePipelineLayout),
+    FAKE_PROC("vkDestroyPipelineLayout", FakeDestroyPipelineLayout),
+    FAKE_PROC("vkCreateComputePipelines", FakeCreateComputePipelines),
+    FAKE_PROC("vkDestroyPipeline", FakeDestroyPipeline),
+    FAKE_PROC("vkCreateDescriptorPool", FakeCreateDescriptorPool),
+    FAKE_PROC("vkDestroyDescriptorPool", FakeDestroyDescriptorPool),
+    FAKE_PROC("vkAllocateDescriptorSets", FakeAllocateDescriptorSets),
+    FAKE_PROC("vkFreeDescriptorSets", FakeFreeDescriptorSets),
+    FAKE_PROC("vkUpdateDescriptorSets", FakeUpdateDescriptorSets),
+    FAKE_PROC("vkCmdBindPipeline", FakeCmdBindPipeline),
+    FAKE_PROC("vkCmdBindDescriptorSets", FakeCmdBindDescriptorSets),
+    FAKE_PROC("vkCmdPushConstants", FakeCmdPushConstants),
+    FAKE_PROC("vkCmdDispatch", FakeCmdDispatch),
+    FAKE_PROC("vkCreateQueryPool", FakeCreateQueryPool),
+    FAKE_PROC("vkDestroyQueryPool", FakeDestroyQueryPool),
+    FAKE_PROC("vkCmdResetQueryPool", FakeCmdResetQueryPool),
+    FAKE_PROC("vkCmdWriteTimestamp", FakeCmdWriteTimestamp),
+    FAKE_PROC("vkGetQueryPoolResults", FakeGetQueryPoolResults),
 };
 
 #undef FAKE_PROC
@@ -2071,6 +2788,31 @@ VkQueue FakeVulkanDevice::GetQueue(std::uint32_t family, std::uint32_t index) {
   VkQueue queue = VK_NULL_HANDLE;
   FakeGetDeviceQueue(impl_->device, family, index, &queue);
   return queue;
+}
+
+void FakeVulkanDevice::FailNextSubmits(std::vector<VkResult> results) {
+  std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
+  impl_->submit_results = std::move(results);
+}
+
+void FakeVulkanDevice::LoseDevice() {
+  std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
+  impl_->lost = true;
+}
+
+void FakeVulkanDevice::HoldFences(bool hold) {
+  std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
+  impl_->hold_fences = hold;
+  if (hold) {
+    return;
+  }
+  for (VkFence fence : impl_->held_fences) {
+    const auto found = impl_->fences.find(fence);
+    if (found != impl_->fences.end()) {
+      found->second = true;
+    }
+  }
+  impl_->held_fences.clear();
 }
 
 VkResult FakeVulkanDevice::Submit(
