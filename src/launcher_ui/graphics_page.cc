@@ -840,18 +840,25 @@ GtkWidget* BuildTextureCompressionRow(LauncherContext* context) {
       // on the APK's own ETC1 textures. BC mode creates images at scale 1;
       // otherwise MOCKTAIL_SMALL_TEXTURE_UPSCALE (default 4) enlarges
       // colour textures of up to kSmallTextureMaxExtent (64) pixels a side
-      // by repeating texels. L123-REPORT.md: no stall at all while the
-      // graphics card converts (P2B1, P2B2), stalls of up to 196 ms while
-      // a place loads when the processor converts (P2Bc1,
-      // MOCKTAIL_ETC2_GPU=0). Keep config.yaml's template in step
-      // (runtime_config_bootstrap.cc).
+      // by repeating texels.
       _("The cost: fine detail can lose some quality, so sharp edges in text "
         "and icons or smooth gradients may look blockier. Small textures (up "
         "to 64 pixels across) also keep their own size instead of the "
         "fourfold enlargement Mocktail gives them otherwise, so they look "
-        "smoother but less crisp. When the conversion has to run on the "
-        "processor instead of the graphics card, loading can stutter "
-        "briefly.") +
+        "smoother but less crisp.") +
+      "\n\n" +
+      // L123-REPORT.md: no ETC2 stall in any phase while the graphics card
+      // converts (P2B1, P2B2: longest frames 62 and 64 ms while moving);
+      // stalls of up to 196 ms while a place loads when the processor
+      // converts (P2Bc1, MOCKTAIL_ETC2_GPU=0). vulkan_etc2_gpu.cc logs
+      // "ETC2 GPU decode ready" once the GPU route's selftest passed; until
+      // then, and without it, uploads take the CPU route. Keep config.yaml's
+      // template in step (runtime_config_bootstrap.cc).
+      _("Converting on the graphics card, which Mocktail does wherever it "
+        "can, added no stutter in that test. When the conversion has to run "
+        "on the processor instead (the session log then has no “[vulkan] "
+        "ETC2 GPU decode ready” line), loading can stutter briefly: for up to "
+        "about 0.2 s in the same game.") +
       "\n\n" +
       // vulkan_etc2_emulation.cc logs "ETC2/EAC emulation enabled" when it
       // emulates for a device, with "become BC1/BC3/BC4/BC5 host images" in
