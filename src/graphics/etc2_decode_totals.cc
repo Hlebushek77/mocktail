@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdarg>
 #include <cstdio>
+#include <new>
 
 namespace mocktail::graphics {
 
@@ -276,8 +277,70 @@ bool Etc2DecodeTotalsMilestone(std::uint64_t before, std::uint64_t after) {
   return false;
 }
 
+std::string FormatEtc2StallSuffix(
+    unsigned threads, bool fast_path,
+    const std::uint64_t (&source_bytes_by_type)[kEtc2CountedMemoryTypes],
+    std::uint64_t unknown_type_bytes) {
+  std::string out;
+  Append(&out, " [threads %u, path %s, src", threads,
+         fast_path ? "fast" : "legacy");
+  bool any = false;
+  for (std::size_t type = 0; type < kEtc2CountedMemoryTypes; ++type) {
+    if (source_bytes_by_type[type] != 0) {
+      Append(&out, " t%zu %.1f", type, Mebibytes(source_bytes_by_type[type]));
+      any = true;
+    }
+  }
+  if (unknown_type_bytes != 0) {
+    Append(&out, " unknown %.1f", Mebibytes(unknown_type_bytes));
+    any = true;
+  }
+  out.append(any ? " MiB]" : " - MiB]");
+  return out;
+}
+
+std::uint8_t* Etc2Scratch::Reserve(std::size_t bytes,
+                                   std::chrono::steady_clock::time_point now) {
+  last_used_ = now;
+  if (bytes <= capacity_) {
+    return data_.get();
+  }
+  // Grow by at least half, so a burst of slowly growing submits does not
+  // allocate on each one; default-initialised, so nothing is zero-filled.
+  const std::size_t grown = std::max(bytes, capacity_ + capacity_ / 2);
+  data_.reset();
+  capacity_ = 0;
+  std::uint8_t* fresh = new (std::nothrow) std::uint8_t[grown];
+  if (fresh == nullptr) {
+    fresh = new (std::nothrow) std::uint8_t[bytes];
+    if (fresh == nullptr) {
+      return nullptr;
+    }
+    capacity_ = bytes;
+  } else {
+    capacity_ = grown;
+  }
+  data_.reset(fresh);
+  return data_.get();
+}
+
+bool Etc2Scratch::ReleaseIfIdle(std::chrono::steady_clock::time_point now) {
+  if (capacity_ <= kEtc2ScratchKeepBytes ||
+      now - last_used_ < kEtc2ScratchIdleRelease) {
+    return false;
+  }
+  Release();
+  return true;
+}
+
+void Etc2Scratch::Release() {
+  data_.reset();
+  capacity_ = 0;
+}
+
 void ReleaseOversizedEtc2Scratch(std::vector<std::uint8_t>* scratch) {
-  if (scratch != nullptr && scratch->capacity() > kEtc2ScratchKeepBytes) {
+  if (scratch != nullptr &&
+      scratch->capacity() > kEtc2LegacyScratchKeepBytes) {
     std::vector<std::uint8_t>().swap(*scratch);
   }
 }

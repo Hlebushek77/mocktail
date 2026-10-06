@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cstdint>
 #include <vector>
 
@@ -51,17 +52,68 @@ TEST(Etc2DecodeTotalsTest, ReportsAtSixtyFourMebibytesAndEachDoubling) {
   EXPECT_FALSE(Etc2DecodeTotalsMilestone(UINT64_MAX - 1, UINT64_MAX));
 }
 
-TEST(Etc2DecodeTotalsTest, GivesBackScratchLargerThanTheKeepSize) {
-  std::vector<std::uint8_t> kept(kEtc2ScratchKeepBytes);
+// MOCKTAIL_ETC2_FAST_PATH=0 keeps plus.1's policy: above 32 MiB the
+// scratch goes after every submit.
+TEST(Etc2DecodeTotalsTest, LegacyPathGivesBackScratchLargerThanTheKeepSize) {
+  std::vector<std::uint8_t> kept(kEtc2LegacyScratchKeepBytes);
   ReleaseOversizedEtc2Scratch(&kept);
-  EXPECT_EQ(kept.size(), kEtc2ScratchKeepBytes);
+  EXPECT_EQ(kept.size(), kEtc2LegacyScratchKeepBytes);
 
-  std::vector<std::uint8_t> burst(kEtc2ScratchKeepBytes + 1);
+  std::vector<std::uint8_t> burst(kEtc2LegacyScratchKeepBytes + 1);
   ReleaseOversizedEtc2Scratch(&burst);
   EXPECT_TRUE(burst.empty());
   EXPECT_EQ(burst.capacity(), 0U);
 
   ReleaseOversizedEtc2Scratch(nullptr);
+}
+
+// The fast path keeps its scratch through a burst and gives back anything
+// above 64 MiB only after 5 s without a submit that used it.
+TEST(Etc2DecodeTotalsTest, ScratchGrowsOnceAndGoesAfterFiveIdleSeconds) {
+  using std::chrono::milliseconds;
+  using std::chrono::seconds;
+  const std::chrono::steady_clock::time_point start{seconds(1000)};
+  Etc2Scratch scratch;
+  EXPECT_EQ(scratch.capacity(), 0U);
+  std::uint8_t* first = scratch.Reserve(1000, start);
+  ASSERT_NE(first, nullptr);
+  EXPECT_EQ(scratch.capacity(), 1000U);
+  first[999] = 7;  // writable
+  EXPECT_EQ(scratch.Reserve(10, start), first) << "no shrinking";
+  // Growth is by half at least, so 1001 bytes get 1500.
+  EXPECT_NE(scratch.Reserve(1001, start), nullptr);
+  EXPECT_EQ(scratch.capacity(), 1500U);
+  // Small scratch stays for good.
+  EXPECT_FALSE(scratch.ReleaseIfIdle(start + seconds(3600)));
+  EXPECT_EQ(scratch.capacity(), 1500U);
+
+  const std::size_t burst = kEtc2ScratchKeepBytes + 4096;
+  ASSERT_NE(scratch.Reserve(burst, start), nullptr);
+  EXPECT_EQ(scratch.capacity(), burst);
+  // Every submit of the burst marks it used again.
+  scratch.MarkUsed(start + seconds(3));
+  EXPECT_FALSE(scratch.ReleaseIfIdle(start + seconds(7)));
+  EXPECT_FALSE(scratch.ReleaseIfIdle(start + seconds(8) - milliseconds(1)));
+  EXPECT_EQ(scratch.capacity(), burst);
+  EXPECT_TRUE(scratch.ReleaseIfIdle(start + seconds(8)));
+  EXPECT_EQ(scratch.capacity(), 0U);
+  EXPECT_FALSE(scratch.ReleaseIfIdle(start + seconds(60)));
+  ASSERT_NE(scratch.Reserve(64, start + seconds(61)), nullptr);
+  scratch.Release();
+  EXPECT_EQ(scratch.capacity(), 0U);
+}
+
+TEST(Etc2DecodeTotalsTest, FormatsTheStallLineSuffix) {
+  std::uint64_t by_type[kEtc2CountedMemoryTypes] = {};
+  EXPECT_EQ(FormatEtc2StallSuffix(1, false, by_type, 0),
+            " [threads 1, path legacy, src - MiB]");
+  by_type[3] = 51065651;  // 48.7 MiB
+  by_type[4] = 314573;  // 0.3 MiB
+  EXPECT_EQ(FormatEtc2StallSuffix(8, true, by_type, 0),
+            " [threads 8, path fast, src t3 48.7 t4 0.3 MiB]");
+  by_type[4] = 0;
+  EXPECT_EQ(FormatEtc2StallSuffix(4, true, by_type, 3 * kMiB),
+            " [threads 4, path fast, src t3 48.7 unknown 3.0 MiB]");
 }
 
 TEST(Etc2DecodeTotalsTest, NamesEveryCpuRouteReason) {

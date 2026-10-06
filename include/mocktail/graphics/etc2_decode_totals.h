@@ -1,8 +1,10 @@
 #ifndef MOCKTAIL_GRAPHICS_ETC2_DECODE_TOTALS_H_
 #define MOCKTAIL_GRAPHICS_ETC2_DECODE_TOTALS_H_
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -144,12 +146,53 @@ std::string FormatEtc2Window(const Etc2DecodeTotals& window);
 // its totals a few times.
 bool Etc2DecodeTotalsMilestone(std::uint64_t before, std::uint64_t after);
 
-// Decoding works in one scratch pair sized to the whole submit, and a
-// loading burst can put hundreds of MiB into a single submit. Scratch up to
-// this size stays for the next submit; anything larger is given back.
-inline constexpr std::size_t kEtc2ScratchKeepBytes = 32U * 1024U * 1024U;
+// " [threads 8, path fast, src t3 48.7 t4 0.3 MiB]": what the CPU route's
+// stall line appends after its phase breakdown (DESIGN C7). Memory types
+// without bytes are left out; "src - MiB" when none was known.
+std::string FormatEtc2StallSuffix(
+    unsigned threads, bool fast_path,
+    const std::uint64_t (&source_bytes_by_type)[kEtc2CountedMemoryTypes],
+    std::uint64_t unknown_type_bytes);
 
-// Frees `scratch` when it holds more than kEtc2ScratchKeepBytes.
+// The CPU route's decode scratch: a loading burst can put hundreds of MiB
+// into a single submit. It grows as needed, uninitialised (a fresh
+// value-initialised std::vector costs 3.6 ms at 49 MiB and 25 ms at 350 MiB
+// of zero-filling and page faults inside Roblox's vkQueueSubmit), and is
+// given back once it is larger than kEtc2ScratchKeepBytes and has not been
+// used for kEtc2ScratchIdleRelease. plus.1 gave anything above 32 MiB back
+// after every submit, so every submit of a burst paid the allocation again.
+inline constexpr std::size_t kEtc2ScratchKeepBytes = 64U * 1024U * 1024U;
+inline constexpr std::chrono::steady_clock::duration kEtc2ScratchIdleRelease =
+    std::chrono::seconds(5);
+
+class Etc2Scratch {
+ public:
+  // At least `bytes` of scratch with undefined contents, or null when the
+  // memory cannot be had; marks the buffer used at `now`.
+  std::uint8_t* Reserve(std::size_t bytes,
+                        std::chrono::steady_clock::time_point now);
+  void MarkUsed(std::chrono::steady_clock::time_point now) {
+    last_used_ = now;
+  }
+  // Frees the buffer when it is larger than kEtc2ScratchKeepBytes and was
+  // last used kEtc2ScratchIdleRelease or more before `now`. True if freed.
+  bool ReleaseIfIdle(std::chrono::steady_clock::time_point now);
+  void Release();
+  std::size_t capacity() const { return capacity_; }
+
+ private:
+  std::unique_ptr<std::uint8_t[]> data_;
+  std::size_t capacity_ = 0;
+  std::chrono::steady_clock::time_point last_used_{};
+};
+
+// MOCKTAIL_ETC2_FAST_PATH=0 only (plus.1's policy, kept for the same-build
+// A/B until the legacy path goes): scratch vectors larger than this are
+// given back after every submit.
+inline constexpr std::size_t kEtc2LegacyScratchKeepBytes =
+    32U * 1024U * 1024U;
+
+// Frees `scratch` when it holds more than kEtc2LegacyScratchKeepBytes.
 void ReleaseOversizedEtc2Scratch(std::vector<std::uint8_t>* scratch);
 
 }  // namespace mocktail::graphics
