@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 
 namespace mocktail::graphics::testing {
 namespace {
@@ -123,6 +124,75 @@ std::string VersionText(std::uint32_t vendor, std::uint32_t version) {
   return text;
 }
 
+std::mutex& ValidationMutex() {
+  static auto* mutex = new std::mutex;
+  return *mutex;
+}
+
+std::vector<std::string>& ValidationMessages() {
+  static auto* messages = new std::vector<std::string>;
+  return *messages;
+}
+
+VKAPI_ATTR VkBool32 VKAPI_CALL
+CollectValidation(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
+                  VkDebugUtilsMessageTypeFlagsEXT types,
+                  const VkDebugUtilsMessengerCallbackDataEXT* data, void*) {
+  if ((types & VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT) == 0 ||
+      severity < VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT ||
+      data == nullptr) {
+    return VK_FALSE;
+  }
+  std::string message =
+      severity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT ? "ERROR "
+                                                                : "WARNING ";
+  message += data->pMessageIdName != nullptr ? data->pMessageIdName : "?";
+  message += ": ";
+  message += data->pMessage != nullptr ? data->pMessage : "";
+  std::lock_guard<std::mutex> lock(ValidationMutex());
+  ValidationMessages().push_back(std::move(message));
+  return VK_FALSE;
+}
+
+bool HasLayer(PFN_vkGetInstanceProcAddr get_instance_proc_addr,
+              const char* name) {
+  auto enumerate = reinterpret_cast<PFN_vkEnumerateInstanceLayerProperties>(
+      get_instance_proc_addr(VK_NULL_HANDLE,
+                             "vkEnumerateInstanceLayerProperties"));
+  std::uint32_t count = 0;
+  if (enumerate == nullptr || enumerate(&count, nullptr) != VK_SUCCESS) {
+    return false;
+  }
+  std::vector<VkLayerProperties> layers(count);
+  enumerate(&count, layers.data());
+  layers.resize(count);
+  return std::any_of(layers.begin(), layers.end(),
+                     [name](const VkLayerProperties& layer) {
+                       return std::strcmp(layer.layerName, name) == 0;
+                     });
+}
+
+bool LayerHasExtension(PFN_vkGetInstanceProcAddr get_instance_proc_addr,
+                       const char* layer, const char* extension) {
+  auto enumerate =
+      reinterpret_cast<PFN_vkEnumerateInstanceExtensionProperties>(
+          get_instance_proc_addr(VK_NULL_HANDLE,
+                                 "vkEnumerateInstanceExtensionProperties"));
+  std::uint32_t count = 0;
+  if (enumerate == nullptr ||
+      enumerate(layer, &count, nullptr) != VK_SUCCESS) {
+    return false;
+  }
+  std::vector<VkExtensionProperties> extensions(count);
+  enumerate(layer, &count, extensions.data());
+  extensions.resize(count);
+  return std::any_of(extensions.begin(), extensions.end(),
+                     [extension](const VkExtensionProperties& candidate) {
+                       return std::strcmp(candidate.extensionName,
+                                          extension) == 0;
+                     });
+}
+
 }  // namespace
 
 bool LiveGameRunning(std::string* description) {
@@ -155,6 +225,11 @@ bool LiveGameRunning(std::string* description) {
 
 std::unique_ptr<HeadlessVulkanDevice> HeadlessVulkanDevice::Create(
     std::string* skip_reason) {
+  return Create(skip_reason, Options());
+}
+
+std::unique_ptr<HeadlessVulkanDevice> HeadlessVulkanDevice::Create(
+    std::string* skip_reason, const Options& options) {
   std::string why;
   std::string live;
   if (LiveGameRunning(&live)) {
@@ -192,12 +267,75 @@ std::unique_ptr<HeadlessVulkanDevice> HeadlessVulkanDevice::Create(
   VkInstanceCreateInfo instance_info{};
   instance_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
   instance_info.pApplicationInfo = &application;
+  // MOCKTAIL_TEST_VALIDATION: the Khronos layer, enabled here rather than
+  // through VK_INSTANCE_LAYERS, so the messenger below sees every message.
+  constexpr const char* kValidationLayer = "VK_LAYER_KHRONOS_validation";
+  const char* validation = std::getenv("MOCKTAIL_TEST_VALIDATION");
+  const bool validate = validation != nullptr && validation[0] != '\0' &&
+                        std::strcmp(validation, "0") != 0;
+  const bool validate_sync =
+      validate && std::strcmp(validation, "core") != 0;
+  std::vector<const char*> instance_extensions;
+  VkValidationFeatureEnableEXT sync_feature =
+      VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT;
+  VkValidationFeaturesEXT features{};
+  features.sType = VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT;
+  if (validate) {
+    if (!HasLayer(get_instance_proc_addr, kValidationLayer) ||
+        !LayerHasExtension(get_instance_proc_addr, kValidationLayer,
+                           VK_EXT_DEBUG_UTILS_EXTENSION_NAME)) {
+      *skip_reason =
+          "MOCKTAIL_TEST_VALIDATION is set, but VK_LAYER_KHRONOS_validation "
+          "(with VK_EXT_debug_utils) is not installed";
+      return nullptr;
+    }
+    instance_info.enabledLayerCount = 1;
+    instance_info.ppEnabledLayerNames = &kValidationLayer;
+    instance_extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+    if (validate_sync) {
+      if (LayerHasExtension(get_instance_proc_addr, kValidationLayer,
+                            VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME)) {
+        instance_extensions.push_back(
+            VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME);
+      }
+      features.enabledValidationFeatureCount = 1;
+      features.pEnabledValidationFeatures = &sync_feature;
+      instance_info.pNext = &features;
+    }
+    instance_info.enabledExtensionCount =
+        static_cast<std::uint32_t>(instance_extensions.size());
+    instance_info.ppEnabledExtensionNames = instance_extensions.data();
+  }
   const VkResult instance_result =
       create_instance(&instance_info, nullptr, &device->instance_);
   if (instance_result != VK_SUCCESS) {
     *skip_reason = "no Vulkan driver: vkCreateInstance returned " +
                    std::to_string(instance_result);
     return nullptr;
+  }
+  if (validate) {
+    auto create_messenger =
+        reinterpret_cast<PFN_vkCreateDebugUtilsMessengerEXT>(
+            get_instance_proc_addr(device->instance_,
+                                   "vkCreateDebugUtilsMessengerEXT"));
+    VkDebugUtilsMessengerCreateInfoEXT messenger_info{};
+    messenger_info.sType =
+        VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;
+    messenger_info.messageSeverity =
+        VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
+        VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+    messenger_info.messageType =
+        VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
+        VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+        VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
+    messenger_info.pfnUserCallback = CollectValidation;
+    if (create_messenger == nullptr ||
+        create_messenger(device->instance_, &messenger_info, nullptr,
+                         &device->messenger_) != VK_SUCCESS) {
+      *skip_reason = "could not create a VK_EXT_debug_utils messenger";
+      return nullptr;
+    }
+    device->sync_validation_ = validate_sync;
   }
   Dispatch& vk = device->vk_;
 #define MOCKTAIL_VULKAN_TEST_LOAD(name)                  \
@@ -271,6 +409,24 @@ std::unique_ptr<HeadlessVulkanDevice> HeadlessVulkanDevice::Create(
     return nullptr;
   }
   device->queue_family_ = family;
+  for (std::uint32_t index = 0; index < count; ++index) {
+    const VkQueueFlags flags = device->queue_families_[index].queueFlags;
+    if (index == family || device->queue_families_[index].queueCount == 0) {
+      continue;
+    }
+    if (options.compute_only_family &&
+        device->compute_only_family_ == UINT32_MAX &&
+        (flags & VK_QUEUE_COMPUTE_BIT) != 0 &&
+        (flags & VK_QUEUE_GRAPHICS_BIT) == 0) {
+      device->compute_only_family_ = index;
+    }
+    if (options.transfer_only_family &&
+        device->transfer_only_family_ == UINT32_MAX &&
+        (flags & VK_QUEUE_TRANSFER_BIT) != 0 &&
+        (flags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) == 0) {
+      device->transfer_only_family_ = index;
+    }
+  }
 
   std::vector<const char*> extensions;
   const std::uint32_t device_api =
@@ -307,17 +463,34 @@ std::unique_ptr<HeadlessVulkanDevice> HeadlessVulkanDevice::Create(
     vulkan13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
     vulkan13.synchronization2 = synchronization2 ? VK_TRUE : VK_FALSE;
   }
-  const float priority = 0.0f;  // stay out of the desktop's way
-  VkDeviceQueueCreateInfo queue_info{};
-  queue_info.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-  queue_info.queueFamilyIndex = family;
-  queue_info.queueCount = 1;
-  queue_info.pQueuePriorities = &priority;
+  // Low priority: stay out of the desktop's way.
+  const std::uint32_t main_queues = std::max<std::uint32_t>(
+      1, std::min(options.queue_count,
+                  device->queue_families_[family].queueCount));
+  const std::vector<float> priorities(main_queues, 0.0f);
+  std::vector<VkDeviceQueueCreateInfo> queue_infos;
+  const auto add_family = [&](std::uint32_t queue_family,
+                              std::uint32_t queues) {
+    VkDeviceQueueCreateInfo queue_info{};
+    queue_info.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+    queue_info.queueFamilyIndex = queue_family;
+    queue_info.queueCount = queues;
+    queue_info.pQueuePriorities = priorities.data();
+    queue_infos.push_back(queue_info);
+  };
+  add_family(family, main_queues);
+  for (const std::uint32_t extra :
+       {device->compute_only_family_, device->transfer_only_family_}) {
+    if (extra != UINT32_MAX) {
+      add_family(extra, 1);
+    }
+  }
   VkDeviceCreateInfo device_info{};
   device_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
   device_info.pNext = synchronization2 ? &vulkan13 : nullptr;
-  device_info.queueCreateInfoCount = 1;
-  device_info.pQueueCreateInfos = &queue_info;
+  device_info.queueCreateInfoCount =
+      static_cast<std::uint32_t>(queue_infos.size());
+  device_info.pQueueCreateInfos = queue_infos.data();
   device_info.enabledExtensionCount =
       static_cast<std::uint32_t>(extensions.size());
   device_info.ppEnabledExtensionNames = extensions.data();
@@ -342,8 +515,34 @@ std::unique_ptr<HeadlessVulkanDevice> HeadlessVulkanDevice::Create(
     vk.vkQueueSubmit2 = reinterpret_cast<PFN_vkQueueSubmit2>(
         vk.vkGetDeviceProcAddr(device->device_, "vkQueueSubmit2"));
   }
-  vk.vkGetDeviceQueue(device->device_, family, 0, &device->queue_);
+  for (const VkDeviceQueueCreateInfo& queue_info : queue_infos) {
+    for (std::uint32_t index = 0; index < queue_info.queueCount; ++index) {
+      VkQueue queue = VK_NULL_HANDLE;
+      vk.vkGetDeviceQueue(device->device_, queue_info.queueFamilyIndex, index,
+                          &queue);
+      device->queues_.push_back(
+          {{queue_info.queueFamilyIndex, index}, queue});
+    }
+  }
+  device->queue_ = device->Queue(family, 0);
   return device;
+}
+
+VkQueue HeadlessVulkanDevice::Queue(std::uint32_t family,
+                                    std::uint32_t index) const {
+  for (const auto& [key, queue] : queues_) {
+    if (key.first == family && key.second == index) {
+      return queue;
+    }
+  }
+  return VK_NULL_HANDLE;
+}
+
+std::vector<std::string> HeadlessVulkanDevice::TakeValidationMessages() {
+  std::lock_guard<std::mutex> lock(ValidationMutex());
+  std::vector<std::string> messages;
+  messages.swap(ValidationMessages());
+  return messages;
 }
 
 HeadlessVulkanDevice::~HeadlessVulkanDevice() {
@@ -355,6 +554,15 @@ HeadlessVulkanDevice::~HeadlessVulkanDevice() {
       vk_.vkDestroyDevice(device_, nullptr);
     }
   }
+  if (messenger_ != VK_NULL_HANDLE) {
+    auto destroy_messenger =
+        reinterpret_cast<PFN_vkDestroyDebugUtilsMessengerEXT>(
+            get_instance_proc_addr_(instance_,
+                                    "vkDestroyDebugUtilsMessengerEXT"));
+    if (destroy_messenger != nullptr) {
+      destroy_messenger(instance_, messenger_, nullptr);
+    }
+  }
   if (instance_ != VK_NULL_HANDLE && vk_.vkDestroyInstance != nullptr) {
     vk_.vkDestroyInstance(instance_, nullptr);
   }
@@ -364,7 +572,10 @@ std::string HeadlessVulkanDevice::Describe() const {
   return std::string(properties_.deviceName) + " (driver " +
          VersionText(properties_.vendorID, properties_.driverVersion) +
          ", Vulkan " + VersionText(0, properties_.apiVersion) + "), family " +
-         std::to_string(queue_family_);
+         std::to_string(queue_family_) +
+         (validating() ? (sync_validation_ ? ", validation with sync"
+                                           : ", validation")
+                       : "");
 }
 
 std::uint32_t HeadlessVulkanDevice::FindMemoryType(

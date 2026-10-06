@@ -26,7 +26,11 @@ namespace {
 class GpuDeviceTest : public ::testing::Test {
  protected:
   static void SetUpTestSuite() {
-    device_ = HeadlessVulkanDevice::Create(&skip_reason_).release();
+    HeadlessVulkanDevice::Options options;
+    options.queue_count = 2;
+    options.compute_only_family = true;
+    options.transfer_only_family = true;
+    device_ = HeadlessVulkanDevice::Create(&skip_reason_, options).release();
     if (device_ != nullptr) {
       std::printf("GPU: %s\n", device_->Describe().c_str());
     }
@@ -38,6 +42,17 @@ class GpuDeviceTest : public ::testing::Test {
   void SetUp() override {
     if (device_ == nullptr) {
       GTEST_SKIP() << skip_reason_;
+    }
+    device_->TakeValidationMessages();
+  }
+  // With MOCKTAIL_TEST_VALIDATION, every validation message fails the test
+  // that caused it.
+  void TearDown() override {
+    if (device_ == nullptr) {
+      return;
+    }
+    for (const std::string& message : device_->TakeValidationMessages()) {
+      ADD_FAILURE() << "validation: " << message;
     }
   }
 

@@ -816,6 +816,25 @@ add_executable(etc2_cpu_perf etc2_cpu_perf.cc)
 target_link_libraries(etc2_cpu_perf PRIVATE mocktail_etc2_test_support)
 mocktail_apply_compile_options(etc2_cpu_perf)
 
+# The GPU route on a real device (plus.2 WP2): the decode shader against the
+# CPU decoder, and the integration's batch shape.
+add_executable(etc2_gpu_parity_test etc2_gpu_parity_test.cc)
+target_include_directories(etc2_gpu_parity_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/graphics
+)
+target_link_libraries(etc2_gpu_parity_test PRIVATE
+  mocktail_etc2_test_support
+  GTest::gtest_main
+)
+mocktail_apply_compile_options(etc2_gpu_parity_test)
+
+add_executable(etc2_gpu_route_test etc2_gpu_route_test.cc)
+target_link_libraries(etc2_gpu_route_test PRIVATE
+  mocktail_etc2_test_support
+  GTest::gtest_main
+)
+mocktail_apply_compile_options(etc2_gpu_route_test)
+
 add_executable(video_driver_policy_test
   video_driver_policy_test.cc
 )
@@ -1374,6 +1393,8 @@ add_test(NAME etc2_shader_header_test
 # Real GPU: skipped without a loader, driver or device, and while a live game
 # runs (CR-25). Hold these back with -LE gpu while a live measurement runs.
 gtest_discover_tests(etc2_emulation_gpu_test PROPERTIES LABELS gpu)
+gtest_discover_tests(etc2_gpu_parity_test PROPERTIES LABELS gpu)
+gtest_discover_tests(etc2_gpu_route_test PROPERTIES LABELS gpu)
 # Without a driver every GPU test must skip rather than fail.
 add_test(NAME Etc2EmulationGpuTest.SkipsWithoutAVulkanDriver
   COMMAND etc2_emulation_gpu_test
@@ -1395,6 +1416,21 @@ set_tests_properties(Etc2EmulationGpuTest.ValidationLayerReportsNothing
   PASS_REGULAR_EXPRESSION "\\[  PASSED  \\] [0-9]+ tests?\\."
   FAIL_REGULAR_EXPRESSION "Validation (Error|Warning)|\\[  FAILED  \\]"
 )
+# Every GPU test again under the Khronos layer with synchronization
+# validation (MOCKTAIL_TEST_VALIDATION=sync, plus.2 WP2): the test device
+# enables the layer and VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION
+# itself, and each validation message fails the test that caused it. A
+# control test checks that a missing barrier is reported. Without the layer
+# the tests skip. Only these: work/ctest.sh <build> <home> -L validation
+foreach(gpu_test etc2_emulation_gpu_test etc2_gpu_parity_test
+                 etc2_gpu_route_test)
+  add_test(NAME ${gpu_test}.SyncValidation COMMAND ${gpu_test})
+  set_tests_properties(${gpu_test}.SyncValidation PROPERTIES
+    LABELS "gpu;validation"
+    ENVIRONMENT "MOCKTAIL_TEST_VALIDATION=sync"
+    FAIL_REGULAR_EXPRESSION "\\[  FAILED  \\]"
+  )
+endforeach()
 gtest_discover_tests(video_driver_policy_test)
 gtest_discover_tests(wayland_global_probe_test)
 gtest_discover_tests(wayland_surface_commit_guard_test)
