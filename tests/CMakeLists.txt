@@ -680,6 +680,84 @@ target_link_libraries(vulkan_etc2_diagnostics_test PRIVATE
 )
 mocktail_apply_compile_options(vulkan_etc2_diagnostics_test)
 
+# ETC2/EAC emulation harnesses (plus.2 WP0T): the reference decoder and
+# resampler, the GPU-free fake device with the golden scenarios, and the
+# headless real-GPU tests. The emulation is compiled here directly, without
+# the stub libvulkan; the GPU tests open the system loader with dlopen.
+add_library(mocktail_etc2_emulation_for_tests STATIC
+  ${PROJECT_SOURCE_DIR}/src/graphics/vulkan_etc2_emulation.cc
+  ${PROJECT_SOURCE_DIR}/src/graphics/vulkan_etc2_planning.cc
+  ${PROJECT_SOURCE_DIR}/src/graphics/chunk_arena.cc
+  ${PROJECT_SOURCE_DIR}/src/graphics/etc2_decode_totals.cc
+  ${PROJECT_SOURCE_DIR}/src/graphics/etc2_decoder.cc
+  ${PROJECT_SOURCE_DIR}/src/graphics/texture_override.cc
+)
+target_include_directories(mocktail_etc2_emulation_for_tests PUBLIC
+  ${PROJECT_SOURCE_DIR}/include
+)
+target_compile_definitions(mocktail_etc2_emulation_for_tests PUBLIC
+  VK_NO_PROTOTYPES
+)
+target_link_libraries(mocktail_etc2_emulation_for_tests PUBLIC
+  Vulkan::Headers
+  PkgConfig::LIBPNG
+  Threads::Threads
+)
+mocktail_apply_compile_options(mocktail_etc2_emulation_for_tests)
+
+add_library(mocktail_etc2_test_support STATIC
+  support/etc2_reference_decoder.cc
+  support/resample_reference.cc
+  support/fake_vulkan_device.cc
+  support/etc2_emulation_scenarios.cc
+  support/etc2_emulation_harness.cc
+  support/vulkan_test_device.cc
+  support/etc2_gpu_backend.cc
+)
+target_include_directories(mocktail_etc2_test_support PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}
+)
+target_link_libraries(mocktail_etc2_test_support PUBLIC
+  mocktail_etc2_emulation_for_tests
+  ${CMAKE_DL_LIBS}
+)
+mocktail_apply_compile_options(mocktail_etc2_test_support)
+
+add_executable(etc2_decoder_test etc2_decoder_test.cc)
+target_link_libraries(etc2_decoder_test PRIVATE
+  mocktail_etc2_test_support
+  GTest::gtest_main
+)
+mocktail_apply_compile_options(etc2_decoder_test)
+
+add_executable(resample_rgba_test resample_rgba_test.cc)
+target_link_libraries(resample_rgba_test PRIVATE
+  mocktail_etc2_test_support
+  GTest::gtest_main
+)
+mocktail_apply_compile_options(resample_rgba_test)
+
+add_executable(vulkan_etc2_planning_test vulkan_etc2_planning_test.cc)
+target_link_libraries(vulkan_etc2_planning_test PRIVATE
+  mocktail_etc2_emulation_for_tests
+  GTest::gtest_main
+)
+mocktail_apply_compile_options(vulkan_etc2_planning_test)
+
+add_executable(vulkan_etc2_emulation_test vulkan_etc2_emulation_test.cc)
+target_link_libraries(vulkan_etc2_emulation_test PRIVATE
+  mocktail_etc2_test_support
+  GTest::gtest_main
+)
+mocktail_apply_compile_options(vulkan_etc2_emulation_test)
+
+add_executable(etc2_emulation_gpu_test etc2_emulation_gpu_test.cc)
+target_link_libraries(etc2_emulation_gpu_test PRIVATE
+  mocktail_etc2_test_support
+  GTest::gtest_main
+)
+mocktail_apply_compile_options(etc2_emulation_gpu_test)
+
 add_executable(video_driver_policy_test
   video_driver_policy_test.cc
 )
@@ -1221,6 +1299,34 @@ gtest_discover_tests(vulkan_text_overlay_compositor_test)
 gtest_discover_tests(etc2_decode_totals_test)
 gtest_discover_tests(chunk_arena_test)
 gtest_discover_tests(vulkan_etc2_diagnostics_test)
+gtest_discover_tests(etc2_decoder_test)
+gtest_discover_tests(resample_rgba_test)
+gtest_discover_tests(vulkan_etc2_planning_test)
+gtest_discover_tests(vulkan_etc2_emulation_test)
+# Real GPU: skipped without a loader, driver or device, and while a live game
+# runs (CR-25). Hold these back with -LE gpu while a live measurement runs.
+gtest_discover_tests(etc2_emulation_gpu_test PROPERTIES LABELS gpu)
+# Without a driver every GPU test must skip rather than fail.
+add_test(NAME Etc2EmulationGpuTest.SkipsWithoutAVulkanDriver
+  COMMAND etc2_emulation_gpu_test
+)
+set_tests_properties(Etc2EmulationGpuTest.SkipsWithoutAVulkanDriver PROPERTIES
+  ENVIRONMENT "VK_ICD_FILENAMES=/nonexistent;VK_DRIVER_FILES=/nonexistent"
+  PASS_REGULAR_EXPRESSION "\\[  SKIPPED \\] [0-9]+ tests?, listed below"
+  FAIL_REGULAR_EXPRESSION "\\[  FAILED  \\]|\\[  PASSED  \\] [1-9]"
+)
+# The same tests under the Khronos validation layer: it must report nothing.
+# Without the layer (or a GPU) every test skips and this passes.
+add_test(NAME Etc2EmulationGpuTest.ValidationLayerReportsNothing
+  COMMAND etc2_emulation_gpu_test
+)
+set_tests_properties(Etc2EmulationGpuTest.ValidationLayerReportsNothing
+  PROPERTIES
+  LABELS gpu
+  ENVIRONMENT "VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation"
+  PASS_REGULAR_EXPRESSION "\\[  PASSED  \\] [0-9]+ tests?\\."
+  FAIL_REGULAR_EXPRESSION "Validation (Error|Warning)|\\[  FAILED  \\]"
+)
 gtest_discover_tests(video_driver_policy_test)
 gtest_discover_tests(wayland_global_probe_test)
 gtest_discover_tests(wayland_surface_commit_guard_test)
