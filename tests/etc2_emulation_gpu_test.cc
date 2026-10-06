@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include "mocktail/graphics/vulkan_etc2_gpu.h"
 #include "support/etc2_emulation_harness.h"
 #include "support/etc2_emulation_scenarios.h"
 #include "support/etc2_gpu_backend.h"
@@ -16,7 +17,8 @@
 // VulkanEtc2Emulation on a VkDevice from the system loader, the host images
 // are read back and must equal both the reference model and the golden
 // hashes the fake device produces. The runner's default options pin the
-// CPU route (gpu = false); the GPU route gets its own run when it exists.
+// CPU route (gpu = false); the GPU route and its rescue get runs of their
+// own.
 // The tests skip without a loader, driver or device, and while a live
 // Mocktail or Sober session runs (CR-25).
 
@@ -194,6 +196,42 @@ TEST_P(Etc2EmulationGpuTest, GpuRouteMatchesCpuRouteAndGolden) {
     EXPECT_EQ(run.gpu_stats.passes, 0U);
   }
   EXPECT_EQ(run.gpu_stats.rescues, 0U);
+  EXPECT_EQ(run.gpu_stats.dropped_uploads, 0U);
+}
+
+// [CR-7] The same with no slot ever free after the warm-up: every batch's
+// GPU-route uploads are decoded by the rescue's CPU half into host staging
+// and copied into the arena by the reserved rescue slot, which must leave
+// the same texels again.
+TEST_P(Etc2EmulationGpuTest, RescuedGpuRouteMatchesCpuRouteAndGolden) {
+  const Scenario* scenario = FindEtc2EmulationScenario(GetParam());
+  ASSERT_NE(scenario, nullptr);
+  Etc2GpuBackend backend(device_);
+  ScenarioOptions options;
+  options.emulation.gpu = true;
+  options.after_warm_up = [] { Etc2GpuTesting().fail_slot_acquire = true; };
+  const ScenarioRun run = RunEtc2Scenario(*scenario, &backend, options);
+  Etc2GpuTesting().fail_slot_acquire = false;
+  if (run.skipped) {
+    GTEST_SKIP() << run.skip_reason;
+  }
+  for (const std::string& failure : run.failures) {
+    ADD_FAILURE() << failure;
+  }
+  std::uint64_t golden = 0;
+  ASSERT_TRUE(FindEtc2EmulationGolden(scenario->name, &golden));
+  EXPECT_EQ(run.hash, golden)
+      << "the rescue's host images differ from the CPU route's; this run "
+         "gives "
+      << GoldenLine(scenario->name, run.hash);
+  if (!scenario->emulated) {
+    return;
+  }
+  ASSERT_TRUE(run.gpu_route);
+  if (GpuRouteServes(*device_, *scenario)) {
+    EXPECT_GT(run.gpu_stats.rescues, 0U) << "no upload was rescued";
+    EXPECT_EQ(run.gpu_stats.rescues, run.gpu_stats.passes);
+  }
   EXPECT_EQ(run.gpu_stats.dropped_uploads, 0U);
 }
 

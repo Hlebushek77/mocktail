@@ -193,6 +193,9 @@ struct ScenarioOptions {
   // With emulation.gpu: wait for the GPU route's pipelines, then run its
   // selftest with empty submits, so that every upload can take the route.
   bool wait_for_gpu_route = true;
+  // After that warm-up (or where it would be), before the first step: for
+  // test hooks that must not touch the selftest.
+  std::function<void()> after_warm_up;
 };
 
 struct ScenarioRun {

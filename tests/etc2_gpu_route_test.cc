@@ -763,103 +763,94 @@ TEST_F(Etc2GpuRouteTest, ATransferOnlyFamilyTakesTheCpuRoute) {
   rig.Check(uploads, source->bytes, "transfer-only family");
 }
 
-// The rescue's CPU half belongs to the CPU route's staging arena (WP1);
-// here a test decoder plays it, so the transfer pass and its barrier run on
-// the real device: [CR-7] no slot comes free, the reserved rescue slot
-// carries the copy.
+// [CR-7] No slot comes free: the reserved rescue slot copies what the CPU
+// decoded into host staging (the arena's, or a one-off buffer with
+// MOCKTAIL_ETC2_FAST_PATH=0) into the output arena, and Roblox's rewritten
+// copies read it after the pass's TRANSFER->TRANSFER barrier. Whole mip
+// chains, and padded rows and layers from a source Roblox does not keep
+// mapped. With the rescue slot taken as well, the uploads are dropped:
+// counted, and the call still goes through.
 TEST_F(Etc2GpuRouteTest, ARescueWithNoSlotCopiesCpuTexelsIntoTheArena) {
-  Rig rig(device_, GpuOptions());
-  ASSERT_TRUE(rig.WarmUp(queue()));
-  std::vector<std::unique_ptr<EmulationBackend::Source>> staging;
-  std::vector<std::uint8_t> rescued_bytes;
-  {
-    Etc2GpuTestHooks& hooks = Etc2GpuTesting();
-    std::lock_guard<std::mutex> lock(hooks.mutex);
-    hooks.rescue_decode = [&](const std::vector<VkCommandBuffer>&,
-                              const std::vector<Etc2GpuUpload>& uploads,
-                              std::vector<Etc2RescueSource>* sources) {
-      VkDeviceSize total = 0;
-      for (const Etc2GpuUpload& upload : uploads) {
-        total += upload.output_bytes;
+  for (const bool fast_path : {true, false}) {
+    SCOPED_TRACE(fast_path ? "host staging arena" : "one-off staging");
+    Etc2EmulationOptions options = GpuOptions();
+    options.fast_path = fast_path;
+    Rig rig(device_, options);
+    ASSERT_TRUE(rig.WarmUp(queue()));
+    const VkCommandPool pool = rig.Pool(device_->queue_family());
+    RigImage* chain = rig.Image(VK_FORMAT_ETC2_R8G8B8_SRGB_BLOCK, 50, 30, 4);
+    RigImage* layered =
+        rig.Image(VK_FORMAT_EAC_R11G11_SNORM_BLOCK, 27, 14, 1, 2);
+    RigSource* source = rig.Source(32 * 1024, 61);
+    Etc2GpuTesting().fail_slot_acquire = true;
+    const VkCommandBuffer command_buffer = rig.Begin(pool);
+    VkDeviceSize end = 0;
+    std::vector<RigUpload> uploads =
+        rig.UploadChain(command_buffer, *chain, *source, 0, &end);
+    // Rows and layers apart in Roblox's buffer.
+    VkBufferImageCopy padded{};
+    padded.bufferOffset = end + 48;
+    padded.bufferRowLength = 27 + 13;
+    padded.bufferImageHeight = 14 + 6;
+    padded.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 2};
+    padded.imageExtent = {27, 14, 1};
+    rig.emulation().CmdCopyBufferToImage(
+        device_->device(), command_buffer, source->source.buffer,
+        layered->image, VK_IMAGE_LAYOUT_GENERAL, 1, &padded);
+    rig.End(command_buffer);
+    rig.emulation().UnmapMemory(device_->device(), source->source.memory);
+    ASSERT_EQ(rig.Submit(queue(), {{command_buffer}}, VK_NULL_HANDLE),
+              VK_SUCCESS);
+    rig.vk().vkQueueWaitIdle(queue());
+    Etc2GpuTesting().fail_slot_acquire = false;
+    Etc2GpuDevice::Stats stats = rig.gpu()->stats();
+    EXPECT_EQ(stats.rescues, 1U);
+    EXPECT_EQ(stats.rescued_uploads, uploads.size() + 1);
+    EXPECT_EQ(stats.dropped_uploads, 0U);
+    rig.Check(uploads, source->bytes, "rescue");
+    std::vector<std::vector<std::uint8_t>> texels;
+    ASSERT_TRUE(rig.backend().ReadImage(layered->image, layered->shape,
+                                        &texels));
+    const VkDeviceSize block = EtcBlockBytes(layered->etc);
+    const VkDeviceSize row_stride = ((padded.bufferRowLength + 3) / 4) * block;
+    const VkDeviceSize layer_stride =
+        row_stride * ((padded.bufferImageHeight + 3) / 4);
+    for (std::uint32_t layer = 0; layer < 2; ++layer) {
+      std::vector<std::uint8_t> packed;
+      for (std::uint32_t row = 0; row < (14 + 3) / 4; ++row) {
+        const std::uint8_t* from = source->bytes.data() + padded.bufferOffset +
+                                   layer * layer_stride + row * row_stride;
+        packed.insert(packed.end(), from, from + ((27 + 3) / 4) * block);
       }
-      auto buffer = std::make_unique<EmulationBackend::Source>();
-      if (!rig.backend().CreateSource(total, 0, buffer.get())) {
-        return false;
-      }
-      void* data = nullptr;
-      rig.vk().vkBindBufferMemory(device_->device(), buffer->buffer,
-                                  buffer->memory, 0);
-      rig.vk().vkMapMemory(device_->device(), buffer->memory, 0, VK_WHOLE_SIZE,
-                           0, &data);
-      auto* out = static_cast<std::uint8_t*>(data);
-      VkDeviceSize offset = 0;
-      for (const Etc2GpuUpload& upload : uploads) {
-        // Padded rows: whole blocks, 4 x blocks_wide texels per row.
-        const std::uint32_t width = 4 * upload.blocks_wide;
-        const std::uint32_t height = 4 * upload.blocks_high;
-        const VkDeviceSize block = EtcBlockBytes(upload.format);
-        std::vector<std::uint8_t> packed(
-            static_cast<std::size_t>(upload.blocks_wide) * upload.blocks_high *
-            block);
-        for (std::uint32_t layer = 0; layer < upload.layers; ++layer) {
-          for (std::uint32_t row = 0; row < upload.blocks_high; ++row) {
-            std::memcpy(packed.data() + row * upload.blocks_wide * block,
-                        rescued_bytes.data() + upload.source_offset +
-                            layer * upload.source_layer_stride +
-                            row * upload.source_row_stride,
-                        upload.blocks_wide * block);
-          }
-          const VkDeviceSize layer_bytes = upload.output_bytes / upload.layers;
-          DecodeEtcImage(upload.format, packed.data(), packed.size(), width,
-                         height, out + offset + layer * layer_bytes,
-                         layer_bytes);
-        }
-        sources->push_back({buffer->buffer, offset});
-        offset += upload.output_bytes;
-      }
-      rig.vk().vkUnmapMemory(device_->device(), buffer->memory);
-      staging.push_back(std::move(buffer));
-      return true;
-    };
-  }
-  const VkCommandPool pool = rig.Pool(device_->queue_family());
-  RigImage* image = rig.Image(VK_FORMAT_ETC2_R8G8B8_SRGB_BLOCK, 50, 30, 4);
-  RigSource* source = rig.Source(32 * 1024, 61);
-  rescued_bytes = source->bytes;
-  Etc2GpuTesting().fail_slot_acquire = true;
-  const VkCommandBuffer command_buffer = rig.Begin(pool);
-  const std::vector<RigUpload> uploads =
-      rig.UploadChain(command_buffer, *image, *source, 0);
-  rig.End(command_buffer);
-  ASSERT_EQ(rig.Submit(queue(), {{command_buffer}}, VK_NULL_HANDLE),
-            VK_SUCCESS);
-  rig.vk().vkQueueWaitIdle(queue());
-  const Etc2GpuDevice::Stats stats = rig.gpu()->stats();
-  EXPECT_EQ(stats.rescues, 1U);
-  EXPECT_EQ(stats.rescued_uploads, uploads.size());
-  EXPECT_EQ(stats.dropped_uploads, 0U);
-  rig.Check(uploads, source->bytes, "rescue");
+      std::vector<std::uint8_t> expected(27 * 14 *
+                                         EtcDecodedTexelBytes(layered->etc));
+      ASSERT_TRUE(DecodeEtcImage(layered->etc, packed.data(), packed.size(),
+                                 27, 14, expected.data(), expected.size()));
+      EXPECT_EQ(texels[layer], expected) << "padded rows, layer " << layer;
+    }
+    void* data = nullptr;  // mapped again, as the rig keeps it
+    ASSERT_EQ(rig.emulation().MapMemory(device_->device(),
+                                        source->source.memory, 0,
+                                        VK_WHOLE_SIZE, 0, &data),
+              VK_SUCCESS);
 
-  // Without the CPU half (today's emulation), the uploads are dropped:
-  // counted, and the call still goes through.
-  {
-    Etc2GpuTestHooks& hooks = Etc2GpuTesting();
-    std::lock_guard<std::mutex> lock(hooks.mutex);
-    hooks.rescue_decode = nullptr;
-  }
-  rig.emulation().ReleaseCommandBuffer(command_buffer);
-  rig.Restart(command_buffer, pool, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
-  rig.UploadChain(command_buffer, *image, *source, 0);
-  rig.End(command_buffer);
-  ASSERT_EQ(rig.Submit(queue(), {{command_buffer}}, VK_NULL_HANDLE),
-            VK_SUCCESS);
-  rig.vk().vkQueueWaitIdle(queue());
-  EXPECT_EQ(rig.gpu()->stats().dropped_uploads, uploads.size());
-  Etc2GpuTesting().fail_slot_acquire = false;
-  rig.Teardown();
-  for (const std::unique_ptr<EmulationBackend::Source>& buffer : staging) {
-    rig.backend().DestroyBufferDirect(buffer->buffer);
-    rig.backend().FreeMemoryDirect(buffer->memory);
+    // Neither a slot nor the rescue slot: dropped, counted, submitted.
+    rig.emulation().ReleaseCommandBuffer(command_buffer);
+    rig.Restart(command_buffer, pool,
+                VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
+    rig.UploadChain(command_buffer, *chain, *source, 0);
+    rig.End(command_buffer);
+    Etc2GpuTesting().fail_slot_acquire = true;
+    Etc2GpuTesting().fail_rescue_slot = true;
+    ASSERT_EQ(rig.Submit(queue(), {{command_buffer}}, VK_NULL_HANDLE),
+              VK_SUCCESS);
+    rig.vk().vkQueueWaitIdle(queue());
+    Etc2GpuTesting().fail_slot_acquire = false;
+    Etc2GpuTesting().fail_rescue_slot = false;
+    stats = rig.gpu()->stats();
+    EXPECT_EQ(stats.rescues, 1U);
+    EXPECT_EQ(stats.dropped_uploads, uploads.size());
+    rig.Teardown();
   }
 }
 

@@ -108,10 +108,23 @@ bool ServesOnTheGpu(const Scenario& scenario) {
   return false;
 }
 
+// How a scenario's GPU-route uploads reach the arena.
+enum class Fill {
+  kDecodePass,  // the decode pass in front of the batch
+  // [CR-7] No slot comes free after the warm-up: the reserved rescue slot
+  // copies what the CPU decoded into host staging (the arena's, or a
+  // one-off buffer with MOCKTAIL_ETC2_FAST_PATH=0).
+  kRescue,
+  kRescueLegacyStaging,
+};
+
 class Etc2GpuRouteScenarioTest
     : public ::testing::TestWithParam<std::string> {
  protected:
-  void RunAndCheck(ScenarioTeardown teardown, bool frame_stats) {
+  void TearDown() override { Etc2GpuTesting().fail_slot_acquire = false; }
+
+  void RunAndCheck(ScenarioTeardown teardown, bool frame_stats,
+                   Fill fill = Fill::kDecodePass) {
     const Scenario* scenario = FindEtc2EmulationScenario(GetParam());
     ASSERT_NE(scenario, nullptr);
     FakeVulkanDevice fake;
@@ -120,10 +133,15 @@ class Etc2GpuRouteScenarioTest
     options.teardown = teardown;
     options.emulation.gpu = true;
     options.emulation.frame_stats = frame_stats;
+    options.emulation.fast_path = fill != Fill::kRescueLegacyStaging;
     options.fake = &fake;
+    if (fill != Fill::kDecodePass) {
+      options.after_warm_up = [] { Etc2GpuTesting().fail_slot_acquire = true; };
+    }
     ::testing::internal::CaptureStderr();
     const ScenarioRun run = RunEtc2Scenario(*scenario, &backend, options);
     const std::string log = ::testing::internal::GetCapturedStderr();
+    Etc2GpuTesting().fail_slot_acquire = false;
     ASSERT_FALSE(run.skipped) << run.skip_reason;
     for (const std::string& failure : run.failures) {
       ADD_FAILURE() << failure;
@@ -144,9 +162,16 @@ class Etc2GpuRouteScenarioTest
       EXPECT_EQ(run.gpu_state, "ready") << log;
       EXPECT_GT(run.gpu_stats.passes, 0U);
       EXPECT_GT(fake.counts().decoded_blocks, 0U);
+      if (fill == Fill::kDecodePass) {
+        EXPECT_EQ(run.gpu_stats.rescues, 0U);
+      } else {
+        EXPECT_EQ(run.gpu_stats.rescues, run.gpu_stats.passes);
+        EXPECT_GT(run.gpu_stats.rescued_uploads, 0U);
+      }
     }
     EXPECT_EQ(run.gpu_stats.dropped_uploads, 0U);
     EXPECT_EQ(log.find("GPU decode unavailable"), std::string::npos) << log;
+    EXPECT_EQ(log.find("dropped GPU-route uploads"), std::string::npos) << log;
   }
 };
 
@@ -166,6 +191,21 @@ TEST_P(Etc2GpuRouteScenarioTest, DestroyPoolReleasesEverything) {
 // MOCKTAIL_FRAME_STATS the slots also have timestamp query pools.
 TEST_P(Etc2GpuRouteScenarioTest, DestroyDeviceFirstReleasesEverything) {
   RunAndCheck(ScenarioTeardown::kDestroyDeviceFirst, true);
+}
+
+// The rescue leaves the decode pass's texels, and its staging goes with
+// Roblox's command buffers (or with the device).
+TEST_P(Etc2GpuRouteScenarioTest, RescueMatchesTheGoldenHashes) {
+  RunAndCheck(ScenarioTeardown::kOrderly, false, Fill::kRescue);
+}
+
+TEST_P(Etc2GpuRouteScenarioTest, RescueWithOneOffStagingReleasesEverything) {
+  RunAndCheck(ScenarioTeardown::kResetPool, false,
+              Fill::kRescueLegacyStaging);
+}
+
+TEST_P(Etc2GpuRouteScenarioTest, RescueThenDestroyDeviceReleasesEverything) {
+  RunAndCheck(ScenarioTeardown::kDestroyDeviceFirst, true, Fill::kRescue);
 }
 
 INSTANTIATE_TEST_SUITE_P(Scenarios, Etc2GpuRouteScenarioTest,
@@ -273,7 +313,7 @@ class FakeRig {
   }
 
   RigImage* Image(VkFormat format, std::uint32_t width, std::uint32_t height,
-                  std::uint32_t mips) {
+                  std::uint32_t mips, std::uint32_t layers = 1) {
     auto image = std::make_unique<RigImage>();
     image->format = format;
     Etc2EmulatedFormat emulated;
@@ -288,7 +328,7 @@ class FakeRig {
     info.format = format;
     info.extent = {width, height, 1};
     info.mipLevels = mips;
-    info.arrayLayers = 1;
+    info.arrayLayers = layers;
     info.samples = VK_SAMPLE_COUNT_1_BIT;
     info.tiling = VK_IMAGE_TILING_OPTIMAL;
     info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
@@ -378,6 +418,17 @@ class FakeRig {
                                     static_cast<std::uint32_t>(regions.size()),
                                     regions.data());
     return regions;
+  }
+
+  // Regions as given.
+  void Upload(VkCommandBuffer command_buffer, const RigImage& image,
+              const RigSource& source,
+              const std::vector<VkBufferImageCopy>& regions) {
+    emulation_.CmdCopyBufferToImage(fake_.device(), command_buffer,
+                                    source.buffer, image.image,
+                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                    static_cast<std::uint32_t>(regions.size()),
+                                    regions.data());
   }
 
   VkResult Submit(VkQueue queue,
@@ -738,40 +789,162 @@ TEST_F(Etc2GpuRouteFakeTest, TheSlotFenceFollowsAnAppFence) {
   destroy(rig.fake().device(), second, nullptr);
 }
 
-// [CR-7] No slot and no CPU half for the rescue (the emulation's stays a
-// stub until the CPU route's staging arena exists): the uploads are
-// dropped, counted and logged, and the call itself goes through.
-TEST_F(Etc2GpuRouteFakeTest, ARescueWithoutTheCpuHalfDropsAndCounts) {
+// [CR-7] No slot comes free: the queue's reserved rescue slot copies what
+// the CPU decoded into host staging into the arena, and the rewritten copy
+// reads the right texels. A batch on a queue of another family than its
+// pool is rescued the same way. Only when the rescue slot is unavailable
+// too are the uploads dropped: counted, logged, and the call goes through.
+TEST_F(Etc2GpuRouteFakeTest, ARescueDecodesOnTheCpuIntoTheArena) {
   Etc2EmulationOptions options = GpuOptions();
-  options.frame_stats = true;  // the totals line then names the drops
+  options.frame_stats = true;  // the totals line then names the rescues
   ::testing::internal::CaptureStderr();
   {
     FakeRig rig(options);
     ASSERT_TRUE(rig.WarmUp());
     const VkCommandPool pool = rig.Pool(0);
-    RigImage* image = rig.Image(VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK, 32, 32, 1);
+    RigImage* image = rig.Image(VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK, 37, 21, 3);
     RigSource* source = rig.Source(4096, 19);
     Etc2GpuTesting().fail_slot_acquire = true;
     const VkCommandBuffer command_buffer = rig.Begin(pool);
-    rig.Upload(command_buffer, *image, *source);
+    const auto regions = rig.Upload(command_buffer, *image, *source);
     rig.End(command_buffer);
+    const std::uint64_t decoded_blocks = rig.fake().counts().decoded_blocks;
+    const std::uint64_t slots = rig.gpu()->stats().slots_created;
     EXPECT_EQ(rig.Submit(rig.queue(), {{command_buffer}}, VK_NULL_HANDLE),
               VK_SUCCESS);
-    EXPECT_EQ(rig.gpu()->stats().dropped_uploads, 1U);
-    EXPECT_EQ(rig.gpu()->stats().rescues, 0U);
-    // A batch on a queue of another family than its pool: rescued too.
+    rig.Check(*image, *source, regions);
+    EXPECT_EQ(rig.fake().counts().decoded_blocks, decoded_blocks)
+        << "no dispatch: the CPU decoded";
+    Etc2GpuDevice::Stats stats = rig.gpu()->stats();
+    EXPECT_EQ(stats.rescues, 1U);
+    EXPECT_EQ(stats.rescued_uploads, 3U);
+    EXPECT_EQ(stats.dropped_uploads, 0U);
+    EXPECT_EQ(stats.slots_created, slots + 1)
+        << "the queue's reserved rescue slot, and no other";
+
+    // A batch on a queue of another family than its pool.
     Etc2GpuTesting().fail_slot_acquire = false;
     const VkCommandBuffer elsewhere = rig.Begin(pool);
-    rig.Upload(elsewhere, *image, *source);
+    const auto elsewhere_regions = rig.Upload(elsewhere, *image, *source);
     rig.End(elsewhere);
     EXPECT_EQ(rig.Submit(rig.queue(2), {{elsewhere}}, VK_NULL_HANDLE),
               VK_SUCCESS);
-    EXPECT_EQ(rig.gpu()->stats().dropped_uploads, 2U);
+    rig.Check(*image, *source, elsewhere_regions);
+    stats = rig.gpu()->stats();
+    EXPECT_EQ(stats.rescues, 2U);
+    EXPECT_EQ(stats.rescued_uploads, 6U);
+
+    // Neither a slot nor the rescue slot: dropped.
+    Etc2GpuTesting().fail_slot_acquire = true;
+    Etc2GpuTesting().fail_rescue_slot = true;
+    const VkCommandBuffer lost = rig.Begin(pool);
+    rig.Upload(lost, *image, *source);
+    rig.End(lost);
+    EXPECT_EQ(rig.Submit(rig.queue(), {{lost}}, VK_NULL_HANDLE), VK_SUCCESS);
+    stats = rig.gpu()->stats();
+    EXPECT_EQ(stats.rescues, 2U);
+    EXPECT_EQ(stats.dropped_uploads, 3U);
+    Etc2GpuTesting().fail_slot_acquire = false;
+    Etc2GpuTesting().fail_rescue_slot = false;
+    EXPECT_TRUE(rig.fake().errors().empty()) << rig.fake().errors().front();
+    rig.Teardown();
+    ExpectEverythingReleased(rig.fake());
   }
   const std::string log = ::testing::internal::GetCapturedStderr();
   EXPECT_NE(log.find("dropped GPU-route uploads"), std::string::npos) << log;
   EXPECT_NE(log.find("another queue family"), std::string::npos) << log;
-  EXPECT_NE(log.find("rescued=0 dropped=2"), std::string::npos) << log;
+  EXPECT_NE(log.find("rescued=6 dropped=3"), std::string::npos) << log;
+}
+
+// The CPU half reads Roblox's bytes where the decode pass would: rows and
+// layers apart (bufferRowLength, bufferImageHeight), from a source Roblox
+// does not keep mapped (mapped for the submit, as on the CPU route), in
+// formats of every texel size. With MOCKTAIL_ETC2_FAST_PATH=0 its staging
+// is a one-off buffer that goes with Roblox's command buffer.
+TEST_F(Etc2GpuRouteFakeTest, ARescueReadsStridedLayeredAndUnmappedSources) {
+  for (const bool fast_path : {true, false}) {
+    SCOPED_TRACE(fast_path ? "host staging arena" : "one-off staging");
+    Etc2EmulationOptions options = GpuOptions();
+    options.fast_path = fast_path;
+    FakeRig rig(options);
+    ASSERT_TRUE(rig.WarmUp());
+    const VkCommandPool pool = rig.Pool(0);
+    RigSource* source = rig.Source(64 * 1024, 37);
+    rig.emulation().UnmapMemory(rig.fake().device(), source->memory);
+    struct Case {
+      VkFormat format;
+      std::uint32_t width;
+      std::uint32_t height;
+    };
+    const Case cases[] = {{VK_FORMAT_ETC2_R8G8B8A1_UNORM_BLOCK, 30, 18},
+                          {VK_FORMAT_EAC_R11_SNORM_BLOCK, 13, 9},
+                          {VK_FORMAT_EAC_R11G11_UNORM_BLOCK, 21, 22}};
+    for (const Case& test : cases) {
+      RigImage* image = rig.Image(test.format, test.width, test.height, 1, 2);
+      VkBufferImageCopy region{};
+      region.bufferOffset = 64;
+      region.bufferRowLength = test.width + 9;
+      region.bufferImageHeight = test.height + 6;
+      region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 2};
+      region.imageExtent = {test.width, test.height, 1};
+      Etc2GpuTesting().fail_slot_acquire = true;
+      const VkCommandBuffer command_buffer = rig.Begin(pool);
+      rig.Upload(command_buffer, *image, *source, {region});
+      rig.End(command_buffer);
+      const std::uint64_t buffers = rig.fake().counts().buffers.live();
+      const std::uint64_t unmaps = rig.fake().calls("vkUnmapMemory");
+      ASSERT_EQ(rig.Submit(rig.queue(), {{command_buffer}}, VK_NULL_HANDLE),
+                VK_SUCCESS);
+      Etc2GpuTesting().fail_slot_acquire = false;
+      EXPECT_EQ(rig.fake().calls("vkUnmapMemory"), unmaps + 1)
+          << "the source was mapped for the submit only";
+      if (!fast_path) {
+        EXPECT_EQ(rig.fake().counts().buffers.live(), buffers + 1)
+            << "the rescue's one-off staging";
+      }
+      const VkDeviceSize block = EtcBlockBytes(image->etc);
+      const std::uint32_t blocks_wide = (test.width + 3) / 4;
+      const std::uint32_t blocks_high = (test.height + 3) / 4;
+      const VkDeviceSize row_stride =
+          ((region.bufferRowLength + 3) / 4) * block;
+      const VkDeviceSize layer_stride =
+          row_stride * ((region.bufferImageHeight + 3) / 4);
+      for (std::uint32_t layer = 0; layer < 2; ++layer) {
+        std::vector<std::uint8_t> packed;
+        for (std::uint32_t row = 0; row < blocks_high; ++row) {
+          const std::uint8_t* from = source->bytes.data() +
+                                     region.bufferOffset +
+                                     layer * layer_stride + row * row_stride;
+          packed.insert(packed.end(), from, from + blocks_wide * block);
+        }
+        std::vector<std::uint8_t> expected(
+            static_cast<std::size_t>(test.width) * test.height *
+            EtcDecodedTexelBytes(image->etc));
+        ASSERT_TRUE(DecodeEtcImage(image->etc, packed.data(), packed.size(),
+                                   test.width, test.height, expected.data(),
+                                   expected.size()));
+        const std::vector<std::uint8_t>* actual =
+            rig.fake().ImageSubresource(image->image, 0, layer);
+        ASSERT_NE(actual, nullptr);
+        EXPECT_EQ(*actual, expected)
+            << "format " << test.format << " layer " << layer;
+      }
+      // Roblox resets the command buffer: the staging goes with it.
+      rig.emulation().ReleaseCommandBuffer(command_buffer);
+      if (!fast_path) {
+        EXPECT_EQ(rig.fake().counts().buffers.live(), buffers);
+      }
+    }
+    EXPECT_EQ(rig.gpu()->stats().rescued_uploads, 3U);
+    EXPECT_EQ(rig.gpu()->stats().dropped_uploads, 0U);
+    EXPECT_TRUE(rig.fake().errors().empty()) << rig.fake().errors().front();
+    void* data = nullptr;  // mapped again for the rig's teardown
+    ASSERT_EQ(rig.emulation().MapMemory(rig.fake().device(), source->memory,
+                                        0, VK_WHOLE_SIZE, 0, &data),
+              VK_SUCCESS);
+    rig.Teardown();
+    ExpectEverythingReleased(rig.fake());
+  }
 }
 
 // Nothing submitted, nothing waited for: vkDestroyDevice of a device whose

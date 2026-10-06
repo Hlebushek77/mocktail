@@ -582,6 +582,9 @@ ScenarioRun RunEtc2Scenario(const Scenario& scenario, EmulationBackend* backend,
       }
     }
   }
+  if (options.after_warm_up) {
+    options.after_warm_up();
+  }
 
   const VkImageLayout layout = VK_IMAGE_LAYOUT_GENERAL;
   for (const ScenarioStep& step : scenario.steps) {

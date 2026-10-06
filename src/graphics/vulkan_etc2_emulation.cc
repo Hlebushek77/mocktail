@@ -1383,26 +1383,17 @@ struct VulkanEtc2Emulation::State {
     info.count = [this](const std::function<void(Etc2DecodeTotals&)>& update) {
       CountTotals([&update](Etc2DecodeTotals& totals) { update(totals); });
     };
-    info.rescue_decode = [this](const std::vector<VkCommandBuffer>& buffers,
-                                const std::vector<Etc2GpuUpload>& uploads,
-                                std::vector<Etc2RescueSource>* sources) {
-      return RescueDecode(buffers, uploads, sources);
+    // The runtime is destroyed before `dev`, and calls this only from
+    // inside a submit on the device. It runs with a queue's lock of the
+    // runtime held, so it must not take devices_mutex (the totals' arena
+    // peaks hold that one while they read the runtime's stats).
+    info.rescue_decode = [this, host = &dev](
+                             const std::vector<VkCommandBuffer>& buffers,
+                             const std::vector<Etc2GpuUpload>& uploads,
+                             std::vector<Etc2RescueSource>* sources) {
+      return RescueDecode(*host, buffers, uploads, sources);
     };
     dev.gpu = Etc2GpuDevice::Create(std::move(info));
-  }
-
-  // The rescue's CPU half (DESIGN §6, CR-7): decode the uploads straight
-  // into the padded layout of the arena, in the CPU route's host staging
-  // arena, and keep the staging with the batch's records. That arena comes
-  // with the CPU fast path (WP1); until then nothing is decoded here and a
-  // rescued upload is dropped (counted, and its copy reads stale texels).
-  bool RescueDecode(const std::vector<VkCommandBuffer>& command_buffers,
-                    const std::vector<Etc2GpuUpload>& uploads,
-                    std::vector<Etc2RescueSource>* sources) {
-    static_cast<void>(command_buffers);
-    static_cast<void>(uploads);
-    static_cast<void>(sources);
-    return false;
   }
 
   // Inside vkQueueSubmit(2), after the CPU route: the GPU route's decode
@@ -1670,6 +1661,13 @@ struct VulkanEtc2Emulation::State {
   // At most once a second, from OnPresent and the CPU route: trims the
   // host staging arenas and gives back idle scratch.
   void Housekeeping(Clock::time_point now);
+  // The GPU route's rescue, its CPU half (DESIGN §6, CR-7): decodes the
+  // GPU-route uploads of one batch of `dev` into host staging, in the
+  // output arena's layout, for the rescue pass to copy into the arena.
+  bool RescueDecode(const HostDevice& dev,
+                    const std::vector<VkCommandBuffer>& command_buffers,
+                    const std::vector<Etc2GpuUpload>& uploads,
+                    std::vector<Etc2RescueSource>* sources);
 };
 
 VulkanEtc2Emulation::VulkanEtc2Emulation(Etc2EmulationOptions options)
@@ -3213,6 +3211,211 @@ void VulkanEtc2Emulation::State::Housekeeping(Clock::time_point now) {
     fast_source.ReleaseIfIdle(now);
     fast_decoded.ReleaseIfIdle(now);
   }
+}
+
+// The rescue copies each upload with one region, so the CPU writes what the
+// decode pass would have: whole blocks, 4 x blocks_wide texels per row and
+// 4 x blocks_high rows per layer, layer after layer. The source bytes are
+// read now, inside vkQueueSubmit, as on the CPU route. The staging goes to
+// the record of a command buffer of the batch that holds GPU-route
+// uploads: its copies read the arena after the rescue pass's barrier, so
+// once Roblox has reset or freed it the rescue copy read the staging too.
+bool VulkanEtc2Emulation::State::RescueDecode(
+    const HostDevice& dev, const std::vector<VkCommandBuffer>& command_buffers,
+    const std::vector<Etc2GpuUpload>& uploads,
+    std::vector<Etc2RescueSource>* sources) {
+  if (uploads.empty()) {
+    return false;
+  }
+  for (const Etc2GpuUpload& upload : uploads) {
+    if (upload.bc) {
+      // BC mode's CPU encode is not part of the GPU route yet.
+      LogFailure("cannot rescue a BC upload on the CPU");
+      return false;
+    }
+  }
+  struct Source {
+    const std::uint8_t* mapped = nullptr;  // Roblox's mapping, or null
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkDeviceSize memory_offset = 0;
+  };
+  std::vector<Source> where(uploads.size());
+  VkCommandBuffer owner = VK_NULL_HANDLE;
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    for (std::size_t index = 0; index < uploads.size(); ++index) {
+      const Etc2GpuUpload& upload = uploads[index];
+      const auto binding = buffers.find(upload.source);
+      if (binding == buffers.end()) {
+        LogFailure("upload source buffer has no tracked memory binding");
+        return false;
+      }
+      const VkDeviceSize absolute =
+          binding->second.offset + upload.source_offset;
+      const auto mapping = mappings.find(binding->second.memory);
+      if (mapping == mappings.end()) {
+        where[index].memory = binding->second.memory;
+        where[index].memory_offset = absolute;
+      } else if (absolute >= mapping->second.offset &&
+                 (mapping->second.size == VK_WHOLE_SIZE ||
+                  (absolute - mapping->second.offset <=
+                       mapping->second.size &&
+                   upload.source_span <= mapping->second.size -
+                                            (absolute -
+                                             mapping->second.offset)))) {
+        where[index].mapped =
+            static_cast<const std::uint8_t*>(mapping->second.data) +
+            (absolute - mapping->second.offset);
+      } else {
+        LogFailure("upload source lies outside the mapped range");
+        return false;
+      }
+    }
+    const auto holds_gpu_uploads = [&](VkCommandBuffer command_buffer) {
+      const auto record = commands.find(command_buffer);
+      return record != commands.end() && !record->second.gpu_uploads.empty();
+    };
+    for (VkCommandBuffer command_buffer : command_buffers) {
+      if (owner != VK_NULL_HANDLE) {
+        break;
+      }
+      if (holds_gpu_uploads(command_buffer)) {
+        owner = command_buffer;
+        break;
+      }
+      const auto record = commands.find(command_buffer);
+      if (record == commands.end()) {
+        continue;
+      }
+      for (VkCommandBuffer secondary : record->second.secondaries) {
+        if (holds_gpu_uploads(secondary)) {
+          owner = secondary;
+          break;
+        }
+      }
+    }
+  }
+  if (owner == VK_NULL_HANDLE) {
+    LogFailure("a rescued batch holds no GPU-route uploads");
+    return false;
+  }
+
+  // Staging: decoded texels at 16-byte aligned offsets.
+  std::vector<VkDeviceSize> offsets(uploads.size());
+  VkDeviceSize total = 0;
+  VkDeviceSize compressed_total = 0;
+  for (std::size_t index = 0; index < uploads.size(); ++index) {
+    offsets[index] = (total + kEtc2StagingRegionAlignment - 1) /
+                     kEtc2StagingRegionAlignment * kEtc2StagingRegionAlignment;
+    total = offsets[index] + uploads[index].output_bytes;
+    compressed_total += uploads[index].compressed;
+  }
+  ArenaRef range;
+  Staging staging;
+  std::uint8_t* mapped = nullptr;
+  VkBuffer buffer = VK_NULL_HANDLE;
+  VkDeviceSize base = 0;
+  if (dev.host_staging != nullptr) {
+    if (dev.host_staging->Take(total, &range) && range.mapped != nullptr) {
+      mapped = range.mapped;
+      buffer = range.buffer;
+      base = range.offset;
+    } else {
+      ChunkArena::ReleaseRef(range);
+      range = ArenaRef{};
+    }
+  }
+  if (mapped == nullptr) {
+    if (!CreateStaging(dev, total, &staging, &mapped)) {
+      LogFailure("could not allocate staging for a rescue");
+      return false;
+    }
+    buffer = staging.buffer;
+  }
+  const auto give_back = [&]() {
+    if (range.arena_id != 0) {
+      ChunkArena::ReleaseRef(range);
+    } else {
+      DestroyStaging(dev, staging);
+    }
+  };
+
+  // Copy-in from Roblox's memory (streaming loads, whole block rows), then
+  // decode on the pool.
+  std::vector<std::uint8_t> compressed(
+      static_cast<std::size_t>(compressed_total));
+  std::vector<EtcDecodeJob> jobs;
+  {
+    TemporaryMappings temporary;
+    VkDeviceSize packed_offset = 0;
+    for (std::size_t index = 0; index < uploads.size(); ++index) {
+      const Etc2GpuUpload& upload = uploads[index];
+      const std::uint8_t* source = where[index].mapped;
+      if (source == nullptr) {
+        source = temporary.Map(&dev, where[index].memory,
+                               where[index].memory_offset);
+        if (source == nullptr) {
+          LogFailure("could not map an unmapped upload source");
+          give_back();
+          return false;
+        }
+      }
+      const std::size_t row_bytes =
+          static_cast<std::size_t>(upload.blocks_wide) *
+          EtcBlockBytes(upload.format);
+      const VkDeviceSize packed_layer =
+          static_cast<VkDeviceSize>(row_bytes) * upload.blocks_high;
+      const VkDeviceSize output_layer = upload.output_bytes / upload.layers;
+      for (std::uint32_t layer = 0; layer < upload.layers; ++layer) {
+        std::uint8_t* packed = compressed.data() + packed_offset;
+        CopyStridedFromMappedMemory(
+            packed, source + layer * upload.source_layer_stride, row_bytes,
+            upload.blocks_high,
+            static_cast<std::size_t>(upload.source_row_stride));
+        EtcDecodeJob job;
+        job.format = upload.format;
+        job.source = packed;
+        job.source_bytes = static_cast<std::size_t>(packed_layer);
+        job.width = 4 * upload.blocks_wide;
+        job.height = 4 * upload.blocks_high;
+        job.destination = mapped + offsets[index] + layer * output_layer;
+        job.destination_bytes = static_cast<std::size_t>(output_layer);
+        jobs.push_back(job);
+        packed_offset += packed_layer;
+      }
+    }
+  }
+  DecodeEtcJobs(jobs.data(), jobs.size(), WorkerCount());
+  for (const EtcDecodeJob& job : jobs) {
+    if (!job.ok) {
+      LogFailure("could not decode a rescued upload");
+      give_back();
+      return false;
+    }
+  }
+
+  bool kept = false;
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    const auto record = commands.find(owner);
+    if (record != commands.end()) {
+      if (range.arena_id != 0) {
+        record->second.staging_refs.push_back(range);
+      } else {
+        record->second.staging.push_back(staging);
+      }
+      kept = true;
+    }
+  }
+  if (!kept) {
+    give_back();
+    return false;
+  }
+  sources->clear();
+  for (std::size_t index = 0; index < uploads.size(); ++index) {
+    sources->push_back({buffer, base + offsets[index]});
+  }
+  return true;
 }
 
 void VulkanEtc2Emulation::PrepareSubmit(VkQueue queue, std::uint32_t count,
