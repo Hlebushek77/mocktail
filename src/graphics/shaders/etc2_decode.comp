@@ -34,7 +34,14 @@ struct Job {
 
 layout(std430, set = 0, binding = 0) readonly buffer Source { uint src[]; };
 layout(std430, set = 0, binding = 1) readonly buffer Jobs { Job jobs[]; };
-layout(std430, set = 1, binding = 0) writeonly buffer Destination { uint dst[]; };
+// The output, seen as 8- and 16-byte texel rows of one block: each
+// invocation writes a whole row of its block with one store, so a subgroup's
+// stores cover whole cache lines. That matters most when the output lives in
+// system memory, where scalar stores made partial PCIe writes (about 40x
+// slower). Rows start on 16 bytes (8 for R11): output ranges are 256-byte
+// aligned and hold padded rows of 4 x blocks_wide texels.
+layout(std430, set = 1, binding = 0) writeonly buffer Destination2 { uvec2 dst2[]; };
+layout(std430, set = 1, binding = 0) writeonly buffer Destination4 { uvec4 dst4[]; };
 
 layout(push_constant) uniform Push {
   uint job_first;
@@ -91,10 +98,8 @@ void main() {
     }
     for (uint y = 0u; y < 4u; ++y) {
       const uint d = row0 + y * job.dst_row_words + bx * 4u;
-      dst[d + 0u] = px[0u * 4u + y];
-      dst[d + 1u] = px[1u * 4u + y];
-      dst[d + 2u] = px[2u * 4u + y];
-      dst[d + 3u] = px[3u * 4u + y];
+      dst4[d >> 2] = uvec4(px[0u * 4u + y], px[1u * 4u + y], px[2u * 4u + y],
+                           px[3u * 4u + y]);
     }
     return;
   }
@@ -105,10 +110,10 @@ void main() {
   if (format == FMT_EAC_R11 || format == FMT_EAC_R11_SIGNED) {
     for (int y = 0; y < 4; ++y) {
       const uint d = row0 + uint(y) * job.dst_row_words + bx * 2u;
-      dst[d + 0u] = DecodeR11(r0, r1, 0 * 4 + y, is_signed) |
-                    (DecodeR11(r0, r1, 1 * 4 + y, is_signed) << 16);
-      dst[d + 1u] = DecodeR11(r0, r1, 2 * 4 + y, is_signed) |
-                    (DecodeR11(r0, r1, 3 * 4 + y, is_signed) << 16);
+      dst2[d >> 1] = uvec2(DecodeR11(r0, r1, 0 * 4 + y, is_signed) |
+                               (DecodeR11(r0, r1, 1 * 4 + y, is_signed) << 16),
+                           DecodeR11(r0, r1, 2 * 4 + y, is_signed) |
+                               (DecodeR11(r0, r1, 3 * 4 + y, is_signed) << 16));
     }
     return;
   }
@@ -116,10 +121,12 @@ void main() {
   const uint g1 = src[s + 3u];
   for (int y = 0; y < 4; ++y) {
     const uint d = row0 + uint(y) * job.dst_row_words + bx * 4u;
+    uvec4 row;
     for (int x = 0; x < 4; ++x) {
       const int t = x * 4 + y;
-      dst[d + uint(x)] = DecodeR11(r0, r1, t, is_signed) |
-                         (DecodeR11(g0, g1, t, is_signed) << 16);
+      row[x] = DecodeR11(r0, r1, t, is_signed) |
+               (DecodeR11(g0, g1, t, is_signed) << 16);
     }
+    dst4[d >> 2] = row;
   }
 }
