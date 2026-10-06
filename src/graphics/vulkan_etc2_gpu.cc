@@ -763,7 +763,9 @@ struct Etc2GpuDevice::Impl {
     std::unique_ptr<ChunkArena>& arena = arenas[family];
     if (arena == nullptr) {
       ChunkArena::Config config;
-      config.chunk_bytes = kOutputChunkBytes;
+      // A chunk is bound whole as one storage buffer (maxStorageBufferRange
+      // is at least 128 MiB on every conformant driver).
+      config.chunk_bytes = std::min(kOutputChunkBytes, max_output);
       config.keep_idle_bytes = kOutputKeepIdleBytes;
       config.alignment = kEtc2GpuRegionAlignment;
       config.cap_bytes = arena_cap;
@@ -928,10 +930,12 @@ struct Etc2GpuDevice::Impl {
     }
     if (info.frame_stats &&
         (slot.record_ns >= 1000000ULL || gpu_ns >= 4000000ULL)) {
+      // Recycled while the next call is being planned: that call would be
+      // epoch + 1, so a slot reported by the very next call lags by 1.
       std::uint64_t lag = 0;
       {
         std::lock_guard<std::mutex> lock(epoch_mutex);
-        lag = epoch - slot.epoch;
+        lag = epoch + 1 - slot.epoch;
       }
       std::fprintf(stderr,
                    "  [vulkan] ETC2 GPU submit: %llu uploads, %.1f MiB "
@@ -1207,9 +1211,12 @@ struct Etc2GpuDevice::Impl {
 
   // Records one batch's decode pass (DESIGN C3.2): copy-in, decode, and the
   // barrier that orders the decode before Roblox's copies.
+  // `begun`: the command buffer left its initial state, so a rescue after a
+  // failure here needs another one.
   bool RecordDecode(Slot& slot, VkCommandBuffer command_buffer,
                     const Etc2GpuBatch& batch, VkDeviceSize* input_cursor,
-                    std::uint32_t* job_cursor) {
+                    std::uint32_t* job_cursor, bool* begun) {
+    *begun = false;
     Etc2DecodePass pass;
     if (!BuildDecodePass(batch.uploads, *input_cursor, *job_cursor, &pass) ||
         *input_cursor + pass.input_bytes > slot.input.size ||
@@ -1229,6 +1236,7 @@ struct Etc2GpuDevice::Impl {
                     static_cast<VkDeviceSize>(*job_cursor) *
                         sizeof(Etc2DecodeJob),
                 pass.jobs.data(), pass.jobs.size() * sizeof(Etc2DecodeJob));
+    *begun = true;
     if (!Begin(command_buffer)) {
       return false;
     }
@@ -1383,17 +1391,20 @@ struct Etc2GpuDevice::Impl {
                   " rescuing",
                   VK_SUCCESS);
         }
-        const VkCommandBuffer command_buffer = NextCommandBuffer(*slot);
+        VkCommandBuffer command_buffer = NextCommandBuffer(*slot);
         bool recorded = false;
         if (command_buffer != VK_NULL_HANDLE && decode && buffers &&
             !slot->rescue && family_matches) {
           input_cursor = AlignUp(input_cursor, kEtc2GpuInputAlignment);
+          bool begun = false;
           recorded = RecordDecode(*slot, command_buffer, batch, &input_cursor,
-                                  &job_cursor);
+                                  &job_cursor, &begun);
           if (recorded) {
             uploads += batch.uploads.size();
             compressed += batch_compressed;
             decoded += batch_decoded;
+          } else if (begun) {
+            command_buffer = NextCommandBuffer(*slot);
           }
         }
         if (!recorded && command_buffer != VK_NULL_HANDLE) {
@@ -1733,16 +1744,16 @@ struct Etc2GpuDevice::Impl {
     }
     for (auto& [queue, queue_state] : doomed) {
       std::lock_guard<std::mutex> lock(queue_state->mutex);
+      // Only a fence that was submitted can signal: a lost slot's fence-only
+      // submit failed, or its fence was already signalled.
       for (std::unique_ptr<Slot>& slot : queue_state->slots) {
-        if (slot->phase == Slot::Phase::kInFlight ||
-            slot->phase == Slot::Phase::kLost) {
+        if (slot->phase == Slot::Phase::kInFlight) {
           WaitSubmitted(slot->fence, "a decode pass");
         }
         DestroySlot(slot.get());
       }
       if (queue_state->rescue != nullptr) {
-        if (queue_state->rescue->phase == Slot::Phase::kInFlight ||
-            queue_state->rescue->phase == Slot::Phase::kLost) {
+        if (queue_state->rescue->phase == Slot::Phase::kInFlight) {
           WaitSubmitted(queue_state->rescue->fence, "a rescue pass");
         }
         DestroySlot(queue_state->rescue.get());
