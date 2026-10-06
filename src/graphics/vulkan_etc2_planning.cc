@@ -92,6 +92,12 @@ bool PlanRegions(const Etc2ImageShape& record, VkDevice device,
     if (scale > 1 && region.imageSubresource.layerCount != 1) {
       return false;
     }
+    // Each region starts 16-byte aligned in staging [DESIGN CR-19]: R16
+    // texels (EAC R11) would otherwise leave the next region at 2 mod 4,
+    // which a transfer-only queue forbids (VUID-vkCmdCopyBufferToImage-
+    // commandBuffer-07737). 16 is a multiple of every host texel size.
+    *total = (*total + kEtc2StagingRegionAlignment - 1) &
+             ~(kEtc2StagingRegionAlignment - 1);
     upload.device = device;
     upload.source = source;
     upload.source_offset = region.bufferOffset;

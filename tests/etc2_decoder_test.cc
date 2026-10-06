@@ -488,8 +488,9 @@ TEST(Etc2DecoderTest, BandsMatchReference) {
   }
 }
 
-// DecodeEtcJobs splits jobs into bands and, above 65536 blocks, runs them on
-// worker threads; the output must not depend on either.
+// DecodeEtcJobs splits jobs into bands of at most 4096 blocks, batches small
+// ones into tasks and, from 64 KiB of compressed data on, runs them on the
+// shared worker pool; the output must not depend on any of it.
 TEST(Etc2DecoderTest, JobsMatchReferenceSerialAndThreaded) {
   std::mt19937_64 rng(0x5EED0003);
   struct Image {
@@ -512,14 +513,15 @@ TEST(Etc2DecoderTest, JobsMatchReferenceSerialAndThreaded) {
            {}});
     }
   }
-  // 1024x1040 RGB8 alone is 66560 blocks: the threaded path with banding.
+  // 1024x1040 RGB8 alone is 66560 blocks (520 KiB): 17 bands of 4096
+  // blocks and one of 1024 on the pool.
   images.push_back(
       {EtcFormat::kEtc2Rgb8,
        1024,
        1040,
        RandomBytes(&rng, CompressedBytes(EtcFormat::kEtc2Rgb8, 1024, 1040)),
        {}});
-  for (const unsigned workers : {1U, 4U}) {
+  for (const unsigned workers : {1U, 4U, 8U}) {
     std::vector<EtcDecodeJob> jobs;
     for (Image& image : images) {
       image.out.assign(static_cast<std::size_t>(image.width) * image.height *
@@ -546,7 +548,8 @@ TEST(Etc2DecoderTest, JobsMatchReferenceSerialAndThreaded) {
     broken.destination_bytes = small.size();
     broken.ok = true;
     jobs.insert(jobs.begin() + 3, broken);
-    DecodeEtcJobs(jobs.data(), jobs.size(), workers);
+    EXPECT_EQ(DecodeEtcJobs(jobs.data(), jobs.size(), workers), workers)
+        << "every worker takes part";
     EXPECT_FALSE(jobs[3].ok);
     for (std::size_t index = 0; index < images.size(); ++index) {
       const EtcDecodeJob& job = jobs[index < 3 ? index : index + 1];
@@ -557,6 +560,41 @@ TEST(Etc2DecoderTest, JobsMatchReferenceSerialAndThreaded) {
           << "image " << index << " workers " << workers;
     }
   }
+}
+
+// Less than 64 KiB of compressed data decodes on the caller, and a submit of
+// only broken jobs decodes nothing.
+TEST(Etc2DecoderTest, SmallSubmitsDecodeOnTheCaller) {
+  std::mt19937_64 rng(0x5EED0004);
+  std::vector<std::vector<std::uint8_t>> sources;
+  std::vector<std::vector<std::uint8_t>> outputs;
+  std::vector<EtcDecodeJob> jobs;
+  for (int index = 0; index < 40; ++index) {  // 40 x 16x16 RGBA8: 10 KiB
+    sources.push_back(
+        RandomBytes(&rng, CompressedBytes(EtcFormat::kEtc2Rgba8, 16, 16)));
+    outputs.emplace_back(16 * 16 * 4, 0x3C);
+  }
+  for (int index = 0; index < 40; ++index) {
+    EtcDecodeJob job;
+    job.format = EtcFormat::kEtc2Rgba8;
+    job.source = sources[index].data();
+    job.source_bytes = sources[index].size();
+    job.width = 16;
+    job.height = 16;
+    job.destination = outputs[index].data();
+    job.destination_bytes = outputs[index].size();
+    jobs.push_back(job);
+  }
+  EXPECT_EQ(DecodeEtcJobs(jobs.data(), jobs.size(), 8), 1U);
+  for (int index = 0; index < 40; ++index) {
+    EXPECT_TRUE(jobs[index].ok);
+    ASSERT_EQ(outputs[index],
+              ReferenceDecode(EtcFormat::kEtc2Rgba8, sources[index], 16, 16));
+  }
+  EtcDecodeJob broken;
+  EXPECT_EQ(DecodeEtcJobs(&broken, 1, 8), 0U);
+  EXPECT_FALSE(broken.ok);
+  EXPECT_EQ(DecodeEtcJobs(nullptr, 0, 8), 0U);
 }
 
 }  // namespace

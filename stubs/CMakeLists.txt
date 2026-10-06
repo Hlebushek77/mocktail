@@ -115,6 +115,11 @@ add_library(stub_vulkan SHARED
   ${CMAKE_SOURCE_DIR}/src/graphics/texture_override.cc
 )
 configure_stub(stub_vulkan "libvulkan.so")
+# ETC2 CPU fast path (plus.2 WP1).
+target_sources(stub_vulkan PRIVATE
+  ${CMAKE_SOURCE_DIR}/src/graphics/worker_pool.cc
+  ${CMAKE_SOURCE_DIR}/src/graphics/mapped_memory_copy.cc
+)
 target_include_directories(stub_vulkan PRIVATE ${CMAKE_SOURCE_DIR}/include)
 # MOCKTAIL_VK_CALL_STATS counting wrappers (plus.2 DXT probe).
 target_sources(stub_vulkan PRIVATE

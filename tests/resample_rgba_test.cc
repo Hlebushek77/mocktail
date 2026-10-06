@@ -1,7 +1,13 @@
 #include <gtest/gtest.h>
 
+#include <unistd.h>
+
 #include <cstdint>
+#include <cstdio>
+#include <filesystem>
 #include <random>
+#include <string>
+#include <system_error>
 #include <vector>
 
 #include "mocktail/graphics/texture_override.h"
@@ -143,6 +149,87 @@ TEST(ResampleRgbaTest, ImageOverloadChecksPixelCount) {
   std::vector<std::uint8_t> untouched(52 * 28 * 4, 0x11);
   ResampleRgba(image, 52, 28, untouched.data());
   EXPECT_EQ(untouched, std::vector<std::uint8_t>(52 * 28 * 4, 0x11));
+}
+
+// The row-stride overload reads a region cropped out of a wider image (the
+// emulation's partial uploads) as if it had been copied out first.
+TEST(ResampleRgbaTest, StridedSourceMatchesACroppedCopy) {
+  std::mt19937_64 rng(0x5EED0103);
+  for (int index = 0; index < 2000; ++index) {
+    const std::uint32_t source_width =
+        1 + static_cast<std::uint32_t>(rng() % 40);
+    const std::uint32_t source_height =
+        1 + static_cast<std::uint32_t>(rng() % 40);
+    const std::uint32_t padding = static_cast<std::uint32_t>(rng() % 5);
+    const std::uint32_t width = 1 + static_cast<std::uint32_t>(rng() % 160);
+    const std::uint32_t height = 1 + static_cast<std::uint32_t>(rng() % 160);
+    const std::vector<std::uint8_t> wide =
+        RandomRgba(&rng, source_width + padding, source_height);
+    std::vector<std::uint8_t> cropped;
+    for (std::uint32_t y = 0; y < source_height; ++y) {
+      const auto row = wide.begin() + static_cast<std::ptrdiff_t>(
+                                          y * (source_width + padding) * 4);
+      cropped.insert(cropped.end(), row, row + source_width * 4);
+    }
+    const std::size_t size = static_cast<std::size_t>(width) * height * 4;
+    std::vector<std::uint8_t> actual(size, 0x11);
+    std::vector<std::uint8_t> expected(size, 0xEE);
+    ResampleRgba(wide.data(), source_width, source_height,
+                 static_cast<std::size_t>(source_width + padding) * 4, width,
+                 height, actual.data());
+    reference::ResampleRgba(cropped.data(), source_width, source_height,
+                            width, height, expected.data());
+    ASSERT_EQ(actual, expected)
+        << source_width << "x" << source_height << " (+" << padding
+        << ") -> " << width << "x" << height;
+  }
+}
+
+class TextureOverridesActiveTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    directory_ = ::testing::TempDir() + "/texture_overrides_active_" +
+                 std::to_string(::getpid());
+    std::error_code error;
+    std::filesystem::remove_all(directory_, error);
+    std::filesystem::create_directories(directory_, error);
+  }
+  void TearDown() override {
+    std::error_code error;
+    std::filesystem::remove_all(directory_, error);
+  }
+
+  void Touch(const std::string& name) {
+    std::FILE* file = std::fopen((directory_ + "/" + name).c_str(), "w");
+    ASSERT_NE(file, nullptr) << name;
+    std::fclose(file);
+  }
+
+  std::string directory_;
+};
+
+// Hashing every mip-0 colour upload and probing for its PNG is only worth it
+// when an override can exist, or when uploads are being dumped.
+TEST_F(TextureOverridesActiveTest, OnlyAPngOrADumpDirectoryActivates) {
+  EXPECT_FALSE(TextureOverrides("", "").active());
+  EXPECT_FALSE(TextureOverrides(directory_ + "/missing", "").active());
+  EXPECT_TRUE(TextureOverrides(directory_ + "/missing", "").enabled());
+  EXPECT_FALSE(TextureOverrides(directory_, "").active()) << "empty folder";
+  Touch("readme.txt");
+  Touch("0123456789abcdef.png.bak");
+  std::error_code error;
+  std::filesystem::create_directories(directory_ + "/folder.png", error);
+  EXPECT_FALSE(TextureOverrides(directory_, "").active())
+      << "no regular *.png yet";
+  EXPECT_TRUE(TextureOverrides("", directory_ + "/dumps").active());
+
+  Touch("0123456789ABCDEF.PNG");
+  const TextureOverrides overrides(directory_, "");
+  EXPECT_TRUE(overrides.active()) << "the extension is matched in any case";
+  // Scanned once: removing the PNG later does not deactivate it.
+  std::filesystem::remove(directory_ + "/0123456789ABCDEF.PNG", error);
+  EXPECT_TRUE(overrides.active());
+  EXPECT_FALSE(TextureOverrides(directory_, "").active());
 }
 
 }  // namespace

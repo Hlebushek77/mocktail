@@ -29,6 +29,12 @@ void ResampleRgba(const RgbaImage& source, std::uint32_t width,
 void ResampleRgba(const std::uint8_t* source, std::uint32_t source_width,
                   std::uint32_t source_height, std::uint32_t width,
                   std::uint32_t height, std::uint8_t* destination);
+// The same for a source whose rows lie `source_row_bytes` apart (a region
+// cropped out of a wider image).
+void ResampleRgba(const std::uint8_t* source, std::uint32_t source_width,
+                  std::uint32_t source_height, std::size_t source_row_bytes,
+                  std::uint32_t width, std::uint32_t height,
+                  std::uint8_t* destination);
 
 class TextureOverrides {
  public:
@@ -37,6 +43,10 @@ class TextureOverrides {
 
   bool enabled() const { return !override_dir_.empty() || !dump_dir_.empty(); }
   bool dumping() const { return !dump_dir_.empty(); }
+  // Whether uploads need hashing, Dump and Lookup at all: the dump directory
+  // is set, or the override directory held a regular *.png (any case) when
+  // this was constructed. PNGs added later count from the next start.
+  bool active() const { return active_; }
 
   std::shared_ptr<const RgbaImage> Lookup(std::uint64_t hash);
   void Dump(std::uint64_t hash, std::uint32_t width, std::uint32_t height,
@@ -45,6 +55,7 @@ class TextureOverrides {
  private:
   std::string override_dir_;
   std::string dump_dir_;
+  bool active_ = false;
   std::mutex mutex_;
   std::unordered_map<std::uint64_t, std::shared_ptr<const RgbaImage>> cache_;
   std::unordered_set<std::uint64_t> dumped_;

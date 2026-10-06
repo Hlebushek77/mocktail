@@ -843,14 +843,10 @@ std::vector<Scenario> BuildScenarios() {
   {
     ScenarioBuilder b("TransferOnlyQueueFamily", 19,
                       "uploads recorded on a transfer-only queue family");
-    // CR-19: today's tight staging layout leaves an EAC R11 region with an
-    // odd texel count at 2 mod 4, which a transfer-only queue forbids. WP1
-    // aligns the staging offsets and must drop this allowance.
-    b.QueueFamily(1)
-        .AllowFakeError("VUID-vkCmdCopyBufferToImage-commandBuffer-07737")
-        .FakeOnly(
-            "misaligned offsets on a transfer queue are undefined "
-            "behaviour on a real GPU (CR-19)");
+    // CR-19: EAC R11 regions with an odd texel count used to leave the
+    // next region's staging offset at 2 mod 4, which a transfer-only queue
+    // forbids; staging regions now start on 16-byte boundaries.
+    b.QueueFamily(1);
     const std::uint32_t source = b.Source();
     const std::uint32_t cb = b.CommandBuffer();
     const std::uint32_t images[] = {

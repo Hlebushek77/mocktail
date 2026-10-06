@@ -44,9 +44,12 @@ struct EtcDecodeJob {
   bool ok = false;
 };
 
-// Synchronous; job destination buffers must not overlap.
-void DecodeEtcJobs(EtcDecodeJob* jobs, std::size_t count,
-                   unsigned worker_count);
+// Synchronous; job destination buffers must not overlap. Decodes in bands
+// of at most 4096 blocks on the shared WorkerPool with `worker_count`
+// threads, or on the calling thread for under 64 KiB of compressed data.
+// Returns how many threads took part (0 when no job could be decoded).
+unsigned DecodeEtcJobs(EtcDecodeJob* jobs, std::size_t count,
+                       unsigned worker_count);
 
 }  // namespace mocktail::graphics
 

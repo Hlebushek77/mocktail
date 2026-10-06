@@ -9,6 +9,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #include "support/etc2_emulation_harness.h"
@@ -79,15 +80,28 @@ void ExpectEverythingReleased(const FakeVulkanDevice& fake) {
   EXPECT_EQ(counts.live_mappings, 0U);
 }
 
-// Today each copy has a staging buffer of its own, which goes when its
-// command buffer is released (ReleaseRecordResources), before the device.
-// With the host staging arena (WP1) the chunks stay until the device goes:
-// this check then becomes one on the arena's live references.
-void ExpectStagingReleased(const FakeVulkanDevice& fake) {
-  EXPECT_EQ(fake.counts().entry_point_buffers.live(), 0U)
-      << "staging buffers outlived their command buffers";
-  EXPECT_EQ(fake.counts().entry_point_memory.live(), 0U)
-      << "staging memory outlived its command buffers";
+// The legacy path (MOCKTAIL_ETC2_FAST_PATH=0) gives each copy a staging
+// buffer of its own, which goes when its command buffer is released
+// (ReleaseRecordResources), before the device. The fast path takes ranges of
+// the host staging arena, whose chunks stay until the device goes; every
+// scenario's staging fits one chunk, so one chunk is all that may remain
+// (that the ranges themselves come back is checked by the arena tests
+// below).
+void ExpectStagingReleased(const FakeVulkanDevice& fake, bool fast_path) {
+  const FakeVulkanDevice::Counts& counts = fake.counts();
+  if (!fast_path) {
+    EXPECT_EQ(counts.entry_point_buffers.live(), 0U)
+        << "staging buffers outlived their command buffers";
+    EXPECT_EQ(counts.entry_point_memory.live(), 0U)
+        << "staging memory outlived its command buffers";
+    return;
+  }
+  EXPECT_LE(counts.entry_point_buffers.live(), 1U) << "one arena chunk";
+  EXPECT_EQ(counts.entry_point_memory.live(),
+            counts.entry_point_buffers.live());
+  EXPECT_EQ(counts.entry_point_buffers.created,
+            counts.entry_point_buffers.live())
+      << "the arena never frees a chunk it may reuse while the device lives";
 }
 
 void ExpectGolden(const Scenario& scenario, std::uint64_t hash) {
@@ -104,20 +118,32 @@ void ExpectGolden(const Scenario& scenario, std::uint64_t hash) {
       << GoldenLine(scenario.name, hash);
 }
 
-class Etc2EmulationScenarioTest : public ::testing::TestWithParam<std::string> {
+// Every scenario on both CPU paths: the fast path (the default) and the
+// legacy one that MOCKTAIL_ETC2_FAST_PATH=0 keeps for the A/B; both must
+// give the frozen plus.1 texels.
+class Etc2EmulationScenarioTest
+    : public ::testing::TestWithParam<std::tuple<std::string, bool>> {
  protected:
+  const std::string& name() const { return std::get<0>(GetParam()); }
+  bool fast_path() const { return std::get<1>(GetParam()); }
+  ScenarioOptions Options() const {
+    ScenarioOptions options;
+    options.emulation.fast_path = fast_path();
+    return options;
+  }
+
   // Runs the scenario with `teardown` and checks everything but the image
   // copies against the model, the golden hash and the fake's counts.
   void RunAndCheck(ScenarioTeardown teardown) {
-    const Scenario* scenario = FindEtc2EmulationScenario(GetParam());
+    const Scenario* scenario = FindEtc2EmulationScenario(name());
     ASSERT_NE(scenario, nullptr);
     FakeVulkanDevice fake;
     FakeEmulationBackend backend(&fake);
-    ScenarioOptions options;
+    ScenarioOptions options = Options();
     options.teardown = teardown;
     bool released = false;
     options.after_command_buffers = [&]() {
-      ExpectStagingReleased(fake);
+      ExpectStagingReleased(fake, fast_path());
       released = true;
     };
     const ScenarioRun run = RunEtc2Scenario(*scenario, &backend, options);
@@ -133,13 +159,15 @@ class Etc2EmulationScenarioTest : public ::testing::TestWithParam<std::string> {
 };
 
 TEST_P(Etc2EmulationScenarioTest, MatchesModelAndGolden) {
-  const Scenario* scenario = FindEtc2EmulationScenario(GetParam());
+  const Scenario* scenario = FindEtc2EmulationScenario(name());
   ASSERT_NE(scenario, nullptr);
   FakeVulkanDevice fake;
   FakeEmulationBackend backend(&fake);
-  ScenarioOptions options;
+  ScenarioOptions options = Options();
   options.fake = &fake;
-  options.after_command_buffers = [&fake]() { ExpectStagingReleased(fake); };
+  options.after_command_buffers = [&]() {
+    ExpectStagingReleased(fake, fast_path());
+  };
   const ScenarioRun run = RunEtc2Scenario(*scenario, &backend, options);
   ASSERT_FALSE(run.skipped) << run.skip_reason;
   for (const std::string& failure : run.failures) {
@@ -148,10 +176,13 @@ TEST_P(Etc2EmulationScenarioTest, MatchesModelAndGolden) {
   ExpectOnlyAllowedErrors(fake, *scenario);
   ExpectEverythingReleased(fake);
   ExpectGolden(*scenario, run.hash);
-  // Today one staging buffer and allocation per copy command; recorded for
-  // comparison with the host staging arena (WP1).
+  // Legacy: one staging buffer and allocation per copy command; fast: at
+  // most one arena chunk.
   RecordProperty("staging_allocations",
                  std::to_string(fake.calls("vkAllocateMemory")));
+  if (fast_path()) {
+    EXPECT_LE(fake.calls("vkAllocateMemory"), 1U);
+  }
 }
 
 // vkResetCommandPool: the adapter releases every command buffer of the pool
@@ -172,11 +203,13 @@ TEST_P(Etc2EmulationScenarioTest, DestroyDeviceFirstReleasesStaging) {
   RunAndCheck(ScenarioTeardown::kDestroyDeviceFirst);
 }
 
-INSTANTIATE_TEST_SUITE_P(Scenarios, Etc2EmulationScenarioTest,
-                         ::testing::ValuesIn(ScenarioNames()),
-                         [](const ::testing::TestParamInfo<std::string>& info) {
-                           return info.param;
-                         });
+INSTANTIATE_TEST_SUITE_P(
+    Scenarios, Etc2EmulationScenarioTest,
+    ::testing::Combine(::testing::ValuesIn(ScenarioNames()), ::testing::Bool()),
+    [](const ::testing::TestParamInfo<std::tuple<std::string, bool>>& info) {
+      return std::get<0>(info.param) +
+             (std::get<1>(info.param) ? "_Fast" : "_Legacy");
+    });
 
 TEST(Etc2EmulationScenarioListTest, EveryScenarioHasAGoldenHash) {
   for (const Scenario& scenario : Etc2EmulationScenarios()) {
@@ -660,9 +693,27 @@ void Destroy(VulkanEtc2Emulation* emulation, FakeVulkanDevice* fake,
   emulation->FreeMemory(fake->device(), upload.memory, nullptr);
 }
 
-TEST(VulkanEtc2EmulationTest, ReleasingACommandBufferFreesItsStaging) {
+// The direct staging tests on both CPU paths: the legacy path's one-off
+// buffers go with their command buffer, the fast path's arena chunk stays
+// with the device and takes its ranges back.
+class VulkanEtc2EmulationPathTest : public ::testing::TestWithParam<bool> {
+ protected:
+  bool fast_path() const { return GetParam(); }
+  Etc2EmulationOptions PathOptions() const {
+    Etc2EmulationOptions options = Options(1);
+    options.fast_path = fast_path();
+    return options;
+  }
+  // Staging buffers (and memories) alive while `copies` copies are
+  // recorded: one each on the legacy path, one arena chunk on the fast one.
+  std::uint64_t Staging(std::uint64_t copies) const {
+    return fast_path() ? 1 : copies;
+  }
+};
+
+TEST_P(VulkanEtc2EmulationPathTest, ReleasingACommandBufferFreesItsStaging) {
   FakeVulkanDevice fake;
-  VulkanEtc2Emulation emulation(Options(1));
+  VulkanEtc2Emulation emulation(PathOptions());
   const VkQueue queue = Register(&emulation, &fake);
   const VkCommandPool pool = CreatePool(
       &emulation, &fake, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT);
@@ -674,11 +725,11 @@ TEST(VulkanEtc2EmulationTest, ReleasingACommandBufferFreesItsStaging) {
   EXPECT_EQ(fake.copy_buffer_to_image_regions(), 1U);
 
   emulation.ReleaseCommandBuffer(upload.command_buffer);
-  EXPECT_EQ(fake.counts().entry_point_buffers.live(), 0U);
-  EXPECT_EQ(fake.counts().entry_point_memory.live(), 0U);
+  EXPECT_EQ(fake.counts().entry_point_buffers.live(), fast_path() ? 1U : 0U);
+  EXPECT_EQ(fake.counts().entry_point_memory.live(), fast_path() ? 1U : 0U);
   emulation.ReleaseCommandBuffer(upload.command_buffer);  // nothing left
   // Nothing to decode either: only the emulation sees this submit (the
-  // fake would run the copy from the staging buffer that is gone).
+  // fake would run the copy from the staging that is gone).
   VkSubmitInfo info{};
   info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
   info.commandBufferCount = 1;
@@ -697,10 +748,10 @@ TEST(VulkanEtc2EmulationTest, ReleasingACommandBufferFreesItsStaging) {
 }
 
 // DestroyDevice frees the staging of that device's command buffers only.
-TEST(VulkanEtc2EmulationTest, DestroyDeviceKeepsOtherDevicesStaging) {
+TEST_P(VulkanEtc2EmulationPathTest, DestroyDeviceKeepsOtherDevicesStaging) {
   FakeVulkanDevice first;
   FakeVulkanDevice second;
-  VulkanEtc2Emulation emulation(Options(1));
+  VulkanEtc2Emulation emulation(PathOptions());
   Register(&emulation, &first);
   const VkQueue second_queue = Register(&emulation, &second);
   const VkCommandPool first_pool = CreatePool(
@@ -721,12 +772,15 @@ TEST(VulkanEtc2EmulationTest, DestroyDeviceKeepsOtherDevicesStaging) {
             VK_SUCCESS);
   EXPECT_EQ(second.copy_buffer_to_image_regions(), 1U);
   emulation.ReleaseCommandBuffer(two.command_buffer);
-  EXPECT_EQ(second.counts().entry_point_buffers.live(), 0U);
+  EXPECT_EQ(second.counts().entry_point_buffers.live(),
+            fast_path() ? 1U : 0U);
   Destroy(&emulation, &second, two);
   // The first pool goes after its device, as Roblox may do it.
   DestroyPool(&emulation, &first, first_pool, {one.command_buffer});
   DestroyPool(&emulation, &second, second_pool, {two.command_buffer});
   emulation.DestroyDevice(second.device());
+  EXPECT_EQ(second.counts().entry_point_buffers.live(), 0U);
+  EXPECT_EQ(second.counts().entry_point_memory.live(), 0U);
   EXPECT_TRUE(first.errors().empty()) << first.errors().front();
   EXPECT_TRUE(second.errors().empty()) << second.errors().front();
 }
@@ -734,23 +788,242 @@ TEST(VulkanEtc2EmulationTest, DestroyDeviceKeepsOtherDevicesStaging) {
 // A command buffer from a destroyed pool: the adapter releases every one of
 // them before vkDestroyCommandPool, as it does for vkResetCommandPool, and
 // the emulation forgets the pool after it.
-TEST(VulkanEtc2EmulationTest, PoolTeardownReleasesEveryCommandBuffer) {
+TEST_P(VulkanEtc2EmulationPathTest, PoolTeardownReleasesEveryCommandBuffer) {
   FakeVulkanDevice fake;
-  VulkanEtc2Emulation emulation(Options(1));
+  VulkanEtc2Emulation emulation(PathOptions());
   Register(&emulation, &fake);
   const VkCommandPool pool = CreatePool(&emulation, &fake, 0);
   const Upload one = RecordUpload(&emulation, &fake, pool);
   const Upload two = RecordUpload(&emulation, &fake, pool);
-  EXPECT_EQ(fake.counts().entry_point_buffers.live(), 2U);
+  EXPECT_EQ(fake.counts().entry_point_buffers.live(), Staging(2));
   DestroyPool(&emulation, &fake, pool,
               {one.command_buffer, two.command_buffer});
-  EXPECT_EQ(fake.counts().entry_point_buffers.live(), 0U);
-  EXPECT_EQ(fake.counts().entry_point_memory.live(), 0U);
+  EXPECT_EQ(fake.counts().entry_point_buffers.live(), fast_path() ? 1U : 0U);
+  EXPECT_EQ(fake.counts().entry_point_memory.live(), fast_path() ? 1U : 0U);
   Destroy(&emulation, &fake, one);
   Destroy(&emulation, &fake, two);
   emulation.DestroyDevice(fake.device());
   EXPECT_EQ(fake.counts().command_buffers.live(), 0U);
+  EXPECT_EQ(fake.counts().entry_point_buffers.live(), 0U);
+  EXPECT_EQ(fake.counts().entry_point_memory.live(), 0U);
   EXPECT_TRUE(fake.errors().empty()) << fake.errors().front();
+}
+
+INSTANTIATE_TEST_SUITE_P(Paths, VulkanEtc2EmulationPathTest,
+                         ::testing::Bool(),
+                         [](const ::testing::TestParamInfo<bool>& info) {
+                           return std::string(info.param ? "Fast" : "Legacy");
+                         });
+
+// ---- the host staging arena (fast path) ------------------------------------
+
+// One copy of a `size` x `size` ETC2 RGBA8 texture (4 x size^2 bytes of
+// staging) recorded into a fresh command buffer.
+struct ArenaCopy {
+  VkImage image = VK_NULL_HANDLE;
+  VkCommandBuffer command_buffer = VK_NULL_HANDLE;
+};
+
+class HostStagingArenaTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    queue_ = Register(&emulation_, &fake_);
+    pool_ = CreatePool(&emulation_, &fake_,
+                       VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT);
+    // Room for every copy below: 1024x1024 RGBA8 is 1 MiB compressed.
+    fake_.CreateBuffer(1U << 20, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &source_);
+    fake_.AllocateMemory(1U << 20, 3, &memory_);
+    emulation_.NoteAllocateMemory(fake_.device(), memory_, 3, 1U << 20);
+    emulation_.BindBufferMemory(fake_.device(), source_, memory_, 0);
+    void* data = nullptr;
+    emulation_.MapMemory(fake_.device(), memory_, 0, VK_WHOLE_SIZE, 0, &data);
+  }
+  void TearDown() override {
+    for (const ArenaCopy& copy : copies_) {
+      emulation_.ReleaseCommandBuffer(copy.command_buffer);
+      emulation_.DestroyImage(fake_.device(), copy.image, nullptr);
+    }
+    copies_.clear();
+    emulation_.UnmapMemory(fake_.device(), memory_);
+    emulation_.DestroyBuffer(fake_.device(), source_, nullptr);
+    emulation_.FreeMemory(fake_.device(), memory_, nullptr);
+    fake_.DestroyCommandPool(pool_);
+    emulation_.ForgetCommandPool(fake_.device(), pool_);
+    emulation_.DestroyDevice(fake_.device());
+    EXPECT_EQ(fake_.counts().entry_point_buffers.live(), 0U);
+    EXPECT_EQ(fake_.counts().entry_point_memory.live(), 0U);
+    EXPECT_TRUE(fake_.errors().empty()) << fake_.errors().front();
+  }
+
+  ArenaCopy Record(std::uint32_t size) {
+    ArenaCopy copy;
+    VkImageCreateInfo info =
+        ImageInfo(VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK, size, size);
+    emulation_.CreateImage(fake_.device(), &info, nullptr, &copy.image);
+    copy.command_buffer =
+        fake_.AllocateCommandBuffer(pool_, VK_COMMAND_BUFFER_LEVEL_PRIMARY);
+    emulation_.BeginCommandBuffer(copy.command_buffer, pool_,
+                                  VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
+    fake_.BeginCommandBuffer(copy.command_buffer);
+    VkBufferImageCopy region{};
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = {size, size, 1};
+    emulation_.CmdCopyBufferToImage(fake_.device(), copy.command_buffer,
+                                    source_, copy.image,
+                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                                    &region);
+    fake_.EndCommandBuffer(copy.command_buffer);
+    copies_.push_back(copy);
+    return copy;
+  }
+
+  // Where the host copy reads the copy's staging: buffer and offset.
+  std::pair<VkBuffer, VkDeviceSize> StagingOf(const ArenaCopy& copy) const {
+    const auto recorded = fake_.RecordedBufferCopies(copy.command_buffer);
+    EXPECT_EQ(recorded.size(), 1U);
+    if (recorded.empty() || recorded[0].regions.empty()) {
+      return {VK_NULL_HANDLE, 0};
+    }
+    return {recorded[0].buffer, recorded[0].regions[0].bufferOffset};
+  }
+
+  // Roblox's vkQueueSubmit, then its vkResetCommandBuffer once the fence
+  // signalled; with `destroy`, the image goes too.
+  void SubmitAndRelease(const ArenaCopy& copy, bool destroy = false) {
+    ASSERT_EQ(Submit(&emulation_, &fake_, queue_, copy.command_buffer),
+              VK_SUCCESS);
+    emulation_.ReleaseCommandBuffer(copy.command_buffer);
+    fake_.ResetCommandBuffer(copy.command_buffer);
+    if (destroy) {
+      emulation_.DestroyImage(fake_.device(), copy.image, nullptr);
+      copies_.erase(std::remove_if(copies_.begin(), copies_.end(),
+                                   [&copy](const ArenaCopy& other) {
+                                     return other.image == copy.image;
+                                   }),
+                    copies_.end());
+    }
+  }
+
+  FakeVulkanDevice fake_;
+  VulkanEtc2Emulation emulation_{Options(1)};
+  VkQueue queue_ = VK_NULL_HANDLE;
+  VkCommandPool pool_ = VK_NULL_HANDLE;
+  VkBuffer source_ = VK_NULL_HANDLE;
+  VkDeviceMemory memory_ = VK_NULL_HANDLE;
+  std::vector<ArenaCopy> copies_;
+};
+
+// Ranges follow each other in one chunk, 256-byte aligned; a command
+// buffer's release gives its range back, and once a chunk holds no range it
+// is reused from its start.
+TEST_F(HostStagingArenaTest, RangesComeBackWithTheirCommandBuffer) {
+  const ArenaCopy a = Record(8);  // 256 bytes of staging
+  const ArenaCopy b = Record(4);  // 64
+  const ArenaCopy c = Record(12);
+  const auto [chunk, a_offset] = StagingOf(a);
+  ASSERT_NE(chunk, VK_NULL_HANDLE);
+  EXPECT_EQ(a_offset, 0U);
+  EXPECT_EQ(StagingOf(b), std::make_pair(chunk, VkDeviceSize{256}));
+  EXPECT_EQ(StagingOf(c), std::make_pair(chunk, VkDeviceSize{512}));
+  EXPECT_EQ(fake_.BufferSize(chunk), 64ULL << 20);
+  EXPECT_EQ(fake_.BufferUsage(chunk), static_cast<VkBufferUsageFlags>(
+                                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                                          VK_BUFFER_USAGE_TRANSFER_DST_BIT));
+  // Two of three released: the chunk still holds c, so bumping continues.
+  SubmitAndRelease(a);
+  SubmitAndRelease(b);
+  const ArenaCopy d = Record(4);
+  EXPECT_EQ(StagingOf(d), std::make_pair(chunk, VkDeviceSize{1280}));
+  // All released: the next range starts over at 0.
+  SubmitAndRelease(c);
+  SubmitAndRelease(d);
+  const ArenaCopy e = Record(4);
+  EXPECT_EQ(StagingOf(e), std::make_pair(chunk, VkDeviceSize{0}));
+  EXPECT_EQ(fake_.calls("vkAllocateMemory"), 1U);
+  EXPECT_EQ(fake_.calls("vkCreateBuffer"), 1U);
+  // Roblox's source through the adapter's hook, and the chunk once.
+  EXPECT_EQ(fake_.calls("vkMapMemory"), 2U);
+}
+
+// DESIGN §9.2, WP1: after the first chunk exists, recording, submitting and
+// releasing copies costs no Vulkan allocation, even when a session's staging
+// adds up to many chunks' worth. 20 rounds of 8 x 512x512 RGBA8 (8 MiB of
+// staging each) would need three chunks if ranges leaked.
+TEST_F(HostStagingArenaTest, NoAllocationPerCopyAfterWarmUp) {
+  std::uint64_t allocations = 0;
+  std::uint64_t buffers = 0;
+  for (int round = 0; round < 20; ++round) {
+    std::vector<ArenaCopy> batch;
+    for (int index = 0; index < 8; ++index) {
+      batch.push_back(Record(512));
+    }
+    EXPECT_EQ(StagingOf(batch.front()).second, 0U) << "round " << round;
+    for (const ArenaCopy& copy : batch) {
+      SubmitAndRelease(copy, true);
+    }
+    if (round == 0) {
+      allocations = fake_.calls("vkAllocateMemory");
+      buffers = fake_.calls("vkCreateBuffer");
+      EXPECT_EQ(allocations, 1U);
+    }
+  }
+  EXPECT_EQ(fake_.calls("vkAllocateMemory"), allocations);
+  EXPECT_EQ(fake_.calls("vkCreateBuffer"), buffers);
+  EXPECT_EQ(fake_.calls("vkFreeMemory"), 0U);
+  EXPECT_EQ(fake_.calls("vkDestroyBuffer"), 0U);
+}
+
+// The chunks are HOST_CACHED system memory (type 4 on the RTX 3060) unless
+// MOCKTAIL_ETC2_STAGING_MEMORY=coherent asks for the write-combined type 3,
+// and never the BAR (type 5).
+TEST(HostStagingMemoryTest, PrefersCachedSystemMemoryUnlessCoherentIsAsked) {
+  for (const Etc2StagingMemory kind :
+       {Etc2StagingMemory::kCached, Etc2StagingMemory::kCoherent}) {
+    FakeVulkanDevice fake;
+    Etc2EmulationOptions options = Options(1);
+    options.staging_memory = kind;
+    VulkanEtc2Emulation emulation(options);
+    const VkQueue queue = Register(&emulation, &fake);
+    const VkCommandPool pool = CreatePool(
+        &emulation, &fake, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT);
+    const Upload upload = RecordUpload(&emulation, &fake, pool);
+    const auto recorded = fake.RecordedBufferCopies(upload.command_buffer);
+    ASSERT_EQ(recorded.size(), 1U);
+    EXPECT_EQ(fake.MemoryTypeIndex(fake.BufferMemory(recorded[0].buffer)),
+              kind == Etc2StagingMemory::kCached ? 4U : 3U);
+    ASSERT_EQ(Submit(&emulation, &fake, queue, upload.command_buffer),
+              VK_SUCCESS);
+    emulation.ReleaseCommandBuffer(upload.command_buffer);
+    Destroy(&emulation, &fake, upload);
+    DestroyPool(&emulation, &fake, pool, {upload.command_buffer});
+    emulation.DestroyDevice(fake.device());
+    EXPECT_TRUE(fake.errors().empty()) << fake.errors().front();
+  }
+  // Without cached system memory: the coherent system type; without any
+  // system memory (an integrated GPU): the first coherent type.
+  FakeVulkanDevice::Config uncached;
+  uncached.memory.memoryTypes[4].propertyFlags &=
+      ~static_cast<VkMemoryPropertyFlags>(VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+  FakeVulkanDevice::Config unified;
+  for (std::uint32_t type = 0; type < unified.memory.memoryTypeCount; ++type) {
+    unified.memory.memoryTypes[type].propertyFlags |=
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+  }
+  for (const auto& [config, expected] :
+       {std::make_pair(uncached, 3U), std::make_pair(unified, 3U)}) {
+    FakeVulkanDevice fake(config);
+    VulkanEtc2Emulation emulation(Options(1));
+    Register(&emulation, &fake);
+    const VkCommandPool pool = CreatePool(&emulation, &fake, 0);
+    const Upload upload = RecordUpload(&emulation, &fake, pool);
+    const auto recorded = fake.RecordedBufferCopies(upload.command_buffer);
+    ASSERT_EQ(recorded.size(), 1U);
+    EXPECT_EQ(fake.MemoryTypeIndex(fake.BufferMemory(recorded[0].buffer)),
+              expected);
+    Destroy(&emulation, &fake, upload);
+    DestroyPool(&emulation, &fake, pool, {upload.command_buffer});
+    emulation.DestroyDevice(fake.device());
+  }
 }
 
 // ---- the fake itself -----------------------------------------------------

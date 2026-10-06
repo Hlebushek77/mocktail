@@ -570,7 +570,11 @@ TEST_F(Etc2DiagnosticsTest, DestroyDeviceDropsEveryRecordOfTheDevice) {
 }
 
 TEST_F(Etc2DiagnosticsTest, BeginReleasesTheLastRecording) {
-  VulkanEtc2Emulation emulation(Options(false));
+  // MOCKTAIL_ETC2_FAST_PATH=0: a one-off staging buffer per copy, gone at
+  // the next begin.
+  Etc2EmulationOptions options = Options(false);
+  options.fast_path = false;
+  VulkanEtc2Emulation emulation(options);
   testing::internal::CaptureStderr();
   Register(&emulation);
   emulation.RegisterCommandPool(device_, graphics_pool_, 0, 0);
@@ -584,6 +588,31 @@ TEST_F(Etc2DiagnosticsTest, BeginReleasesTheLastRecording) {
   EXPECT_EQ(fake_.buffers_created, fake_.buffers_destroyed);
   emulation.ForgetCommandPool(device_, graphics_pool_);
   emulation.DestroyDevice(device_);
+  testing::internal::GetCapturedStderr();
+}
+
+TEST_F(Etc2DiagnosticsTest, BeginReturnsTheLastRecordingsStagingRanges) {
+  // The fast path: both copies take ranges of one arena chunk, which stays
+  // for the next recording and goes with the device.
+  VulkanEtc2Emulation emulation(Options(false));
+  testing::internal::CaptureStderr();
+  Register(&emulation);
+  emulation.RegisterCommandPool(device_, graphics_pool_, 0, 0);
+  const VkImage image = CreateEtc2Image(&emulation);
+  const VkBuffer source = CreateSource(&emulation, 3);
+  const int before = fake_.buffers_created;
+  emulation.BeginCommandBuffer(command_buffer_, graphics_pool_, 0);
+  Copy(&emulation, command_buffer_, source, image);
+  Copy(&emulation, command_buffer_, source, image);
+  EXPECT_EQ(fake_.buffers_created - before, 1);
+  emulation.BeginCommandBuffer(command_buffer_, graphics_pool_, 0);
+  Copy(&emulation, command_buffer_, source, image);
+  EXPECT_EQ(fake_.buffers_created - before, 1) << "no buffer per copy";
+  emulation.BeginCommandBuffer(command_buffer_, graphics_pool_, 0);
+  EXPECT_EQ(fake_.buffers_created - fake_.buffers_destroyed, 1);
+  emulation.ForgetCommandPool(device_, graphics_pool_);
+  emulation.DestroyDevice(device_);
+  EXPECT_EQ(fake_.buffers_created, fake_.buffers_destroyed);
   testing::internal::GetCapturedStderr();
 }
 
@@ -668,7 +697,8 @@ TEST_F(Etc2DiagnosticsTest, FrameStatsCountTheUploadShape) {
       << "one window had ETC2 work";
   const std::string line = log.substr(window, line_end - window);
   for (const char* field :
-       {"submits=1 ", "record_calls=2 ", "staging_allocs=2 ", "uploads=3 ",
+       {"submits=1 ", "record_calls=2 ", "staging_allocs=0 ", "uploads=3 ",
+        "arena_mib=64.0(+0.0) ",
         "gpu=0 ", "fallback=3 ", "images=+2/-1 ", "copyimg=1 ",
         "aliasviews=1 ", "regions=3 ", "fam=0:2/0.0,1:1/0.0 ",
         "nocompute=1/0.0 ", "unknownfam=0 ", "begin=ot:1,sim:1,other:0 ",
@@ -689,7 +719,9 @@ TEST_F(Etc2DiagnosticsTest, FrameStatsCountTheUploadShape) {
   for (const char* field :
        {" | gpu uploads=0 ", " | cpu_route gpu_disabled=0 gpu_not_ready=0 "
                              "gpu_unavailable=3 ",
-        " | arena peak=0.0 MiB ", " | record calls=2 ", "destroyed=2 ",
+        " | arena peak=64.0 MiB over_cap=0.0 MiB staging_allocs=0 "
+        "staging_fallbacks=0 ",
+        " | record calls=2 ", "destroyed=2 ",
         "copies=1/0/1/0/0"}) {
     EXPECT_NE(totals_line.find(field), std::string::npos)
         << field << " in " << totals_line;

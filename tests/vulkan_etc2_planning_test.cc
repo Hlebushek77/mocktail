@@ -239,13 +239,12 @@ TEST(PlanRegionsTest, PlansStridesLayersAndStagingOfUnscaledRegions) {
   EXPECT_EQ(second.offset_y, 4);
   EXPECT_EQ(second.target_bytes, 378U);
 
-  // The host copies read tightly packed decoded texels from staging. Today
-  // the targets follow each other without padding, so the second starts at
-  // byte 60; CR-19 (WP1) moves it to a 16-byte boundary and must change
-  // these three numbers.
+  // The host copies read tightly packed decoded texels from staging, each
+  // region from a 16-byte boundary (CR-19): the first ends at byte 60 (30
+  // R16 texels), so the second starts at 64.
   EXPECT_EQ(first.target_offset, 0U);
-  EXPECT_EQ(second.target_offset, 60U);
-  EXPECT_EQ(plan.total, 438U);
+  EXPECT_EQ(second.target_offset, 64U);
+  EXPECT_EQ(plan.total, 442U);
   for (std::size_t index = 0; index < 2; ++index) {
     const VkBufferImageCopy& copy = plan.rewritten[index];
     EXPECT_EQ(copy.bufferOffset, plan.uploads[index].target_offset);
@@ -260,6 +259,32 @@ TEST(PlanRegionsTest, PlansStridesLayersAndStagingOfUnscaledRegions) {
   EXPECT_EQ(copy.imageOffset.y, 4);
   EXPECT_EQ(copy.imageExtent.width, 9U);
   EXPECT_EQ(copy.imageExtent.height, 7U);
+}
+
+// CR-19: R16 regions with an odd texel count end at 2 mod 4, and a
+// transfer-only queue needs every bufferOffset to be a multiple of 4
+// (VUID-vkCmdCopyBufferToImage-commandBuffer-07737). Every region starts on
+// a 16-byte boundary instead; the texels each region carries are unchanged.
+TEST(PlanRegionsTest, StartsEveryRegionOnASixteenByteBoundary) {
+  const Etc2ImageShape shape = Shape(VK_FORMAT_EAC_R11_UNORM_BLOCK, 1, 5, 3);
+  // 5x3, 1x1 and 3x1 texels: 30, 2 and 6 bytes of R16.
+  const Plan plan = PlanAll(shape, {Region(0, 0, 0, 0, 0, 1, 0, 0, 5, 3),
+                                    Region(64, 0, 0, 2, 0, 1, 0, 0, 1, 1),
+                                    Region(72, 0, 0, 0, 0, 1, 1, 1, 3, 1)});
+  ASSERT_TRUE(plan.ok);
+  ASSERT_EQ(plan.uploads.size(), 3U);
+  EXPECT_EQ(plan.uploads[0].target_offset, 0U);
+  EXPECT_EQ(plan.uploads[1].target_offset, 32U);
+  EXPECT_EQ(plan.uploads[2].target_offset, 48U);
+  EXPECT_EQ(plan.total, 54U) << "no padding after the last region";
+  for (std::size_t index = 0; index < plan.uploads.size(); ++index) {
+    EXPECT_EQ(plan.uploads[index].target_offset % 16, 0U);
+    EXPECT_EQ(plan.rewritten[index].bufferOffset,
+              plan.uploads[index].target_offset);
+  }
+  EXPECT_EQ(plan.uploads[0].target_bytes, 30U);
+  EXPECT_EQ(plan.uploads[1].target_bytes, 2U);
+  EXPECT_EQ(plan.uploads[2].target_bytes, 6U);
 }
 
 TEST(PlanRegionsTest, ScalesRegionsOfAnUpscaledImage) {

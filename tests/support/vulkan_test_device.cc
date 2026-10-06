@@ -2,6 +2,7 @@
 
 #include <dirent.h>
 #include <dlfcn.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cctype>
@@ -11,6 +12,63 @@
 
 namespace mocktail::graphics::testing {
 namespace {
+
+// The process name in /proc/<pid>/comm, or "" when it cannot be read.
+std::string ProcessName(long pid) {
+  const std::string path = "/proc/" + std::to_string(pid) + "/comm";
+  std::FILE* file = std::fopen(path.c_str(), "r");
+  if (file == nullptr) {
+    return {};
+  }
+  char name[64] = {};
+  const bool read = std::fgets(name, sizeof(name), file) != nullptr;
+  std::fclose(file);
+  if (!read) {
+    return {};
+  }
+  name[std::strcspn(name, "\n")] = '\0';
+  return name;
+}
+
+// The parent from /proc/<pid>/stat, or 0. The name in the second field may
+// hold spaces and parentheses, so the fields are read after the last ')'.
+long ParentProcess(long pid) {
+  const std::string path = "/proc/" + std::to_string(pid) + "/stat";
+  std::FILE* file = std::fopen(path.c_str(), "r");
+  if (file == nullptr) {
+    return 0;
+  }
+  char line[512] = {};
+  const bool read = std::fgets(line, sizeof(line), file) != nullptr;
+  std::fclose(file);
+  const char* name_end = read ? std::strrchr(line, ')') : nullptr;
+  char state = 0;
+  long parent = 0;
+  if (name_end == nullptr ||
+      std::sscanf(name_end + 1, " %c %ld", &state, &parent) != 2) {
+    return 0;
+  }
+  return parent;
+}
+
+// ctest runs the whole suite in parallel, and
+// AnyLinuxPackagingTest.RelocatedRuntimePaths runs a fixture binary named
+// mocktail: without this, every GPU test that starts during those two
+// seconds skips as if a game were running. A process that descends from
+// the ctest which started this test is another test, never a live game.
+bool StartedByThisCtestRun(long pid) {
+  const long ctest = static_cast<long>(getppid());
+  if (ctest <= 1 || ProcessName(ctest) != "ctest") {
+    return false;
+  }
+  for (int depth = 0; depth < 64 && pid > 1; ++depth) {
+    pid = ParentProcess(pid);
+    if (pid == ctest) {
+      return true;
+    }
+  }
+  return false;
+}
 
 // The loader stays loaded for the life of the process: unloading drivers at
 // exit is a known source of crashes, and nothing is gained by it.
@@ -80,21 +138,12 @@ bool LiveGameRunning(std::string* description) {
         })) {
       continue;
     }
-    const std::string path = std::string("/proc/") + pid + "/comm";
-    std::FILE* file = std::fopen(path.c_str(), "r");
-    if (file == nullptr) {
-      continue;
-    }
-    char name[64] = {};
-    const bool read = std::fgets(name, sizeof(name), file) != nullptr;
-    std::fclose(file);
-    if (!read) {
-      continue;
-    }
-    name[std::strcspn(name, "\n")] = '\0';
-    if (std::strcmp(name, "mocktail") == 0 || std::strcmp(name, "sober") == 0) {
+    const long number = std::strtol(pid, nullptr, 10);
+    const std::string name = ProcessName(number);
+    if ((name == "mocktail" || name == "sober") &&
+        !StartedByThisCtestRun(number)) {
       if (description != nullptr) {
-        *description = std::string(name) + " (pid " + pid + ")";
+        *description = name + " (pid " + pid + ")";
       }
       found = true;
       break;

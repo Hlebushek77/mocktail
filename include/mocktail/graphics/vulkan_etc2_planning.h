@@ -84,10 +84,14 @@ bool HostRegion(const Etc2ImageShape* image, std::uint32_t mip,
                 VkOffset3D offset, VkExtent3D extent, VkOffset3D* start,
                 VkOffset3D* end);
 
+// Where each region's decoded texels start in CPU-route staging.
+inline constexpr VkDeviceSize kEtc2StagingRegionAlignment = 16;
+
 // Plans the CPU route of one copy: per region an upload, and a rewritten
 // region that reads decoded texels tightly packed from a staging buffer at
-// offset 0 onward. `total` is the staging size. False when a region cannot
-// be served (bad extent, layered upscaled image, short row length).
+// offset 0 onward, each region starting kEtc2StagingRegionAlignment-aligned.
+// `total` is the staging size. False when a region cannot be served (bad
+// extent, layered upscaled image, short row length).
 template <typename Region>
 bool PlanRegions(const Etc2ImageShape& image, VkDevice device,
                  VkBuffer source, VkImage destination, std::uint32_t count,
