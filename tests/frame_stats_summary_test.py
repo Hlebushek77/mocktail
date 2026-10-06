@@ -134,6 +134,22 @@ class FrameStatsSummaryTest(unittest.TestCase):
         self.assertIn("lines: stalls>=20ms n=0 total=0 ms max=0 ms | "
                       "windows=1 avg fps=100.0", lines)
 
+    def test_reads_the_stall_suffix_with_and_without_a_path(self) -> None:
+        # plus.2 development builds named the CPU path; the release does
+        # not, since only one is left.
+        self.log.write_text(
+            "  [vulkan] ETC2 decode stall 30 ms: 9 uploads, 1.0 MiB "
+            "compressed, 8.0 MiB written (prepare 0, copy 10, decode 10, "
+            "write 10 ms) [threads 4, src t4 1.0 MiB]\n"
+            "  [vulkan] ETC2 decode stall 25 ms: 7 uploads, 0.5 MiB "
+            "compressed, 4.0 MiB written (prepare 0, copy 5, decode 10, "
+            "write 10 ms) [threads 8, path legacy, src t3 0.5 MiB]\n")
+        stalls = json.loads(run(str(self.log), "--json"))["phases"][0][
+            "stalls"]
+        self.assertEqual(stalls["count"], 2)
+        self.assertEqual(stalls["paths"], {"legacy": 1})
+        self.assertEqual(stalls["source_mib"], {"t3": 0.5, "t4": 1.0})
+
     def test_old_logs_without_these_lines_summarise_to_zero(self) -> None:
         self.log.write_text("[launcher] nothing measured\n")
         phase = json.loads(run(str(self.log), "--json"))["phases"][0]

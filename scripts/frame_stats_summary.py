@@ -50,7 +50,8 @@ FRAME_STATS = re.compile(
 STALL = re.compile(
     r"ETC2 decode stall (\d+) ms: (\d+) uploads, ([\d.]+) MiB compressed, "
     r"([\d.]+) MiB written \(prepare (\d+), copy (\d+), decode (\d+), "
-    r"write (\d+) ms\)(?: \[threads (\d+), path (\w+), src ([^\]]*) MiB\])?")
+    r"write (\d+) ms\)"
+    r"(?: \[threads (\d+), (?:path (\w+), )?src ([^\]]*) MiB\])?")
 STALL_LOOSE = re.compile(r"decode stall (\d+) ms")
 GPU_SUBMIT = re.compile(
     r"ETC2 GPU submit: (\d+) uploads, ([\d.]+) MiB compressed, ([\d.]+) MiB "
@@ -188,9 +189,11 @@ def summarise(lines: Iterable[str]) -> dict:
                 for index, name in enumerate(split, start=5):
                     split[name] += int(stall[index])
                 if stall[10]:
+                    # plus.2 development logs: the fast or the legacy path.
                     paths[stall[10]] = paths.get(stall[10], 0) + 1
+                if stall[11] is not None:
                     for item in re.findall(r"(t\d+|unknown) ([\d.]+)",
-                                           stall[11] or ""):
+                                           stall[11]):
                         stall_sources[item[0]] = round(
                             stall_sources.get(item[0], 0.0) + float(item[1]),
                             3)

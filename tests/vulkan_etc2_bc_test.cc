@@ -994,24 +994,28 @@ const char* TeardownName(ScenarioTeardown teardown) {
 }
 
 // Every scenario with MOCKTAIL_ETC2_TO_BC=1 on the fake device (BC, no
-// ETC2), on the fast path and the legacy one, with every teardown: the
+// ETC2), with the host staging arena and with one-off staging buffers (its
+// fallback), with every teardown: the
 // host images are BC images of the app's extent (BC mode never upscales,
 // so the upscale scenarios run as plain uploads), their blocks equal the
 // references', every copy and blit is what the model expects, and the
 // emulation gives back everything it made.
 class Etc2BcScenarioTest
     : public ::testing::TestWithParam<
-          std::tuple<std::string, bool, ScenarioTeardown>> {};
+          std::tuple<std::string, bool, ScenarioTeardown>> {
+ protected:
+  void TearDown() override { Etc2EmulationTesting().no_host_staging = false; }
+};
 
 TEST_P(Etc2BcScenarioTest, MatchesModelAndGolden) {
-  const auto& [name, fast_path, teardown] = GetParam();
+  const auto& [name, arena, teardown] = GetParam();
+  Etc2EmulationTesting().no_host_staging = !arena;
   const Scenario* scenario = FindEtc2EmulationScenario(name);
   ASSERT_NE(scenario, nullptr);
   FakeVulkanDevice fake;
   FakeEmulationBackend backend(&fake);
   ScenarioOptions options;
   options.emulation.to_bc = true;
-  options.emulation.fast_path = fast_path;
   options.teardown = teardown;
   if (teardown == ScenarioTeardown::kOrderly) {
     options.fake = &fake;  // the image copies and blits too
@@ -1054,7 +1058,7 @@ INSTANTIATE_TEST_SUITE_P(
     [](const ::testing::TestParamInfo<
         std::tuple<std::string, bool, ScenarioTeardown>>& info) {
       return std::get<0>(info.param) +
-             (std::get<1>(info.param) ? "_Fast_" : "_Legacy_") +
+             (std::get<1>(info.param) ? "_Arena_" : "_OneOffStaging_") +
              TeardownName(std::get<2>(info.param));
     });
 
@@ -1100,7 +1104,7 @@ bool BcServesOnTheGpu(const Scenario& scenario) {
 enum class BcFill {
   kPass,    // the etc2_bc dispatches in front of the batch
   kRescue,  // [CR-7] no slot after the warm-up: CPU-encoded, copied in
-  kRescueLegacyStaging,  // the same through one-off staging buffers
+  kRescueOneOffStaging,  // the same through one-off staging buffers
 };
 
 // With the GPU route on as well (MOCKTAIL_ETC2_GPU's default) and ready
@@ -1110,10 +1114,15 @@ enum class BcFill {
 // with every teardown, everything the route made is given back.
 class Etc2BcGpuRouteTest : public ::testing::TestWithParam<std::string> {
  protected:
-  void TearDown() override { Etc2GpuTesting().fail_slot_acquire = false; }
+  void TearDown() override {
+    Etc2GpuTesting().fail_slot_acquire = false;
+    Etc2EmulationTesting().no_host_staging = false;
+  }
 
   void RunAndCheck(ScenarioTeardown teardown, bool frame_stats,
                    BcFill fill = BcFill::kPass) {
+    Etc2EmulationTesting().no_host_staging =
+        fill == BcFill::kRescueOneOffStaging;
     const Scenario* scenario = FindEtc2EmulationScenario(GetParam());
     ASSERT_NE(scenario, nullptr);
     FakeVulkanDevice fake;
@@ -1123,7 +1132,6 @@ class Etc2BcGpuRouteTest : public ::testing::TestWithParam<std::string> {
     options.emulation.to_bc = true;
     options.emulation.gpu = true;
     options.emulation.frame_stats = frame_stats;
-    options.emulation.fast_path = fill != BcFill::kRescueLegacyStaging;
     if (teardown == ScenarioTeardown::kOrderly) {
       options.fake = &fake;  // the image copies and blits too
     }
@@ -1206,7 +1214,7 @@ TEST_P(Etc2BcGpuRouteTest, RescueMatchesTheBcGoldens) {
 
 TEST_P(Etc2BcGpuRouteTest, RescueWithOneOffStagingReleasesEverything) {
   RunAndCheck(ScenarioTeardown::kDestroyPool, false,
-              BcFill::kRescueLegacyStaging);
+              BcFill::kRescueOneOffStaging);
 }
 
 INSTANTIATE_TEST_SUITE_P(Scenarios, Etc2BcGpuRouteTest,
@@ -1280,13 +1288,13 @@ TEST(Etc2BcOverrideTest, Rgb8A1OverridesArePunchedThroughAtAlpha128) {
   submit.kind = ScenarioStep::Kind::kSubmit;
   submit.batches = {{0}};
   scenario.steps = {override_step, copy, submit};
-  for (const bool fast_path : {true, false}) {
-    SCOPED_TRACE(fast_path ? "fast path" : "legacy path");
+  for (const bool arena : {true, false}) {
+    SCOPED_TRACE(arena ? "host staging arena" : "one-off staging");
+    Etc2EmulationTesting().no_host_staging = !arena;
     FakeVulkanDevice fake;
     FakeEmulationBackend backend(&fake);
     ScenarioOptions options;
     options.emulation.to_bc = true;
-    options.emulation.fast_path = fast_path;
     ::testing::internal::CaptureStderr();
     const ScenarioRun run = RunEtc2Scenario(scenario, &backend, options);
     const std::string log = ::testing::internal::GetCapturedStderr();
@@ -1297,6 +1305,7 @@ TEST(Etc2BcOverrideTest, Rgb8A1OverridesArePunchedThroughAtAlpha128) {
     EXPECT_NE(log.find("texture override loaded"), std::string::npos) << log;
     EXPECT_TRUE(fake.errors().empty()) << fake.errors().front();
   }
+  Etc2EmulationTesting().no_host_staging = false;
   // The emulation's blocks equal the reference encoding of the resampled
   // override (checked above against the model); what those blocks decode
   // to, by D3D10 rules:

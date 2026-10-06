@@ -4,7 +4,6 @@
 
 #include <chrono>
 #include <cstdint>
-#include <vector>
 
 namespace mocktail::graphics {
 namespace {
@@ -52,22 +51,7 @@ TEST(Etc2DecodeTotalsTest, ReportsAtSixtyFourMebibytesAndEachDoubling) {
   EXPECT_FALSE(Etc2DecodeTotalsMilestone(UINT64_MAX - 1, UINT64_MAX));
 }
 
-// MOCKTAIL_ETC2_FAST_PATH=0 keeps plus.1's policy: above 32 MiB the
-// scratch goes after every submit.
-TEST(Etc2DecodeTotalsTest, LegacyPathGivesBackScratchLargerThanTheKeepSize) {
-  std::vector<std::uint8_t> kept(kEtc2LegacyScratchKeepBytes);
-  ReleaseOversizedEtc2Scratch(&kept);
-  EXPECT_EQ(kept.size(), kEtc2LegacyScratchKeepBytes);
-
-  std::vector<std::uint8_t> burst(kEtc2LegacyScratchKeepBytes + 1);
-  ReleaseOversizedEtc2Scratch(&burst);
-  EXPECT_TRUE(burst.empty());
-  EXPECT_EQ(burst.capacity(), 0U);
-
-  ReleaseOversizedEtc2Scratch(nullptr);
-}
-
-// The fast path keeps its scratch through a burst and gives back anything
+// The CPU route keeps its scratch through a burst and gives back anything
 // above 64 MiB only after 5 s without a submit that used it.
 TEST(Etc2DecodeTotalsTest, ScratchGrowsOnceAndGoesAfterFiveIdleSeconds) {
   using std::chrono::milliseconds;
@@ -105,15 +89,14 @@ TEST(Etc2DecodeTotalsTest, ScratchGrowsOnceAndGoesAfterFiveIdleSeconds) {
 
 TEST(Etc2DecodeTotalsTest, FormatsTheStallLineSuffix) {
   std::uint64_t by_type[kEtc2CountedMemoryTypes] = {};
-  EXPECT_EQ(FormatEtc2StallSuffix(1, false, by_type, 0),
-            " [threads 1, path legacy, src - MiB]");
+  EXPECT_EQ(FormatEtc2StallSuffix(1, by_type, 0), " [threads 1, src - MiB]");
   by_type[3] = 51065651;  // 48.7 MiB
   by_type[4] = 314573;  // 0.3 MiB
-  EXPECT_EQ(FormatEtc2StallSuffix(8, true, by_type, 0),
-            " [threads 8, path fast, src t3 48.7 t4 0.3 MiB]");
+  EXPECT_EQ(FormatEtc2StallSuffix(8, by_type, 0),
+            " [threads 8, src t3 48.7 t4 0.3 MiB]");
   by_type[4] = 0;
-  EXPECT_EQ(FormatEtc2StallSuffix(4, true, by_type, 3 * kMiB),
-            " [threads 4, path fast, src t3 48.7 unknown 3.0 MiB]");
+  EXPECT_EQ(FormatEtc2StallSuffix(4, by_type, 3 * kMiB),
+            " [threads 4, src t3 48.7 unknown 3.0 MiB]");
 }
 
 TEST(Etc2DecodeTotalsTest, NamesEveryCpuRouteReason) {

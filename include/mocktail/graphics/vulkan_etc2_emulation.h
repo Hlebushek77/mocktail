@@ -3,6 +3,7 @@
 
 #include <vulkan/vulkan.h>
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -91,7 +92,6 @@ enum class Etc2StagingMemory { kCached, kCoherent };
 // construct the emulation with explicit options instead.
 struct Etc2EmulationOptions {
   std::uint32_t upscale = kDefaultSmallTextureUpscale;  // MOCKTAIL_SMALL_TEXTURE_UPSCALE (1..8)
-  bool fast_path = true;          // MOCKTAIL_ETC2_FAST_PATH (development only)
   bool gpu = true;                // MOCKTAIL_ETC2_GPU
   bool to_bc = false;             // MOCKTAIL_ETC2_TO_BC
   unsigned workers = 0;           // MOCKTAIL_ETC2_WORKERS, 0: min(8, cores / 2)
@@ -108,6 +108,15 @@ struct Etc2EmulationOptions {
   static Etc2EmulationOptions FromLookup(
       const std::function<const char*(const char*)>& lookup);
 };
+
+// Test switches; production never sets them.
+struct Etc2EmulationTestHooks {
+  // Emulated devices get no host staging arena, so every CPU-route copy and
+  // every rescue takes a one-off staging buffer: the fallback for an arena
+  // that cannot grow.
+  std::atomic<bool> no_host_staging{false};
+};
+Etc2EmulationTestHooks& Etc2EmulationTesting();
 
 // A batch that only Mocktail's work is in, submitted by the caller through
 // the host vkQueueSubmit right before Roblox's batches (the GPU route's

@@ -279,12 +279,11 @@ bool Etc2DecodeTotalsMilestone(std::uint64_t before, std::uint64_t after) {
 }
 
 std::string FormatEtc2StallSuffix(
-    unsigned threads, bool fast_path,
+    unsigned threads,
     const std::uint64_t (&source_bytes_by_type)[kEtc2CountedMemoryTypes],
     std::uint64_t unknown_type_bytes) {
   std::string out;
-  Append(&out, " [threads %u, path %s, src", threads,
-         fast_path ? "fast" : "legacy");
+  Append(&out, " [threads %u, src", threads);
   bool any = false;
   for (std::size_t type = 0; type < kEtc2CountedMemoryTypes; ++type) {
     if (source_bytes_by_type[type] != 0) {
@@ -337,13 +336,6 @@ bool Etc2Scratch::ReleaseIfIdle(std::chrono::steady_clock::time_point now) {
 void Etc2Scratch::Release() {
   data_.reset();
   capacity_ = 0;
-}
-
-void ReleaseOversizedEtc2Scratch(std::vector<std::uint8_t>* scratch) {
-  if (scratch != nullptr &&
-      scratch->capacity() > kEtc2LegacyScratchKeepBytes) {
-    std::vector<std::uint8_t>().swap(*scratch);
-  }
 }
 
 }  // namespace mocktail::graphics

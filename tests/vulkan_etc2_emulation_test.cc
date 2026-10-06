@@ -80,16 +80,16 @@ void ExpectEverythingReleased(const FakeVulkanDevice& fake) {
   EXPECT_EQ(counts.live_mappings, 0U);
 }
 
-// The legacy path (MOCKTAIL_ETC2_FAST_PATH=0) gives each copy a staging
-// buffer of its own, which goes when its command buffer is released
-// (ReleaseRecordResources), before the device. The fast path takes ranges of
-// the host staging arena, whose chunks stay until the device goes; every
-// scenario's staging fits one chunk, so one chunk is all that may remain
-// (that the ranges themselves come back is checked by the arena tests
-// below).
-void ExpectStagingReleased(const FakeVulkanDevice& fake, bool fast_path) {
+// Without the host staging arena (the fallback for an arena that cannot
+// grow) each copy gets a staging buffer of its own, which goes when its
+// command buffer is released (ReleaseRecordResources), before the device.
+// With it, copies take ranges of the arena, whose chunks stay until the
+// device goes; every scenario's staging fits one chunk, so one chunk is all
+// that may remain (that the ranges themselves come back is checked by the
+// arena tests below).
+void ExpectStagingReleased(const FakeVulkanDevice& fake, bool arena) {
   const FakeVulkanDevice::Counts& counts = fake.counts();
-  if (!fast_path) {
+  if (!arena) {
     EXPECT_EQ(counts.entry_point_buffers.live(), 0U)
         << "staging buffers outlived their command buffers";
     EXPECT_EQ(counts.entry_point_memory.live(), 0U)
@@ -118,19 +118,20 @@ void ExpectGolden(const Scenario& scenario, std::uint64_t hash) {
       << GoldenLine(scenario.name, hash);
 }
 
-// Every scenario on both CPU paths: the fast path (the default) and the
-// legacy one that MOCKTAIL_ETC2_FAST_PATH=0 keeps for the A/B; both must
-// give the frozen plus.1 texels.
+// Every scenario with both kinds of CPU-route staging: ranges of the host
+// staging arena (the default) and one-off buffers (the fallback when the
+// arena cannot grow); both must give the frozen plus.1 texels.
 class Etc2EmulationScenarioTest
     : public ::testing::TestWithParam<std::tuple<std::string, bool>> {
  protected:
-  const std::string& name() const { return std::get<0>(GetParam()); }
-  bool fast_path() const { return std::get<1>(GetParam()); }
-  ScenarioOptions Options() const {
-    ScenarioOptions options;
-    options.emulation.fast_path = fast_path();
-    return options;
+  void SetUp() override {
+    Etc2EmulationTesting().no_host_staging = !arena();
   }
+  void TearDown() override { Etc2EmulationTesting().no_host_staging = false; }
+
+  const std::string& name() const { return std::get<0>(GetParam()); }
+  bool arena() const { return std::get<1>(GetParam()); }
+  ScenarioOptions Options() const { return ScenarioOptions(); }
 
   // Runs the scenario with `teardown` and checks everything but the image
   // copies against the model, the golden hash and the fake's counts.
@@ -143,7 +144,7 @@ class Etc2EmulationScenarioTest
     options.teardown = teardown;
     bool released = false;
     options.after_command_buffers = [&]() {
-      ExpectStagingReleased(fake, fast_path());
+      ExpectStagingReleased(fake, arena());
       released = true;
     };
     const ScenarioRun run = RunEtc2Scenario(*scenario, &backend, options);
@@ -166,7 +167,7 @@ TEST_P(Etc2EmulationScenarioTest, MatchesModelAndGolden) {
   ScenarioOptions options = Options();
   options.fake = &fake;
   options.after_command_buffers = [&]() {
-    ExpectStagingReleased(fake, fast_path());
+    ExpectStagingReleased(fake, arena());
   };
   const ScenarioRun run = RunEtc2Scenario(*scenario, &backend, options);
   ASSERT_FALSE(run.skipped) << run.skip_reason;
@@ -176,11 +177,11 @@ TEST_P(Etc2EmulationScenarioTest, MatchesModelAndGolden) {
   ExpectOnlyAllowedErrors(fake, *scenario);
   ExpectEverythingReleased(fake);
   ExpectGolden(*scenario, run.hash);
-  // Legacy: one staging buffer and allocation per copy command; fast: at
-  // most one arena chunk.
+  // One-off staging: one buffer and allocation per copy command; the
+  // arena: at most one chunk.
   RecordProperty("staging_allocations",
                  std::to_string(fake.calls("vkAllocateMemory")));
-  if (fast_path()) {
+  if (arena()) {
     EXPECT_LE(fake.calls("vkAllocateMemory"), 1U);
   }
 }
@@ -208,7 +209,7 @@ INSTANTIATE_TEST_SUITE_P(
     ::testing::Combine(::testing::ValuesIn(ScenarioNames()), ::testing::Bool()),
     [](const ::testing::TestParamInfo<std::tuple<std::string, bool>>& info) {
       return std::get<0>(info.param) +
-             (std::get<1>(info.param) ? "_Fast" : "_Legacy");
+             (std::get<1>(info.param) ? "_Arena" : "_OneOffStaging");
     });
 
 TEST(Etc2EmulationScenarioListTest, EveryScenarioHasAGoldenHash) {
@@ -693,21 +694,23 @@ void Destroy(VulkanEtc2Emulation* emulation, FakeVulkanDevice* fake,
   emulation->FreeMemory(fake->device(), upload.memory, nullptr);
 }
 
-// The direct staging tests on both CPU paths: the legacy path's one-off
-// buffers go with their command buffer, the fast path's arena chunk stays
-// with the device and takes its ranges back.
+// The direct staging tests with both kinds of staging: one-off buffers (the
+// fallback when the arena cannot grow) go with their command buffer, the
+// host staging arena's chunk stays with the device and takes its ranges
+// back.
 class VulkanEtc2EmulationPathTest : public ::testing::TestWithParam<bool> {
  protected:
-  bool fast_path() const { return GetParam(); }
-  Etc2EmulationOptions PathOptions() const {
-    Etc2EmulationOptions options = Options(1);
-    options.fast_path = fast_path();
-    return options;
+  void SetUp() override {
+    Etc2EmulationTesting().no_host_staging = !arena();
   }
+  void TearDown() override { Etc2EmulationTesting().no_host_staging = false; }
+
+  bool arena() const { return GetParam(); }
+  Etc2EmulationOptions PathOptions() const { return Options(1); }
   // Staging buffers (and memories) alive while `copies` copies are
-  // recorded: one each on the legacy path, one arena chunk on the fast one.
+  // recorded: one each without the arena, one arena chunk with it.
   std::uint64_t Staging(std::uint64_t copies) const {
-    return fast_path() ? 1 : copies;
+    return arena() ? 1 : copies;
   }
 };
 
@@ -725,8 +728,8 @@ TEST_P(VulkanEtc2EmulationPathTest, ReleasingACommandBufferFreesItsStaging) {
   EXPECT_EQ(fake.copy_buffer_to_image_regions(), 1U);
 
   emulation.ReleaseCommandBuffer(upload.command_buffer);
-  EXPECT_EQ(fake.counts().entry_point_buffers.live(), fast_path() ? 1U : 0U);
-  EXPECT_EQ(fake.counts().entry_point_memory.live(), fast_path() ? 1U : 0U);
+  EXPECT_EQ(fake.counts().entry_point_buffers.live(), arena() ? 1U : 0U);
+  EXPECT_EQ(fake.counts().entry_point_memory.live(), arena() ? 1U : 0U);
   emulation.ReleaseCommandBuffer(upload.command_buffer);  // nothing left
   // Nothing to decode either: only the emulation sees this submit (the
   // fake would run the copy from the staging that is gone).
@@ -773,7 +776,7 @@ TEST_P(VulkanEtc2EmulationPathTest, DestroyDeviceKeepsOtherDevicesStaging) {
   EXPECT_EQ(second.copy_buffer_to_image_regions(), 1U);
   emulation.ReleaseCommandBuffer(two.command_buffer);
   EXPECT_EQ(second.counts().entry_point_buffers.live(),
-            fast_path() ? 1U : 0U);
+            arena() ? 1U : 0U);
   Destroy(&emulation, &second, two);
   // The first pool goes after its device, as Roblox may do it.
   DestroyPool(&emulation, &first, first_pool, {one.command_buffer});
@@ -798,8 +801,8 @@ TEST_P(VulkanEtc2EmulationPathTest, PoolTeardownReleasesEveryCommandBuffer) {
   EXPECT_EQ(fake.counts().entry_point_buffers.live(), Staging(2));
   DestroyPool(&emulation, &fake, pool,
               {one.command_buffer, two.command_buffer});
-  EXPECT_EQ(fake.counts().entry_point_buffers.live(), fast_path() ? 1U : 0U);
-  EXPECT_EQ(fake.counts().entry_point_memory.live(), fast_path() ? 1U : 0U);
+  EXPECT_EQ(fake.counts().entry_point_buffers.live(), arena() ? 1U : 0U);
+  EXPECT_EQ(fake.counts().entry_point_memory.live(), arena() ? 1U : 0U);
   Destroy(&emulation, &fake, one);
   Destroy(&emulation, &fake, two);
   emulation.DestroyDevice(fake.device());
@@ -812,10 +815,11 @@ TEST_P(VulkanEtc2EmulationPathTest, PoolTeardownReleasesEveryCommandBuffer) {
 INSTANTIATE_TEST_SUITE_P(Paths, VulkanEtc2EmulationPathTest,
                          ::testing::Bool(),
                          [](const ::testing::TestParamInfo<bool>& info) {
-                           return std::string(info.param ? "Fast" : "Legacy");
+                           return std::string(info.param ? "Arena"
+                                                         : "OneOffStaging");
                          });
 
-// ---- the host staging arena (fast path) ------------------------------------
+// ---- the host staging arena ------------------------------------------------
 
 // One copy of a `size` x `size` ETC2 RGBA8 texture (4 x size^2 bytes of
 // staging) recorded into a fresh command buffer.

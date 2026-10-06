@@ -113,18 +113,23 @@ enum class Fill {
   kDecodePass,  // the decode pass in front of the batch
   // [CR-7] No slot comes free after the warm-up: the reserved rescue slot
   // copies what the CPU decoded into host staging (the arena's, or a
-  // one-off buffer with MOCKTAIL_ETC2_FAST_PATH=0).
+  // one-off buffer, its fallback when the arena cannot grow).
   kRescue,
-  kRescueLegacyStaging,
+  kRescueOneOffStaging,
 };
 
 class Etc2GpuRouteScenarioTest
     : public ::testing::TestWithParam<std::string> {
  protected:
-  void TearDown() override { Etc2GpuTesting().fail_slot_acquire = false; }
+  void TearDown() override {
+    Etc2GpuTesting().fail_slot_acquire = false;
+    Etc2EmulationTesting().no_host_staging = false;
+  }
 
   void RunAndCheck(ScenarioTeardown teardown, bool frame_stats,
                    Fill fill = Fill::kDecodePass) {
+    Etc2EmulationTesting().no_host_staging =
+        fill == Fill::kRescueOneOffStaging;
     const Scenario* scenario = FindEtc2EmulationScenario(GetParam());
     ASSERT_NE(scenario, nullptr);
     FakeVulkanDevice fake;
@@ -133,7 +138,6 @@ class Etc2GpuRouteScenarioTest
     options.teardown = teardown;
     options.emulation.gpu = true;
     options.emulation.frame_stats = frame_stats;
-    options.emulation.fast_path = fill != Fill::kRescueLegacyStaging;
     options.fake = &fake;
     if (fill != Fill::kDecodePass) {
       options.after_warm_up = [] { Etc2GpuTesting().fail_slot_acquire = true; };
@@ -201,7 +205,7 @@ TEST_P(Etc2GpuRouteScenarioTest, RescueMatchesTheGoldenHashes) {
 
 TEST_P(Etc2GpuRouteScenarioTest, RescueWithOneOffStagingReleasesEverything) {
   RunAndCheck(ScenarioTeardown::kResetPool, false,
-              Fill::kRescueLegacyStaging);
+              Fill::kRescueOneOffStaging);
 }
 
 TEST_P(Etc2GpuRouteScenarioTest, RescueThenDestroyDeviceReleasesEverything) {
@@ -532,6 +536,7 @@ class FakeRig {
 class Etc2GpuRouteFakeTest : public ::testing::Test {
  protected:
   void TearDown() override {
+    Etc2EmulationTesting().no_host_staging = false;
     Etc2GpuTestHooks& hooks = Etc2GpuTesting();
     hooks.fail_slot_acquire = false;
     hooks.fail_rescue_slot = false;
@@ -943,14 +948,14 @@ TEST_F(Etc2GpuRouteFakeTest, ARescueDecodesOnTheCpuIntoTheArena) {
 // The CPU half reads Roblox's bytes where the decode pass would: rows and
 // layers apart (bufferRowLength, bufferImageHeight), from a source Roblox
 // does not keep mapped (mapped for the submit, as on the CPU route), in
-// formats of every texel size. With MOCKTAIL_ETC2_FAST_PATH=0 its staging
-// is a one-off buffer that goes with Roblox's command buffer.
+// formats of every texel size. Without the host staging arena (its
+// fallback) the staging is a one-off buffer that goes with Roblox's command
+// buffer.
 TEST_F(Etc2GpuRouteFakeTest, ARescueReadsStridedLayeredAndUnmappedSources) {
-  for (const bool fast_path : {true, false}) {
-    SCOPED_TRACE(fast_path ? "host staging arena" : "one-off staging");
-    Etc2EmulationOptions options = GpuOptions();
-    options.fast_path = fast_path;
-    FakeRig rig(options);
+  for (const bool arena : {true, false}) {
+    SCOPED_TRACE(arena ? "host staging arena" : "one-off staging");
+    Etc2EmulationTesting().no_host_staging = !arena;
+    FakeRig rig(GpuOptions());
     ASSERT_TRUE(rig.WarmUp());
     const VkCommandPool pool = rig.Pool(0);
     RigSource* source = rig.Source(64 * 1024, 37);
@@ -982,7 +987,7 @@ TEST_F(Etc2GpuRouteFakeTest, ARescueReadsStridedLayeredAndUnmappedSources) {
       Etc2GpuTesting().fail_slot_acquire = false;
       EXPECT_EQ(rig.fake().calls("vkUnmapMemory"), unmaps + 1)
           << "the source was mapped for the submit only";
-      if (!fast_path) {
+      if (!arena) {
         EXPECT_EQ(rig.fake().counts().buffers.live(), buffers + 1)
             << "the rescue's one-off staging";
       }
@@ -1015,7 +1020,7 @@ TEST_F(Etc2GpuRouteFakeTest, ARescueReadsStridedLayeredAndUnmappedSources) {
       }
       // Roblox resets the command buffer: the staging goes with it.
       rig.emulation().ReleaseCommandBuffer(command_buffer);
-      if (!fast_path) {
+      if (!arena) {
         EXPECT_EQ(rig.fake().counts().buffers.live(), buffers);
       }
     }

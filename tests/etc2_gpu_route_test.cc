@@ -530,6 +530,7 @@ class Etc2GpuRouteTest : public ::testing::Test {
     device_->TakeValidationMessages();
   }
   void TearDown() override {
+    Etc2EmulationTesting().no_host_staging = false;
     Etc2GpuTestHooks& hooks = Etc2GpuTesting();
     hooks.fail_slot_acquire = false;
     hooks.fail_rescue_slot = false;
@@ -798,18 +799,16 @@ TEST_F(Etc2GpuRouteTest, ATransferOnlyFamilyTakesTheCpuRoute) {
 }
 
 // [CR-7] No slot comes free: the reserved rescue slot copies what the CPU
-// decoded into host staging (the arena's, or a one-off buffer with
-// MOCKTAIL_ETC2_FAST_PATH=0) into the output arena, and Roblox's rewritten
-// copies read it after the pass's TRANSFER->TRANSFER barrier. Whole mip
-// chains, and padded rows and layers from a source Roblox does not keep
-// mapped. With the rescue slot taken as well, the uploads are dropped:
+// decoded into host staging (the arena's, or a one-off buffer, its fallback)
+// into the output arena, and Roblox's rewritten copies read it after the
+// pass's TRANSFER->TRANSFER barrier. Whole mip chains, and padded rows and
+// layers from a source Roblox does not keep mapped. With the rescue slot taken as well, the uploads are dropped:
 // counted, and the call still goes through.
 TEST_F(Etc2GpuRouteTest, ARescueWithNoSlotCopiesCpuTexelsIntoTheArena) {
-  for (const bool fast_path : {true, false}) {
-    SCOPED_TRACE(fast_path ? "host staging arena" : "one-off staging");
-    Etc2EmulationOptions options = GpuOptions();
-    options.fast_path = fast_path;
-    Rig rig(device_, options);
+  for (const bool arena : {true, false}) {
+    SCOPED_TRACE(arena ? "host staging arena" : "one-off staging");
+    Etc2EmulationTesting().no_host_staging = !arena;
+    Rig rig(device_, GpuOptions());
     ASSERT_TRUE(rig.WarmUp(queue()));
     const VkCommandPool pool = rig.Pool(device_->queue_family());
     RigImage* chain = rig.Image(VK_FORMAT_ETC2_R8G8B8_SRGB_BLOCK, 50, 30, 4);

@@ -364,7 +364,6 @@ class Etc2DiagnosticsTest : public ::testing::Test {
 TEST(Etc2EmulationOptionsTest, ReadsEveryVariable) {
   const std::map<std::string, const char*> environment = {
       {"MOCKTAIL_SMALL_TEXTURE_UPSCALE", "2"},
-      {"MOCKTAIL_ETC2_FAST_PATH", "0"},
       {"MOCKTAIL_ETC2_GPU", "off"},
       {"MOCKTAIL_ETC2_TO_BC", "true"},
       {"MOCKTAIL_ETC2_WORKERS", "3"},
@@ -380,7 +379,6 @@ TEST(Etc2EmulationOptionsTest, ReadsEveryVariable) {
         return found != environment.end() ? found->second : nullptr;
       });
   EXPECT_EQ(options.upscale, 2U);
-  EXPECT_FALSE(options.fast_path);
   EXPECT_FALSE(options.gpu);
   EXPECT_TRUE(options.to_bc);
   EXPECT_EQ(options.workers, 3U);
@@ -395,7 +393,6 @@ TEST(Etc2EmulationOptionsTest, KeepsDefaultsForUnsetOrUnknownValues) {
   const Etc2EmulationOptions unset = Etc2EmulationOptions::FromLookup(
       [](const char*) -> const char* { return nullptr; });
   EXPECT_EQ(unset.upscale, kDefaultSmallTextureUpscale);
-  EXPECT_TRUE(unset.fast_path);
   EXPECT_TRUE(unset.gpu);
   EXPECT_FALSE(unset.to_bc);
   EXPECT_EQ(unset.workers, 0U);
@@ -570,11 +567,10 @@ TEST_F(Etc2DiagnosticsTest, DestroyDeviceDropsEveryRecordOfTheDevice) {
 }
 
 TEST_F(Etc2DiagnosticsTest, BeginReleasesTheLastRecording) {
-  // MOCKTAIL_ETC2_FAST_PATH=0: a one-off staging buffer per copy, gone at
-  // the next begin.
-  Etc2EmulationOptions options = Options(false);
-  options.fast_path = false;
-  VulkanEtc2Emulation emulation(options);
+  // Without the host staging arena (the fallback when it cannot grow): a
+  // one-off staging buffer per copy, gone at the next begin.
+  Etc2EmulationTesting().no_host_staging = true;
+  VulkanEtc2Emulation emulation(Options(false));
   testing::internal::CaptureStderr();
   Register(&emulation);
   emulation.RegisterCommandPool(device_, graphics_pool_, 0, 0);
@@ -588,12 +584,13 @@ TEST_F(Etc2DiagnosticsTest, BeginReleasesTheLastRecording) {
   EXPECT_EQ(fake_.buffers_created, fake_.buffers_destroyed);
   emulation.ForgetCommandPool(device_, graphics_pool_);
   emulation.DestroyDevice(device_);
+  Etc2EmulationTesting().no_host_staging = false;
   testing::internal::GetCapturedStderr();
 }
 
 TEST_F(Etc2DiagnosticsTest, BeginReturnsTheLastRecordingsStagingRanges) {
-  // The fast path: both copies take ranges of one arena chunk, which stays
-  // for the next recording and goes with the device.
+  // The host staging arena: both copies take ranges of one chunk, which
+  // stays for the next recording and goes with the device.
   VulkanEtc2Emulation emulation(Options(false));
   testing::internal::CaptureStderr();
   Register(&emulation);
