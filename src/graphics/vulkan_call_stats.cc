@@ -9,6 +9,7 @@
 #include <cstring>
 #include <mutex>
 #include <type_traits>
+#include <unordered_map>
 
 namespace mocktail::graphics {
 namespace {
@@ -31,8 +32,60 @@ bool g_frame_started = false;
 std::uint64_t g_window_start_ns = 0;
 std::uint64_t g_frames = 0;
 
+// The formats of the images created while enabled. Never destroyed, like
+// the atomics, so a hook racing process exit finds a live map.
+struct RememberedImages {
+  std::mutex mutex;
+  std::unordered_map<VkImage, VkFormat> formats;
+};
+
+RememberedImages& Images() {
+  static RememberedImages* const images = new RememberedImages;
+  return *images;
+}
+
+bool RememberedFormat(VkImage image, VkFormat* format) {
+  if (image == VK_NULL_HANDLE) {
+    return false;
+  }
+  RememberedImages& images = Images();
+  std::lock_guard<std::mutex> lock(images.mutex);
+  const auto found = images.formats.find(image);
+  if (found == images.formats.end()) {
+    return false;
+  }
+  *format = found->second;
+  return true;
+}
+
 constexpr std::size_t Index(VkCallCounter counter) {
   return static_cast<std::size_t>(counter);
+}
+
+template <typename Region>
+std::uint64_t RegionBytes(VkFormat format, std::uint32_t region_count,
+                          const Region* regions) {
+  VkFormatTexelBlock block;
+  if (regions == nullptr || !LookupVkFormatTexelBlock(format, &block)) {
+    return 0;
+  }
+  std::uint64_t bytes = 0;
+  for (std::uint32_t i = 0; i < region_count; ++i) {
+    const VkExtent3D& extent = regions[i].imageExtent;
+    const std::uint32_t layers = regions[i].imageSubresource.layerCount;
+    const std::uint64_t columns =
+        (static_cast<std::uint64_t>(extent.width) + block.width - 1) /
+        block.width;
+    const std::uint64_t rows =
+        (static_cast<std::uint64_t>(extent.height) + block.height - 1) /
+        block.height;
+    bytes += columns * rows * std::max<std::uint64_t>(extent.depth, 1) *
+             (layers == VK_REMAINING_ARRAY_LAYERS
+                  ? 1
+                  : std::max<std::uint64_t>(layers, 1)) *
+             block.bytes;
+  }
+  return bytes;
 }
 
 #define MOCKTAIL_VK_CALL_STATS_WRAPPER(name, counter, ret, params, args,     \
@@ -190,7 +243,7 @@ void AddVkCallStatsBytes(VkCallCounter counter, std::uint64_t bytes) {
   }
 }
 
-void VkCallStatsCountCreateImage(VkFormat format) {
+void VkCallStatsCountCreateImage(VkImage image, VkFormat format) {
   if (!VkCallStatsEnabled()) {
     return;
   }
@@ -198,6 +251,65 @@ void VkCallStatsCountCreateImage(VkFormat format) {
       1, std::memory_order_relaxed);
   g_created_images[static_cast<std::size_t>(ClassifyVkImageFormat(format))]
       .fetch_add(1, std::memory_order_relaxed);
+  if (image != VK_NULL_HANDLE) {
+    RememberedImages& images = Images();
+    std::lock_guard<std::mutex> lock(images.mutex);
+    images.formats[image] = format;
+  }
+}
+
+void VkCallStatsCountDestroyImage(VkImage image) {
+  if (!VkCallStatsEnabled()) {
+    return;
+  }
+  g_calls[Index(VkCallCounter::kDestroyImage)].fetch_add(
+      1, std::memory_order_relaxed);
+  if (image != VK_NULL_HANDLE) {
+    RememberedImages& images = Images();
+    std::lock_guard<std::mutex> lock(images.mutex);
+    images.formats.erase(image);
+  }
+}
+
+void VkCallStatsCountImageView(VkImage image, VkFormat view_format) {
+  if (!VkCallStatsEnabled()) {
+    return;
+  }
+  VkFormat image_format = VK_FORMAT_UNDEFINED;
+  if (RememberedFormat(image, &image_format) && image_format != view_format) {
+    g_calls[Index(VkCallCounter::kAliasView)].fetch_add(
+        1, std::memory_order_relaxed);
+  }
+}
+
+void VkCallStatsCountCopyBufferToImage(VkImage image,
+                                       std::uint32_t region_count,
+                                       const VkBufferImageCopy* regions) {
+  if (!VkCallStatsEnabled()) {
+    return;
+  }
+  g_calls[Index(VkCallCounter::kCopyBufferToImage)].fetch_add(
+      1, std::memory_order_relaxed);
+  VkFormat format = VK_FORMAT_UNDEFINED;
+  if (RememberedFormat(image, &format)) {
+    g_bytes[Index(VkCallCounter::kCopyBufferToImage)].fetch_add(
+        BufferImageCopyBytes(format, region_count, regions),
+        std::memory_order_relaxed);
+  }
+}
+
+void VkCallStatsCountCopyBufferToImage2(const VkCopyBufferToImageInfo2* info) {
+  if (!VkCallStatsEnabled()) {
+    return;
+  }
+  g_calls[Index(VkCallCounter::kCopyBufferToImage)].fetch_add(
+      1, std::memory_order_relaxed);
+  VkFormat format = VK_FORMAT_UNDEFINED;
+  if (info != nullptr && RememberedFormat(info->dstImage, &format)) {
+    g_bytes[Index(VkCallCounter::kCopyBufferToImage)].fetch_add(
+        BufferImageCopyBytes(format, info->regionCount, info->pRegions),
+        std::memory_order_relaxed);
+  }
 }
 
 void AddVkCallStatsBlocked(VkBlockedCall call, std::uint64_t nanoseconds) {
@@ -235,6 +347,95 @@ std::uint64_t MappedRangeBytes(std::uint32_t range_count,
     }
   }
   return bytes;
+}
+
+bool LookupVkFormatTexelBlock(VkFormat format, VkFormatTexelBlock* block) {
+  const auto in = [format](VkFormat first, VkFormat last) {
+    return format >= first && format <= last;
+  };
+  // ASTC block sizes, in the order of the UNORM/SRGB pairs and of the
+  // SFLOAT formats.
+  static constexpr std::uint8_t kAstcBlocks[][2] = {
+      {4, 4}, {5, 4},  {5, 5},  {6, 5},  {6, 6},   {8, 5},   {8, 6},
+      {8, 8}, {10, 5}, {10, 6}, {10, 8}, {10, 10}, {12, 10}, {12, 12},
+  };
+  VkFormatTexelBlock found;
+  if (format == VK_FORMAT_R4G4_UNORM_PACK8 ||
+      in(VK_FORMAT_R8_UNORM, VK_FORMAT_R8_SRGB) ||
+      format == VK_FORMAT_S8_UINT) {
+    found.bytes = 1;
+  } else if (in(VK_FORMAT_R4G4B4A4_UNORM_PACK16,
+                VK_FORMAT_A1R5G5B5_UNORM_PACK16) ||
+             in(VK_FORMAT_R8G8_UNORM, VK_FORMAT_R8G8_SRGB) ||
+             in(VK_FORMAT_R16_UNORM, VK_FORMAT_R16_SFLOAT) ||
+             format == VK_FORMAT_D16_UNORM ||
+             format == VK_FORMAT_A4R4G4B4_UNORM_PACK16 ||
+             format == VK_FORMAT_A4B4G4R4_UNORM_PACK16) {
+    found.bytes = 2;
+  } else if (in(VK_FORMAT_R8G8B8_UNORM, VK_FORMAT_B8G8R8_SRGB)) {
+    found.bytes = 3;
+  } else if (in(VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_A2B10G10R10_SINT_PACK32) ||
+             in(VK_FORMAT_R16G16_UNORM, VK_FORMAT_R16G16_SFLOAT) ||
+             in(VK_FORMAT_R32_UINT, VK_FORMAT_R32_SFLOAT) ||
+             in(VK_FORMAT_B10G11R11_UFLOAT_PACK32,
+                VK_FORMAT_E5B9G9R9_UFLOAT_PACK32) ||
+             format == VK_FORMAT_X8_D24_UNORM_PACK32 ||
+             format == VK_FORMAT_D32_SFLOAT) {
+    found.bytes = 4;
+  } else if (in(VK_FORMAT_R16G16B16_UNORM, VK_FORMAT_R16G16B16_SFLOAT)) {
+    found.bytes = 6;
+  } else if (in(VK_FORMAT_R16G16B16A16_UNORM, VK_FORMAT_R16G16B16A16_SFLOAT) ||
+             in(VK_FORMAT_R32G32_UINT, VK_FORMAT_R32G32_SFLOAT) ||
+             in(VK_FORMAT_R64_UINT, VK_FORMAT_R64_SFLOAT)) {
+    found.bytes = 8;
+  } else if (in(VK_FORMAT_R32G32B32_UINT, VK_FORMAT_R32G32B32_SFLOAT)) {
+    found.bytes = 12;
+  } else if (in(VK_FORMAT_R32G32B32A32_UINT, VK_FORMAT_R32G32B32A32_SFLOAT) ||
+             in(VK_FORMAT_R64G64_UINT, VK_FORMAT_R64G64_SFLOAT)) {
+    found.bytes = 16;
+  } else if (in(VK_FORMAT_R64G64B64_UINT, VK_FORMAT_R64G64B64_SFLOAT)) {
+    found.bytes = 24;
+  } else if (in(VK_FORMAT_R64G64B64A64_UINT, VK_FORMAT_R64G64B64A64_SFLOAT)) {
+    found.bytes = 32;
+  } else if (in(VK_FORMAT_BC1_RGB_UNORM_BLOCK, VK_FORMAT_BC1_RGBA_SRGB_BLOCK) ||
+             in(VK_FORMAT_BC4_UNORM_BLOCK, VK_FORMAT_BC4_SNORM_BLOCK) ||
+             in(VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK,
+                VK_FORMAT_ETC2_R8G8B8A1_SRGB_BLOCK) ||
+             in(VK_FORMAT_EAC_R11_UNORM_BLOCK, VK_FORMAT_EAC_R11_SNORM_BLOCK)) {
+    found = {8, 4, 4};
+  } else if (in(VK_FORMAT_BC2_UNORM_BLOCK, VK_FORMAT_BC3_SRGB_BLOCK) ||
+             in(VK_FORMAT_BC5_UNORM_BLOCK, VK_FORMAT_BC7_SRGB_BLOCK) ||
+             in(VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK,
+                VK_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK) ||
+             in(VK_FORMAT_EAC_R11G11_UNORM_BLOCK,
+                VK_FORMAT_EAC_R11G11_SNORM_BLOCK)) {
+    found = {16, 4, 4};
+  } else if (in(VK_FORMAT_ASTC_4x4_UNORM_BLOCK,
+                VK_FORMAT_ASTC_12x12_SRGB_BLOCK)) {
+    const auto* dims =
+        kAstcBlocks[(format - VK_FORMAT_ASTC_4x4_UNORM_BLOCK) / 2];
+    found = {16, dims[0], dims[1]};
+  } else if (in(VK_FORMAT_ASTC_4x4_SFLOAT_BLOCK,
+                VK_FORMAT_ASTC_12x12_SFLOAT_BLOCK)) {
+    const auto* dims = kAstcBlocks[format - VK_FORMAT_ASTC_4x4_SFLOAT_BLOCK];
+    found = {16, dims[0], dims[1]};
+  } else {
+    return false;
+  }
+  if (block != nullptr) {
+    *block = found;
+  }
+  return true;
+}
+
+std::uint64_t BufferImageCopyBytes(VkFormat format, std::uint32_t region_count,
+                                   const VkBufferImageCopy* regions) {
+  return RegionBytes(format, region_count, regions);
+}
+
+std::uint64_t BufferImageCopyBytes(VkFormat format, std::uint32_t region_count,
+                                   const VkBufferImageCopy2* regions) {
+  return RegionBytes(format, region_count, regions);
 }
 
 void TakeVkCallStatsCounts(VkCallStatsWindow* window) {
@@ -411,6 +612,11 @@ void ResetVkCallStatsForTesting() {
     host->store(nullptr, std::memory_order_release);
   }
   g_dispatch_observer.store(nullptr, std::memory_order_release);
+  {
+    RememberedImages& images = Images();
+    std::lock_guard<std::mutex> lock(images.mutex);
+    images.formats.clear();
+  }
   g_forced_enabled.store(-1, std::memory_order_relaxed);
 }
 

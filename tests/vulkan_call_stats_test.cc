@@ -401,7 +401,8 @@ TEST_F(VulkanCallStatsTest, HookCountersCountOnlyWhileEnabled) {
   ForceVkCallStatsEnabledForTesting(false);
   VkCallStatsCount(VkCallCounter::kQueueSubmit);
   AddVkCallStatsBytes(VkCallCounter::kCopyBufferToImage, 4096);
-  VkCallStatsCountCreateImage(VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK);
+  VkCallStatsCountCreateImage(VK_NULL_HANDLE,
+                              VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK);
   AddVkCallStatsBlocked(VkBlockedCall::kWaitForFences, 5000000);
   VkCallStatsWindow window = Take();
   EXPECT_EQ(window.calls, decltype(window.calls){});
@@ -414,9 +415,10 @@ TEST_F(VulkanCallStatsTest, HookCountersCountOnlyWhileEnabled) {
   VkCallStatsCount(VkCallCounter::kQueueSubmit, 2);
   VkCallStatsCount(VkCallCounter::kCopyBufferToImage);
   AddVkCallStatsBytes(VkCallCounter::kCopyBufferToImage, 4096);
-  VkCallStatsCountCreateImage(VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK);
-  VkCallStatsCountCreateImage(VK_FORMAT_BC7_UNORM_BLOCK);
-  VkCallStatsCountCreateImage(VK_FORMAT_R8G8B8A8_SRGB);
+  VkCallStatsCountCreateImage(VK_NULL_HANDLE,
+                              VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK);
+  VkCallStatsCountCreateImage(VK_NULL_HANDLE, VK_FORMAT_BC7_UNORM_BLOCK);
+  VkCallStatsCountCreateImage(VK_NULL_HANDLE, VK_FORMAT_R8G8B8A8_SRGB);
   AddVkCallStatsBlocked(VkBlockedCall::kWaitForFences, 5000000);
   AddVkCallStatsBlocked(VkBlockedCall::kWaitIdle, 7);
   VkCallStatsCount(VkCallCounter::kCount);  // ignored, out of range
@@ -446,6 +448,201 @@ TEST_F(VulkanCallStatsTest, HookCountersCountOnlyWhileEnabled) {
   // Taking a window starts again from zero.
   window = Take();
   EXPECT_EQ(window.calls, decltype(window.calls){});
+}
+
+VkImage FakeImage(std::uintptr_t value) {
+  return reinterpret_cast<VkImage>(value);
+}
+
+VkBufferImageCopy ImageCopy(std::uint32_t width, std::uint32_t height,
+                            std::uint32_t depth = 1,
+                            std::uint32_t layers = 1) {
+  VkBufferImageCopy region{};
+  region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  region.imageSubresource.layerCount = layers;
+  region.imageExtent = {width, height, depth};
+  return region;
+}
+
+TEST_F(VulkanCallStatsTest, RemembersImageFormatsForViewsAndCopies) {
+  const VkImage etc2 = FakeImage(0x1000);
+  const VkImage bc7 = FakeImage(0x2000);
+  const VkImage unknown = FakeImage(0x3000);
+  VkCallStatsCountCreateImage(etc2, VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK);
+  VkCallStatsCountCreateImage(bc7, VK_FORMAT_BC7_SRGB_BLOCK);
+
+  // Same format: not an alias. Another format, or a block-compatible uint
+  // view as GPU compressors use: an alias. Unknown images never count.
+  VkCallStatsCountImageView(etc2, VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK);
+  VkCallStatsCountImageView(etc2, VK_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK);
+  VkCallStatsCountImageView(bc7, VK_FORMAT_R32G32B32A32_UINT);
+  VkCallStatsCountImageView(unknown, VK_FORMAT_R8G8B8A8_UNORM);
+  VkCallStatsCountImageView(VK_NULL_HANDLE, VK_FORMAT_R8G8B8A8_UNORM);
+
+  // 64x64 ETC2 RGBA8: 16x16 blocks of 16 bytes. 30x30 BC7 in two layers:
+  // 8x8 blocks of 16 bytes per layer, the last row and column partial.
+  const VkBufferImageCopy etc2_region = ImageCopy(64, 64);
+  VkCallStatsCountCopyBufferToImage(etc2, 1, &etc2_region);
+  VkBufferImageCopy2 bc7_region{};
+  bc7_region.sType = VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2;
+  bc7_region.imageSubresource.layerCount = 2;
+  bc7_region.imageExtent = {30, 30, 1};
+  VkCopyBufferToImageInfo2 bc7_copy{};
+  bc7_copy.sType = VK_STRUCTURE_TYPE_COPY_BUFFER_TO_IMAGE_INFO_2;
+  bc7_copy.dstImage = bc7;
+  bc7_copy.regionCount = 1;
+  bc7_copy.pRegions = &bc7_region;
+  VkCallStatsCountCopyBufferToImage2(&bc7_copy);
+  // Counted, without bytes: the destination's format is not known.
+  VkCallStatsCountCopyBufferToImage(unknown, 1, &etc2_region);
+  VkCallStatsCountCopyBufferToImage2(nullptr);
+
+  VkCallStatsWindow window = Take();
+  const auto calls = [&window](VkCallCounter counter) {
+    return window.calls[static_cast<std::size_t>(counter)];
+  };
+  EXPECT_EQ(calls(VkCallCounter::kCreateImage), 2U);
+  EXPECT_EQ(calls(VkCallCounter::kAliasView), 2U);
+  EXPECT_EQ(calls(VkCallCounter::kCopyBufferToImage), 4U);
+  EXPECT_EQ(window.bytes[static_cast<std::size_t>(
+                VkCallCounter::kCopyBufferToImage)],
+            4096U + 2048U);
+
+  // A destroyed image is forgotten; so is anything created while off.
+  VkCallStatsCountDestroyImage(etc2);
+  VkCallStatsCountImageView(etc2, VK_FORMAT_R32G32B32A32_UINT);
+  ForceVkCallStatsEnabledForTesting(false);
+  VkCallStatsCountCreateImage(unknown, VK_FORMAT_BC1_RGB_UNORM_BLOCK);
+  VkCallStatsCountDestroyImage(bc7);
+  VkCallStatsCountImageView(bc7, VK_FORMAT_R32G32B32A32_UINT);
+  ForceVkCallStatsEnabledForTesting(true);
+  VkCallStatsCountImageView(unknown, VK_FORMAT_R32G32_UINT);
+  // bc7 was not forgotten by the destroy made while off.
+  VkCallStatsCountImageView(bc7, VK_FORMAT_R32G32B32A32_UINT);
+  window = Take();
+  EXPECT_EQ(calls(VkCallCounter::kDestroyImage), 1U);
+  EXPECT_EQ(calls(VkCallCounter::kCreateImage), 0U);
+  EXPECT_EQ(calls(VkCallCounter::kAliasView), 1U);
+
+  // A reset forgets every image.
+  ResetVkCallStatsForTesting();
+  ForceVkCallStatsEnabledForTesting(true);
+  VkCallStatsCountImageView(bc7, VK_FORMAT_R32G32B32A32_UINT);
+  window = Take();
+  EXPECT_EQ(calls(VkCallCounter::kAliasView), 0U);
+}
+
+TEST_F(VulkanCallStatsTest, KnowsTheTexelBlockOfEveryCoreFormat) {
+  struct Case {
+    VkFormat format;
+    std::uint32_t bytes;
+    std::uint32_t width;
+    std::uint32_t height;
+  };
+  const std::vector<Case> cases = {
+      {VK_FORMAT_R4G4_UNORM_PACK8, 1, 1, 1},
+      {VK_FORMAT_R8_UNORM, 1, 1, 1},
+      {VK_FORMAT_S8_UINT, 1, 1, 1},
+      {VK_FORMAT_B5G6R5_UNORM_PACK16, 2, 1, 1},
+      {VK_FORMAT_R8G8_SRGB, 2, 1, 1},
+      {VK_FORMAT_R16_SFLOAT, 2, 1, 1},
+      {VK_FORMAT_D16_UNORM, 2, 1, 1},
+      {VK_FORMAT_A4B4G4R4_UNORM_PACK16, 2, 1, 1},
+      {VK_FORMAT_B8G8R8_SRGB, 3, 1, 1},
+      {VK_FORMAT_R8G8B8A8_SRGB, 4, 1, 1},
+      {VK_FORMAT_B8G8R8A8_UNORM, 4, 1, 1},
+      {VK_FORMAT_A2B10G10R10_UNORM_PACK32, 4, 1, 1},
+      {VK_FORMAT_R16G16_SFLOAT, 4, 1, 1},
+      {VK_FORMAT_R32_SFLOAT, 4, 1, 1},
+      {VK_FORMAT_B10G11R11_UFLOAT_PACK32, 4, 1, 1},
+      {VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, 4, 1, 1},
+      {VK_FORMAT_X8_D24_UNORM_PACK32, 4, 1, 1},
+      {VK_FORMAT_D32_SFLOAT, 4, 1, 1},
+      {VK_FORMAT_R16G16B16_UNORM, 6, 1, 1},
+      {VK_FORMAT_R16G16B16A16_SFLOAT, 8, 1, 1},
+      {VK_FORMAT_R32G32_UINT, 8, 1, 1},
+      {VK_FORMAT_R64_SFLOAT, 8, 1, 1},
+      {VK_FORMAT_R32G32B32_SFLOAT, 12, 1, 1},
+      {VK_FORMAT_R32G32B32A32_UINT, 16, 1, 1},
+      {VK_FORMAT_R64G64_UINT, 16, 1, 1},
+      {VK_FORMAT_R64G64B64_SINT, 24, 1, 1},
+      {VK_FORMAT_R64G64B64A64_SFLOAT, 32, 1, 1},
+      {VK_FORMAT_BC1_RGB_UNORM_BLOCK, 8, 4, 4},
+      {VK_FORMAT_BC1_RGBA_SRGB_BLOCK, 8, 4, 4},
+      {VK_FORMAT_BC2_UNORM_BLOCK, 16, 4, 4},
+      {VK_FORMAT_BC3_SRGB_BLOCK, 16, 4, 4},
+      {VK_FORMAT_BC4_SNORM_BLOCK, 8, 4, 4},
+      {VK_FORMAT_BC5_UNORM_BLOCK, 16, 4, 4},
+      {VK_FORMAT_BC6H_UFLOAT_BLOCK, 16, 4, 4},
+      {VK_FORMAT_BC7_SRGB_BLOCK, 16, 4, 4},
+      {VK_FORMAT_ETC2_R8G8B8_SRGB_BLOCK, 8, 4, 4},
+      {VK_FORMAT_ETC2_R8G8B8A1_UNORM_BLOCK, 8, 4, 4},
+      {VK_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK, 16, 4, 4},
+      {VK_FORMAT_EAC_R11_SNORM_BLOCK, 8, 4, 4},
+      {VK_FORMAT_EAC_R11G11_UNORM_BLOCK, 16, 4, 4},
+      {VK_FORMAT_ASTC_4x4_UNORM_BLOCK, 16, 4, 4},
+      {VK_FORMAT_ASTC_5x4_SRGB_BLOCK, 16, 5, 4},
+      {VK_FORMAT_ASTC_8x6_UNORM_BLOCK, 16, 8, 6},
+      {VK_FORMAT_ASTC_10x5_SRGB_BLOCK, 16, 10, 5},
+      {VK_FORMAT_ASTC_12x12_SRGB_BLOCK, 16, 12, 12},
+      {VK_FORMAT_ASTC_4x4_SFLOAT_BLOCK, 16, 4, 4},
+      {VK_FORMAT_ASTC_6x5_SFLOAT_BLOCK, 16, 6, 5},
+      {VK_FORMAT_ASTC_12x10_SFLOAT_BLOCK, 16, 12, 10},
+      {VK_FORMAT_ASTC_12x12_SFLOAT_BLOCK, 16, 12, 12},
+  };
+  for (const Case& c : cases) {
+    VkFormatTexelBlock block;
+    ASSERT_TRUE(LookupVkFormatTexelBlock(c.format, &block)) << c.format;
+    EXPECT_EQ(block.bytes, c.bytes) << c.format;
+    EXPECT_EQ(block.width, c.width) << c.format;
+    EXPECT_EQ(block.height, c.height) << c.format;
+  }
+  // Every Vulkan 1.0 format but the combined depth/stencil ones.
+  for (int value = VK_FORMAT_R4G4_UNORM_PACK8;
+       value <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK; ++value) {
+    const auto format = static_cast<VkFormat>(value);
+    const bool depth_stencil = format == VK_FORMAT_D16_UNORM_S8_UINT ||
+                               format == VK_FORMAT_D24_UNORM_S8_UINT ||
+                               format == VK_FORMAT_D32_SFLOAT_S8_UINT;
+    EXPECT_NE(LookupVkFormatTexelBlock(format, nullptr), depth_stencil)
+        << value;
+  }
+  for (const VkFormat format :
+       {VK_FORMAT_UNDEFINED, VK_FORMAT_D24_UNORM_S8_UINT,
+        VK_FORMAT_G8B8G8R8_422_UNORM, VK_FORMAT_PVRTC1_4BPP_UNORM_BLOCK_IMG}) {
+    EXPECT_FALSE(LookupVkFormatTexelBlock(format, nullptr)) << format;
+  }
+}
+
+TEST_F(VulkanCallStatsTest, CountsTheBytesBufferToImageCopiesWrite) {
+  // RGBA8 3-D image: 16x8x4 texels.
+  const VkBufferImageCopy volume = ImageCopy(16, 8, 4);
+  EXPECT_EQ(BufferImageCopyBytes(VK_FORMAT_R8G8B8A8_UNORM, 1, &volume),
+            16U * 8U * 4U * 4U);
+  // A BC1 mip tail of 2x1 texels still writes a whole block; six cube faces
+  // of 5x3 texels are 2x1 blocks each.
+  const VkBufferImageCopy regions[] = {ImageCopy(2, 1), ImageCopy(5, 3, 1, 6)};
+  EXPECT_EQ(BufferImageCopyBytes(VK_FORMAT_BC1_RGB_UNORM_BLOCK, 2, regions),
+            8U + 6U * 2U * 8U);
+  // VK_REMAINING_ARRAY_LAYERS counts one layer; zero depth counts one slice.
+  const VkBufferImageCopy remaining =
+      ImageCopy(8, 8, 0, VK_REMAINING_ARRAY_LAYERS);
+  EXPECT_EQ(BufferImageCopyBytes(VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK, 1,
+                                 &remaining),
+            2U * 2U * 8U);
+  // ASTC 8x6: 20x13 texels are 3x3 blocks.
+  VkBufferImageCopy2 astc{};
+  astc.sType = VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2;
+  astc.imageSubresource.layerCount = 1;
+  astc.imageExtent = {20, 13, 1};
+  EXPECT_EQ(BufferImageCopyBytes(VK_FORMAT_ASTC_8x6_SRGB_BLOCK, 1, &astc),
+            3U * 3U * 16U);
+  EXPECT_EQ(BufferImageCopyBytes(VK_FORMAT_D24_UNORM_S8_UINT, 1, &volume),
+            0U);
+  EXPECT_EQ(BufferImageCopyBytes(VK_FORMAT_R8G8B8A8_UNORM, 1,
+                                 static_cast<const VkBufferImageCopy*>(
+                                     nullptr)),
+            0U);
 }
 
 TEST_F(VulkanCallStatsTest, ClassifiesImageFormats) {

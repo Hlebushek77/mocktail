@@ -18,6 +18,7 @@
 
 #include "mocktail/graphics/android_vulkan_wsi_adapter.h"
 #include "mocktail/graphics/present_mode_policy.h"
+#include "mocktail/graphics/vulkan_call_stats.h"
 #include "mocktail/graphics/vulkan_etc2_caps.h"
 #include "mocktail/graphics/vulkan_etc2_emulation.h"
 #include "mocktail/graphics/vulkan_text_overlay_compositor.h"
@@ -1153,6 +1154,28 @@ FpsWaitTrace& QueueIdleWaitTrace() {
   return trace;
 }
 
+// MOCKTAIL_VK_CALL_STATS: adds the time until the end of the scope to one of
+// the vk_calls line's blocked totals. Reads no clock while off.
+class CallStatsBlockedScope final {
+ public:
+  explicit CallStatsBlockedScope(mocktail::graphics::VkBlockedCall call)
+      : call_(call),
+        start_ns_(mocktail::graphics::VkCallStatsEnabled() ? MonotonicNanos()
+                                                            : 0) {}
+  ~CallStatsBlockedScope() {
+    if (start_ns_ != 0) {
+      mocktail::graphics::AddVkCallStatsBlocked(call_,
+                                                MonotonicNanos() - start_ns_);
+    }
+  }
+  CallStatsBlockedScope(const CallStatsBlockedScope&) = delete;
+  CallStatsBlockedScope& operator=(const CallStatsBlockedScope&) = delete;
+
+ private:
+  mocktail::graphics::VkBlockedCall call_;
+  std::uint64_t start_ns_ = 0;
+};
+
 // Holds the window's surface-commit guard around a host WSI call that
 // commits the game surface (the present) or sets up its explicit sync
 // (swapchain creation and destruction), so SDL's main-thread commits cannot
@@ -1299,6 +1322,42 @@ void FinishEtc2Submit(VkQueue queue, mocktail::graphics::Etc2SubmitPlan* plan,
   State().etc2.FinishSubmit(plan, result, [queue, submit](VkFence fence) {
     return State().text_overlay.QueueSubmit(queue, 0, nullptr, fence, submit);
   });
+}
+
+// The call-stats dispatch wrappers report here, for the ETC2 emulation's
+// count of uploads recorded after a dispatch.
+void NoteEtc2Dispatch(VkCommandBuffer command_buffer) {
+  State().etc2.NoteDispatch(command_buffer);
+}
+
+// What the proc-address hooks hand out for `name`, an entry point the
+// adapter does not hook: `host`, exactly as before call stats existed,
+// unless MOCKTAIL_VK_CALL_STATS asks for a counting wrapper. A wrapper
+// forwards to the loader's instance-level trampoline, which serves every
+// device; `trampoline` is that pointer when the caller already has it
+// (vkGetInstanceProcAddr), and is looked up only for a wrapped name.
+PFN_vkVoidFunction CallStatsProc(const char* name, PFN_vkVoidFunction host,
+                                 PFN_vkVoidFunction trampoline) {
+  const bool enabled = mocktail::graphics::VkCallStatsEnabled();
+  if (enabled && host != nullptr &&
+      mocktail::graphics::IsVkCallStatsProc(name)) {
+    static const bool observing = [] {
+      mocktail::graphics::SetVkCallStatsDispatchObserver(NoteEtc2Dispatch);
+      return true;
+    }();
+    static_cast<void>(observing);
+    if (trampoline == nullptr) {
+      VkInstance instance = VK_NULL_HANDLE;
+      {
+        AdapterState& state = State();
+        std::lock_guard<std::mutex> lock(state.mutex);
+        instance = state.latest_instance;
+      }
+      trampoline = HostInstanceProc(instance, name);
+    }
+  }
+  return mocktail::graphics::SelectVkCallStatsProc(enabled, name, host,
+                                                   trampoline);
 }
 
 }  // namespace
@@ -1514,7 +1573,8 @@ vkGetInstanceProcAddr(VkInstance instance, const char* name) {
     }
     return adapter;
   }
-  return HostInstanceProc(instance, name);
+  const PFN_vkVoidFunction host = HostInstanceProc(instance, name);
+  return CallStatsProc(name, host, host);
 }
 
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice device,
@@ -1528,7 +1588,7 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice device,
                                       ? host_get_device_proc_addr(device, name)
                                       : nullptr;
   if (!IsDeviceAdapterProc(name)) {
-    return host;
+    return CallStatsProc(name, host, nullptr);
   }
   return host != nullptr ? AdapterProc(name) : nullptr;
 }
@@ -1872,6 +1932,8 @@ VKAPI_ATTR VkResult VKAPI_CALL vkAcquireNextImageKHR(
   }
   const bool fps_trace = FpsTraceEnabled();
   const std::uint64_t acquire_start_ns = fps_trace ? MonotonicNanos() : 0;
+  CallStatsBlockedScope blocked(
+      mocktail::graphics::VkBlockedCall::kAcquireNextImage);
   const VkResult host_result = host_acquire(
       device, swapchain, timeout, semaphore, fence, image_index);
   if (fps_trace) {
@@ -1899,6 +1961,8 @@ VKAPI_ATTR VkResult VKAPI_CALL vkAcquireNextImage2KHR(
     observation.SetResult(VK_ERROR_INITIALIZATION_FAILED);
     return VK_ERROR_INITIALIZATION_FAILED;
   }
+  CallStatsBlockedScope blocked(
+      mocktail::graphics::VkBlockedCall::kAcquireNextImage);
   const VkResult host_result =
       host_acquire(device, acquire_info, image_index);
   const VkResult result = NormalizeSwapchainResult(host_result);
@@ -1925,6 +1989,8 @@ VKAPI_ATTR VkResult VKAPI_CALL vkWaitForFences(
   }
   const bool fps_trace = FpsTraceEnabled();
   const std::uint64_t fence_start_ns = fps_trace ? MonotonicNanos() : 0;
+  CallStatsBlockedScope blocked(
+      mocktail::graphics::VkBlockedCall::kWaitForFences);
   const VkResult result =
       host_wait(device, fence_count, fences, wait_all, timeout);
   if (fps_trace) {
@@ -1986,6 +2052,8 @@ VKAPI_ATTR VkResult VKAPI_CALL vkAllocateCommandBuffers(
     VkDevice device, const VkCommandBufferAllocateInfo* allocate_info,
     VkCommandBuffer* command_buffers) {
   VulkanCallObservation observation("vkAllocateCommandBuffers");
+  mocktail::graphics::VkCallStatsCount(
+      mocktail::graphics::VkCallCounter::kAllocateCommandBuffers);
   const PFN_vkAllocateCommandBuffers host_allocate =
       HostDispatchForDevice(device).allocate_command_buffers;
   if (host_allocate == nullptr) {
@@ -2069,6 +2137,8 @@ VKAPI_ATTR VkResult VKAPI_CALL vkBeginCommandBuffer(
     VkCommandBuffer command_buffer,
     const VkCommandBufferBeginInfo* begin_info) {
   VulkanCallObservation observation("vkBeginCommandBuffer");
+  mocktail::graphics::VkCallStatsCount(
+      mocktail::graphics::VkCallCounter::kBeginCommandBuffer);
   VkCommandPool command_pool = VK_NULL_HANDLE;
   const PFN_vkBeginCommandBuffer host_begin =
       HostDispatchForCommandBuffer(command_buffer, &command_pool)
@@ -2120,6 +2190,8 @@ VKAPI_ATTR VkResult VKAPI_CALL vkWaitSemaphores(
   VulkanCallObservation observation("vkWaitSemaphores");
   const PFN_vkWaitSemaphores host_wait =
       HostDispatchForDevice(device).wait_semaphores;
+  CallStatsBlockedScope blocked(
+      mocktail::graphics::VkBlockedCall::kWaitSemaphores);
   return WaitForSemaphoresObserved("vkWaitSemaphores", host_wait, device,
                                    wait_info, timeout, &observation);
 }
@@ -2130,6 +2202,8 @@ VKAPI_ATTR VkResult VKAPI_CALL vkWaitSemaphoresKHR(
   VulkanCallObservation observation("vkWaitSemaphoresKHR");
   const PFN_vkWaitSemaphoresKHR host_wait =
       HostDispatchForDevice(device).wait_semaphores_khr;
+  CallStatsBlockedScope blocked(
+      mocktail::graphics::VkBlockedCall::kWaitSemaphores);
   return WaitForSemaphoresObserved(
       "vkWaitSemaphoresKHR", reinterpret_cast<PFN_vkWaitSemaphores>(host_wait),
       device, wait_info, timeout, &observation);
@@ -2139,6 +2213,10 @@ VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(
     VkQueue queue, std::uint32_t submit_count, const VkSubmitInfo* submits,
     VkFence fence) {
   VulkanCallObservation observation("vkQueueSubmit");
+  CallStatsBlockedScope blocked(
+      mocktail::graphics::VkBlockedCall::kQueueSubmit);
+  mocktail::graphics::VkCallStatsCount(
+      mocktail::graphics::VkCallCounter::kQueueSubmit);
   const PFN_vkQueueSubmit host_submit =
       HostDispatchForQueue(queue).queue_submit;
   if (host_submit == nullptr) {
@@ -2160,6 +2238,10 @@ VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit2(
     VkQueue queue, std::uint32_t submit_count, const VkSubmitInfo2* submits,
     VkFence fence) {
   VulkanCallObservation observation("vkQueueSubmit2");
+  CallStatsBlockedScope blocked(
+      mocktail::graphics::VkBlockedCall::kQueueSubmit);
+  mocktail::graphics::VkCallStatsCount(
+      mocktail::graphics::VkCallCounter::kQueueSubmit);
   const PFN_vkQueueSubmit2 host_submit =
       HostDispatchForQueue(queue).queue_submit2;
   if (host_submit == nullptr) {
@@ -2181,6 +2263,10 @@ VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit2KHR(
     VkQueue queue, std::uint32_t submit_count, const VkSubmitInfo2* submits,
     VkFence fence) {
   VulkanCallObservation observation("vkQueueSubmit2KHR");
+  CallStatsBlockedScope blocked(
+      mocktail::graphics::VkBlockedCall::kQueueSubmit);
+  mocktail::graphics::VkCallStatsCount(
+      mocktail::graphics::VkCallCounter::kQueueSubmit);
   const PFN_vkQueueSubmit2KHR host_submit =
       HostDispatchForQueue(queue).queue_submit2_khr;
   if (host_submit == nullptr) {
@@ -2224,6 +2310,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkQueueWaitIdle(VkQueue queue) {
   }
   const bool fps_trace = FpsTraceEnabled();
   const std::uint64_t idle_start_ns = fps_trace ? MonotonicNanos() : 0;
+  CallStatsBlockedScope blocked(mocktail::graphics::VkBlockedCall::kWaitIdle);
   const VkResult result =
       State().text_overlay.QueueWaitIdle(queue, host_wait);
   if (fps_trace) {
@@ -2241,6 +2328,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkDeviceWaitIdle(VkDevice device) {
     observation.SetResult(VK_ERROR_INITIALIZATION_FAILED);
     return VK_ERROR_INITIALIZATION_FAILED;
   }
+  CallStatsBlockedScope blocked(mocktail::graphics::VkBlockedCall::kWaitIdle);
   const VkResult result =
       State().text_overlay.DeviceWaitIdle(device, host_wait);
   observation.SetResult(result);
@@ -2359,8 +2447,13 @@ vkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* present_info) {
     observation.SetResult(VK_ERROR_INITIALIZATION_FAILED);
     return VK_ERROR_INITIALIZATION_FAILED;
   }
-  const VkResult result = state.text_overlay.QueuePresent(
-      queue, present_info, ObservedHostQueuePresent);
+  VkResult result = VK_SUCCESS;
+  {
+    CallStatsBlockedScope blocked(
+        mocktail::graphics::VkBlockedCall::kQueuePresent);
+    result = state.text_overlay.QueuePresent(queue, present_info,
+                                             ObservedHostQueuePresent);
+  }
   const VkResult normalized_result = NormalizeSwapchainResult(result);
   if (normalized_result == VK_ERROR_OUT_OF_DATE_KHR) {
     const NoteSurfaceOutOfDateFn note_surface_out_of_date =
@@ -2373,6 +2466,7 @@ vkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* present_info) {
     note_present();
   }
   state.etc2.OnPresent();
+  mocktail::graphics::VkCallStatsOnPresent();
   if (present_info != nullptr && present_info->pResults != nullptr) {
     for (std::uint32_t index = 0; index < present_info->swapchainCount;
          ++index) {
@@ -2523,17 +2617,28 @@ VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceImageFormatProperties2(
 VKAPI_ATTR VkResult VKAPI_CALL vkCreateImage(
     VkDevice device, const VkImageCreateInfo* create_info,
     const VkAllocationCallbacks* allocator, VkImage* image) {
-  return State().etc2.CreateImage(device, create_info, allocator, image);
+  const VkResult result =
+      State().etc2.CreateImage(device, create_info, allocator, image);
+  if (result == VK_SUCCESS && create_info != nullptr && image != nullptr) {
+    mocktail::graphics::VkCallStatsCountCreateImage(*image,
+                                                    create_info->format);
+  }
+  return result;
 }
 
 VKAPI_ATTR void VKAPI_CALL vkDestroyImage(
     VkDevice device, VkImage image, const VkAllocationCallbacks* allocator) {
+  mocktail::graphics::VkCallStatsCountDestroyImage(image);
   State().etc2.DestroyImage(device, image, allocator);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL vkCreateImageView(
     VkDevice device, const VkImageViewCreateInfo* create_info,
     const VkAllocationCallbacks* allocator, VkImageView* view) {
+  if (create_info != nullptr) {
+    mocktail::graphics::VkCallStatsCountImageView(create_info->image,
+                                                  create_info->format);
+  }
   return State().etc2.CreateImageView(device, create_info, allocator, view);
 }
 
@@ -2565,6 +2670,8 @@ VKAPI_ATTR VkResult VKAPI_CALL vkBindImageMemory2(
 VKAPI_ATTR VkResult VKAPI_CALL vkAllocateMemory(
     VkDevice device, const VkMemoryAllocateInfo* info,
     const VkAllocationCallbacks* allocator, VkDeviceMemory* memory) {
+  mocktail::graphics::VkCallStatsCount(
+      mocktail::graphics::VkCallCounter::kAllocateMemory);
   return State().etc2.AllocateMemory(device, info, allocator, memory);
 }
 
@@ -2574,12 +2681,16 @@ VKAPI_ATTR VkResult VKAPI_CALL vkMapMemory(VkDevice device,
                                            VkDeviceSize size,
                                            VkMemoryMapFlags flags,
                                            void** data) {
+  mocktail::graphics::VkCallStatsCount(
+      mocktail::graphics::VkCallCounter::kMapMemory);
   return State().etc2.MapMemory(device, memory, offset, size, flags, data);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL vkMapMemory2(VkDevice device,
                                             const VkMemoryMapInfo* info,
                                             void** data) {
+  mocktail::graphics::VkCallStatsCount(
+      mocktail::graphics::VkCallCounter::kMapMemory);
   return State().etc2.MapMemory2(device, info, data);
 }
 
@@ -2596,11 +2707,15 @@ VKAPI_ATTR VkResult VKAPI_CALL vkUnmapMemory2(VkDevice device,
 VKAPI_ATTR void VKAPI_CALL vkFreeMemory(
     VkDevice device, VkDeviceMemory memory,
     const VkAllocationCallbacks* allocator) {
+  mocktail::graphics::VkCallStatsCount(
+      mocktail::graphics::VkCallCounter::kFreeMemory);
   State().etc2.FreeMemory(device, memory, allocator);
 }
 
 VKAPI_ATTR void VKAPI_CALL vkDestroyBuffer(
     VkDevice device, VkBuffer buffer, const VkAllocationCallbacks* allocator) {
+  mocktail::graphics::VkCallStatsCount(
+      mocktail::graphics::VkCallCounter::kDestroyBuffer);
   State().etc2.DestroyBuffer(device, buffer, allocator);
 }
 
@@ -2608,6 +2723,8 @@ VKAPI_ATTR void VKAPI_CALL vkCmdCopyBufferToImage(
     VkCommandBuffer command_buffer, VkBuffer source, VkImage destination,
     VkImageLayout layout, std::uint32_t region_count,
     const VkBufferImageCopy* regions) {
+  mocktail::graphics::VkCallStatsCountCopyBufferToImage(destination,
+                                                        region_count, regions);
   State().etc2.CmdCopyBufferToImage(
       HostDispatchForCommandBuffer(command_buffer).device, command_buffer,
       source, destination, layout, region_count, regions);
@@ -2615,6 +2732,7 @@ VKAPI_ATTR void VKAPI_CALL vkCmdCopyBufferToImage(
 
 VKAPI_ATTR void VKAPI_CALL vkCmdCopyBufferToImage2(
     VkCommandBuffer command_buffer, const VkCopyBufferToImageInfo2* info) {
+  mocktail::graphics::VkCallStatsCountCopyBufferToImage2(info);
   State().etc2.CmdCopyBufferToImage2(
       HostDispatchForCommandBuffer(command_buffer).device, command_buffer,
       info);
@@ -2625,6 +2743,8 @@ VKAPI_ATTR void VKAPI_CALL vkCmdCopyImage(
     VkImageLayout source_layout, VkImage destination,
     VkImageLayout destination_layout, std::uint32_t region_count,
     const VkImageCopy* regions) {
+  mocktail::graphics::VkCallStatsCount(
+      mocktail::graphics::VkCallCounter::kCopyImage);
   State().etc2.CmdCopyImage(
       HostDispatchForCommandBuffer(command_buffer).device, command_buffer,
       source, source_layout, destination, destination_layout, region_count,
@@ -2633,6 +2753,8 @@ VKAPI_ATTR void VKAPI_CALL vkCmdCopyImage(
 
 VKAPI_ATTR void VKAPI_CALL vkCmdCopyImage2(VkCommandBuffer command_buffer,
                                            const VkCopyImageInfo2* info) {
+  mocktail::graphics::VkCallStatsCount(
+      mocktail::graphics::VkCallCounter::kCopyImage);
   State().etc2.CmdCopyImage2(
       HostDispatchForCommandBuffer(command_buffer).device, command_buffer,
       info);

@@ -358,14 +358,51 @@ void NotifyVkCallStatsDispatch(VkCommandBuffer command_buffer);
 // VkCallStatsEnabled().
 void VkCallStatsCount(VkCallCounter counter, std::uint64_t calls = 1);
 void AddVkCallStatsBytes(VkCallCounter counter, std::uint64_t bytes);
-void VkCallStatsCountCreateImage(VkFormat format);
 void AddVkCallStatsBlocked(VkBlockedCall call, std::uint64_t nanoseconds);
+
+// The adapter does not track the formats of images it does not emulate, so
+// while enabled the image hooks remember every image's format as the app
+// created it, for the view and buffer-to-image copy counters. Keyed by
+// handle alone: Roblox runs one device.
+//
+// vkCreateImage succeeded: counts kCreateImage and the format class, and
+// remembers `image` (unless VK_NULL_HANDLE).
+void VkCallStatsCountCreateImage(VkImage image, VkFormat format);
+// vkDestroyImage: counts kDestroyImage and forgets `image`.
+void VkCallStatsCountDestroyImage(VkImage image);
+// vkCreateImageView: counts kAliasView when `image` is remembered and
+// `view_format` is not the format it was created with.
+void VkCallStatsCountImageView(VkImage image, VkFormat view_format);
+// vkCmdCopyBufferToImage(2): counts kCopyBufferToImage, with the bytes the
+// regions write when the destination is remembered and its format has a
+// fixed texel block (BufferImageCopyBytes).
+void VkCallStatsCountCopyBufferToImage(VkImage image,
+                                       std::uint32_t region_count,
+                                       const VkBufferImageCopy* regions);
+void VkCallStatsCountCopyBufferToImage2(const VkCopyBufferToImageInfo2* info);
 
 std::uint64_t BufferCopyBytes(std::uint32_t region_count,
                               const VkBufferCopy* regions);
 std::uint64_t BufferCopyBytes(const VkCopyBufferInfo2* info);
 std::uint64_t MappedRangeBytes(std::uint32_t range_count,
                                const VkMappedMemoryRange* ranges);
+
+// Bytes per texel block and the block's size in texels.
+struct VkFormatTexelBlock {
+  std::uint32_t bytes = 0;
+  std::uint32_t width = 1;
+  std::uint32_t height = 1;
+};
+// False for VK_FORMAT_UNDEFINED, combined depth/stencil formats (the bytes
+// depend on the aspect copied), multi-planar and most extension formats.
+bool LookupVkFormatTexelBlock(VkFormat format, VkFormatTexelBlock* block);
+// The bytes buffer-to-image copy regions write into an image of `format`:
+// whole blocks over each region's extent, depth and layers. 0 when the
+// format has no fixed texel block.
+std::uint64_t BufferImageCopyBytes(VkFormat format, std::uint32_t region_count,
+                                   const VkBufferImageCopy* regions);
+std::uint64_t BufferImageCopyBytes(VkFormat format, std::uint32_t region_count,
+                                   const VkBufferImageCopy2* regions);
 
 // One 2-second window of counts.
 struct VkCallStatsWindow {
@@ -392,8 +429,9 @@ std::string FormatVkCallStatsLine(const VkCallStatsWindow& window);
 // vkQueuePresentKHR's hook: prints the line every 2 s when enabled.
 void VkCallStatsOnPresent();
 
-// Clears counts, the frame window, wrapper bindings, the observer and a
-// forced state, which tests set to count without the variable.
+// Clears counts, the frame window, wrapper bindings, the observer, the
+// remembered images and a forced state, which tests set to count without
+// the variable.
 void ResetVkCallStatsForTesting();
 void ForceVkCallStatsEnabledForTesting(bool enabled);
 
