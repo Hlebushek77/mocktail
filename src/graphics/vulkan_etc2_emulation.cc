@@ -1,6 +1,8 @@
 #include "mocktail/graphics/vulkan_etc2_emulation.h"
 
+#include <dirent.h>
 #include <pthread.h>
+#include <strings.h>
 #include <sys/stat.h>
 
 #include "mocktail/graphics/chunk_arena.h"
@@ -649,6 +651,42 @@ std::string DescribeEtc2Queues(
   return out.empty() ? "none" : out;
 }
 
+// Whether texture overrides can touch a colour upload: the dump directory is
+// set, or the override directory holds a *.png (any case). The runtime always
+// sets MOCKTAIL_TEXTURE_OVERRIDE_DIR, so TextureOverrides::enabled() is true
+// in every session; only a folder with PNGs in it needs the CPU's decoded
+// texels. The same rule as the CPU fast path's TextureOverrides::active().
+bool TextureOverridesActive() {
+  const char* dump = std::getenv("MOCKTAIL_TEXTURE_DUMP_DIR");
+  if (dump != nullptr && dump[0] != '\0') {
+    return true;
+  }
+  const char* directory = std::getenv("MOCKTAIL_TEXTURE_OVERRIDE_DIR");
+  if (directory == nullptr || directory[0] == '\0') {
+    return false;
+  }
+  DIR* listing = opendir(directory);
+  if (listing == nullptr) {
+    return false;
+  }
+  bool found = false;
+  while (const dirent* entry = readdir(listing)) {
+    const std::size_t length = std::strlen(entry->d_name);
+    if (length <= 4 ||
+        strcasecmp(entry->d_name + length - 4, ".png") != 0) {
+      continue;
+    }
+    struct stat info {};
+    const std::string path = std::string(directory) + "/" + entry->d_name;
+    if (stat(path.c_str(), &info) == 0 && S_ISREG(info.st_mode)) {
+      found = true;
+      break;
+    }
+  }
+  closedir(listing);
+  return found;
+}
+
 // The name of the calling thread, quoted for a log line.
 std::string QuotedThreadName() {
   char name[64] = "";
@@ -706,6 +744,8 @@ struct VulkanEtc2Emulation::State {
   // When Housekeeping may run next (steady clock, ns).
   std::atomic<std::int64_t> next_housekeeping_ns{0};
   TextureOverrides overrides = TextureOverrides::FromEnvironment();
+  // TextureOverridesActive(), read once with the overrides above.
+  const bool overrides_active = TextureOverridesActive();
   // This session's decoding, for the totals line in the log, and with
   // MOCKTAIL_FRAME_STATS=1 the current two-second window.
   std::mutex totals_mutex;
@@ -987,7 +1027,7 @@ struct VulkanEtc2Emulation::State {
       return {Etc2Route::kCpu, Etc2CpuReason::kUpscaled};
     }
     // Override lookups hash the decoded colour texels on the CPU.
-    if (overrides.enabled() && IsColorFormat(target.image.format.etc_format)) {
+    if (overrides_active && IsColorFormat(target.image.format.etc_format)) {
       return {Etc2Route::kCpu, Etc2CpuReason::kOverrides};
     }
     const std::uint32_t family = target.pool_family;
