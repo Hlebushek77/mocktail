@@ -2153,6 +2153,18 @@ VkDeviceSize FakeVulkanDevice::BufferSize(VkBuffer buffer) const {
   return found != impl_->buffers.end() ? found->second.size : 0;
 }
 
+VkDeviceMemory FakeVulkanDevice::BufferMemory(VkBuffer buffer) const {
+  std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
+  const auto found = impl_->buffers.find(buffer);
+  return found != impl_->buffers.end() ? found->second.memory : VK_NULL_HANDLE;
+}
+
+VkBufferUsageFlags FakeVulkanDevice::BufferUsage(VkBuffer buffer) const {
+  std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
+  const auto found = impl_->buffers.find(buffer);
+  return found != impl_->buffers.end() ? found->second.usage : 0;
+}
+
 bool FakeVulkanDevice::IsMapped(VkDeviceMemory memory) const {
   std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
   const auto found = impl_->memories.find(memory);
@@ -2176,6 +2188,23 @@ FakeVulkanDevice::image_transfers() const {
 
 std::uint64_t FakeVulkanDevice::copy_buffer_to_image_regions() const {
   return impl_->copy_regions;
+}
+
+std::vector<FakeVulkanDevice::RecordedBufferCopy>
+FakeVulkanDevice::RecordedBufferCopies(VkCommandBuffer command_buffer) const {
+  std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
+  std::vector<RecordedBufferCopy> copies;
+  const auto found = impl_->command_buffers.find(command_buffer);
+  if (found == impl_->command_buffers.end()) {
+    return copies;
+  }
+  for (const Impl::Command& command : found->second.commands) {
+    if (command.kind == Impl::Command::Kind::kCopyBufferToImage) {
+      copies.push_back(
+          {command.buffer, command.image, command.buffer_image_regions});
+    }
+  }
+  return copies;
 }
 
 const std::vector<std::string>& FakeVulkanDevice::errors() const {

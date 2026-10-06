@@ -146,12 +146,23 @@ class FakeVulkanDevice {
   std::uint8_t* MemoryBytes(VkDeviceMemory memory);
   std::uint32_t MemoryTypeIndex(VkDeviceMemory memory) const;
   VkDeviceSize BufferSize(VkBuffer buffer) const;
+  VkDeviceMemory BufferMemory(VkBuffer buffer) const;  // null: unbound
+  VkBufferUsageFlags BufferUsage(VkBuffer buffer) const;
   bool IsMapped(VkDeviceMemory memory) const;
   const Counts& counts() const;
   // Entry-point calls by name ("vkAllocateMemory"); direct calls not counted.
   std::uint64_t calls(const std::string& name) const;
   const std::vector<ImageTransfer>& image_transfers() const;
   std::uint64_t copy_buffer_to_image_regions() const;
+  // The vkCmdCopyBufferToImage(2) commands recorded into `command_buffer`
+  // since its last begin or reset, in order (copy2 regions as v1 regions).
+  struct RecordedBufferCopy {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkImage image = VK_NULL_HANDLE;
+    std::vector<VkBufferImageCopy> regions;
+  };
+  std::vector<RecordedBufferCopy> RecordedBufferCopies(
+      VkCommandBuffer command_buffer) const;
   const std::vector<std::string>& errors() const;
   void ClearErrors();
 

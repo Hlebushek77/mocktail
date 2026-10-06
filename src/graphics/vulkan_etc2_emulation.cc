@@ -5,9 +5,11 @@
 
 #include "mocktail/graphics/chunk_arena.h"
 #include "mocktail/graphics/etc2_decode_totals.h"
+#include "mocktail/graphics/mapped_memory_copy.h"
 #include "mocktail/graphics/texture_override.h"
 #include "mocktail/graphics/vulkan_etc2_gpu.h"
 #include "mocktail/graphics/vulkan_etc2_planning.h"
+#include "mocktail/graphics/worker_pool.h"
 
 #include <algorithm>
 #include <atomic>
@@ -407,6 +409,20 @@ struct RouteChoice {
 std::atomic<unsigned> g_image_logs{0};
 std::atomic<unsigned> g_decode_logs{0};
 std::atomic<unsigned> g_failure_logs{0};
+std::atomic<unsigned> g_chunk_logs{0};
+
+// The CPU route's host staging arena (DESIGN C1): 64 MiB chunks, a larger
+// copy gets a chunk of its own, and idle chunks beyond 128 MiB are freed
+// after 2 s.
+constexpr VkDeviceSize kHostStagingChunkBytes = 64ULL << 20;
+constexpr VkDeviceSize kHostStagingKeepIdleBytes = 128ULL << 20;
+// Copy-in work comes in pieces of at most 256 KiB, batched into tasks of at
+// least 128 KiB; a submit with less than 64 KiB of compressed data, or less
+// than 256 KiB of upscaled output, keeps that phase on the calling thread.
+constexpr std::size_t kCopyPieceBytes = 256U << 10;
+constexpr std::size_t kCopyTaskBytes = 128U << 10;
+constexpr std::size_t kParallelCopyMinimumBytes = 64U << 10;
+constexpr std::size_t kParallelEmitMinimumBytes = 256U << 10;
 
 void LogFailure(const char* message) {
   if (ShouldLog(&g_failure_logs, 8)) {
@@ -477,6 +493,101 @@ void DestroyStaging(const HostDevice& dev, const Staging& staging) {
   if (dev.free_memory != nullptr) {
     dev.free_memory(dev.device, staging.memory, nullptr);
   }
+}
+
+// The host staging arena's memory type among `type_bits`: HOST_VISIBLE and
+// HOST_COHERENT, in system memory when the device has any (not
+// DEVICE_LOCAL: the BAR is small and slow to read back), preferring
+// HOST_CACHED unless `coherent` asks for the uncached, write-combined kind.
+// Last resort, as for one-off staging: the first coherent type.
+std::uint32_t StagingMemoryType(const VkPhysicalDeviceMemoryProperties& memory,
+                                std::uint32_t type_bits,
+                                Etc2StagingMemory kind) {
+  constexpr VkMemoryPropertyFlags kRequired =
+      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+  const auto find = [&](VkMemoryPropertyFlags required,
+                        VkMemoryPropertyFlags avoided) {
+    for (std::uint32_t index = 0; index < memory.memoryTypeCount; ++index) {
+      const VkMemoryPropertyFlags flags = memory.memoryTypes[index].propertyFlags;
+      if ((type_bits & (1U << index)) != 0 && (flags & required) == required &&
+          (flags & avoided) == 0) {
+        return index;
+      }
+    }
+    return UINT32_MAX;
+  };
+  const VkMemoryPropertyFlags cached = VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+  const VkMemoryPropertyFlags device_local =
+      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+  std::uint32_t type = kind == Etc2StagingMemory::kCached
+                           ? find(kRequired | cached, device_local)
+                           : find(kRequired, cached | device_local);
+  if (type == UINT32_MAX) {
+    type = find(kRequired, device_local);
+  }
+  return type != UINT32_MAX ? type : find(kRequired, 0);
+}
+
+// Host staging arena chunks: persistently mapped TRANSFER_SRC buffers
+// (TRANSFER_DST too, for the GPU route's rescue copy) in StagingMemoryType.
+bool CreateStagingChunk(const HostDevice& dev, Etc2StagingMemory kind,
+                        bool log, VkDeviceSize size,
+                        ArenaChunkStorage* storage) {
+  if (dev.create_buffer == nullptr || dev.allocate_memory == nullptr ||
+      dev.get_buffer_memory_requirements == nullptr ||
+      dev.bind_buffer_memory == nullptr || dev.map_memory == nullptr ||
+      dev.destroy_buffer == nullptr || dev.free_memory == nullptr) {
+    return false;
+  }
+  VkBufferCreateInfo buffer_info{};
+  buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+  buffer_info.size = size;
+  buffer_info.usage =
+      VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+  buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  VkBuffer buffer = VK_NULL_HANDLE;
+  if (dev.create_buffer(dev.device, &buffer_info, nullptr, &buffer) !=
+      VK_SUCCESS) {
+    return false;
+  }
+  VkMemoryRequirements requirements{};
+  dev.get_buffer_memory_requirements(dev.device, buffer, &requirements);
+  const std::uint32_t type =
+      StagingMemoryType(dev.memory, requirements.memoryTypeBits, kind);
+  VkMemoryAllocateInfo allocate_info{};
+  allocate_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+  allocate_info.allocationSize = requirements.size;
+  allocate_info.memoryTypeIndex = type;
+  VkDeviceMemory memory = VK_NULL_HANDLE;
+  void* data = nullptr;
+  if (type == UINT32_MAX ||
+      dev.allocate_memory(dev.device, &allocate_info, nullptr, &memory) !=
+          VK_SUCCESS) {
+    dev.destroy_buffer(dev.device, buffer, nullptr);
+    return false;
+  }
+  if (dev.bind_buffer_memory(dev.device, buffer, memory, 0) != VK_SUCCESS ||
+      dev.map_memory(dev.device, memory, 0, VK_WHOLE_SIZE, 0, &data) !=
+          VK_SUCCESS) {
+    dev.destroy_buffer(dev.device, buffer, nullptr);
+    dev.free_memory(dev.device, memory, nullptr);
+    return false;
+  }
+  if (log) {
+    std::fprintf(stderr,
+                 "  [vulkan] ETC2 staging chunk: %llu MiB in memory type %u "
+                 "(%s)\n",
+                 static_cast<unsigned long long>(size >> 20), type,
+                 (dev.memory.memoryTypes[type].propertyFlags &
+                  VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0
+                     ? "cached"
+                     : "write-combined");
+  }
+  storage->buffer = buffer;
+  storage->memory = memory;
+  storage->mapped = static_cast<std::uint8_t*>(data);
+  storage->size = size;
+  return true;
 }
 
 std::string DescribeQueueFlags(VkQueueFlags flags) {
@@ -580,9 +691,17 @@ struct VulkanEtc2Emulation::State {
   std::unordered_map<VkDeviceMemory, MemoryRecord> memories;
   std::unordered_map<VkImage, ImageBinding> image_bindings;
   std::atomic<bool> has_commands{false};
+  // Concurrent submits decode one at a time.
   std::mutex scratch_mutex;
+  // The fast path's scratch: compressed bytes, and decoded texels of the
+  // uploads that do not decode straight into staging.
+  Etc2Scratch fast_source;
+  Etc2Scratch fast_decoded;
+  // MOCKTAIL_ETC2_FAST_PATH=0: plus.1's scratch and its policy.
   std::vector<std::uint8_t> scratch_source;
   std::vector<std::uint8_t> scratch_decoded;
+  // When Housekeeping may run next (steady clock, ns).
+  std::atomic<std::int64_t> next_housekeeping_ns{0};
   TextureOverrides overrides = TextureOverrides::FromEnvironment();
   // This session's decoding, for the totals line in the log, and with
   // MOCKTAIL_FRAME_STATS=1 the current two-second window.
@@ -743,11 +862,17 @@ struct VulkanEtc2Emulation::State {
                  line.c_str());
   }
 
+  // Whether an override PNG can replace this upload (and so whether it is
+  // hashed, dumped and looked up).
+  bool MayOverride(const PendingUpload& upload) const {
+    return overrides.active() && upload.layers == 1 &&
+           IsColorFormat(upload.format);
+  }
+
   std::shared_ptr<const RgbaImage> FindOverride(const PendingUpload& upload,
                                                 const std::uint8_t* compressed,
                                                 const std::uint8_t* decoded) {
-    if (!overrides.enabled() || upload.layers != 1 ||
-        !IsColorFormat(upload.format)) {
+    if (!MayOverride(upload)) {
       return nullptr;
     }
     std::shared_ptr<const RgbaImage> replacement;
@@ -778,51 +903,7 @@ struct VulkanEtc2Emulation::State {
       ResampleRgba(*replacement, upload.target_width, upload.target_height,
                    upload.target);
     } else if (upload.scale > 1) {
-      std::shared_ptr<const RgbaImage> base;
-      if (upload.full_mip) {
-        std::lock_guard<std::mutex> lock(mutex);
-        const auto record = images.find(upload.image);
-        if (record != images.end()) {
-          if (upload.mip_level == 0) {
-            auto level0 = std::make_shared<RgbaImage>();
-            level0->width = upload.source_width;
-            level0->height = upload.source_height;
-            level0->pixels.assign(decoded, decoded + upload.decoded);
-            if (upload.source_width != upload.width ||
-                upload.source_height != upload.height) {
-              level0->pixels.clear();
-              for (std::uint32_t y = 0; y < upload.source_height; ++y) {
-                const std::uint8_t* row =
-                    decoded + static_cast<std::size_t>(y) * upload.width * 4;
-                level0->pixels.insert(level0->pixels.end(), row,
-                                      row + upload.source_width * 4);
-              }
-            }
-            record->second.base = level0;
-          }
-          base = record->second.base;
-        }
-      }
-      if (base != nullptr) {
-        ResampleRgba(*base, upload.target_width, upload.target_height,
-                     upload.target);
-        return;
-      }
-      const std::uint8_t* source = decoded;
-      std::vector<std::uint8_t> cropped;
-      if (upload.source_width != upload.width ||
-          upload.source_height != upload.height) {
-        const std::size_t row = static_cast<std::size_t>(upload.source_width) * 4;
-        cropped.resize(row * upload.source_height);
-        for (std::uint32_t y = 0; y < upload.source_height; ++y) {
-          std::memcpy(cropped.data() + y * row,
-                      decoded + static_cast<std::size_t>(y) * upload.width * 4,
-                      row);
-        }
-        source = cropped.data();
-      }
-      ResampleRgba(source, upload.source_width, upload.source_height,
-                   upload.target_width, upload.target_height, upload.target);
+      EmitScaled(upload, decoded);
     } else {
       std::memcpy(upload.target, decoded, upload.decoded);
     }
@@ -903,13 +984,17 @@ struct VulkanEtc2Emulation::State {
 
   struct CpuCopyResult {
     bool recorded = false;
-    bool staging_allocated = false;
+    bool staging_allocated = false;  // a one-off staging buffer
+    bool staging_fallback = false;   // because the arena had none
     bool first_upload = false;  // the command buffer's first
     VkDeviceSize compressed = 0;
   };
 
-  // Records the CPU route of one copy: the decoded texels go to a staging
-  // buffer at submit time, and the host copy reads them from there.
+  // Records the CPU route of one copy: the decoded texels go to staging at
+  // submit time, and the host copy reads them from there. Staging is a
+  // range of the device's host staging arena, which costs no Vulkan call
+  // once its chunks exist; a one-off buffer only with
+  // MOCKTAIL_ETC2_FAST_PATH=0 or when the arena cannot grow.
   template <typename Region, typename HostCopy>
   CpuCopyResult RecordCpuCopy(const HostDevice& dev,
                               VkCommandBuffer command_buffer,
@@ -920,8 +1005,6 @@ struct VulkanEtc2Emulation::State {
     std::vector<Region> rewritten;
     std::vector<PendingUpload> uploads;
     VkDeviceSize total = 0;
-    Staging staging;
-    std::uint8_t* mapped = nullptr;
     if (!PlanRegions(target.image, dev.device, source, destination, count,
                      regions, &rewritten, &uploads, &total)) {
       LogFailure("skipped an upload with an unsupported region");
@@ -930,11 +1013,32 @@ struct VulkanEtc2Emulation::State {
     for (const PendingUpload& upload : uploads) {
       result.compressed += upload.compressed;
     }
-    if (!CreateStaging(dev, total, &staging, &mapped)) {
-      LogFailure("could not allocate a host-visible staging buffer");
-      return result;
+    ArenaRef range;
+    Staging staging;
+    std::uint8_t* mapped = nullptr;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    if (dev.host_staging != nullptr) {
+      if (dev.host_staging->Take(total, &range) && range.mapped != nullptr) {
+        mapped = range.mapped;
+        buffer = range.buffer;
+        for (Region& region : rewritten) {
+          region.bufferOffset += range.offset;
+        }
+      } else {
+        ChunkArena::ReleaseRef(range);
+        range = ArenaRef{};
+        result.staging_fallback = true;
+        LogFailure("the staging arena is full; using a one-off buffer");
+      }
     }
-    result.staging_allocated = true;
+    if (mapped == nullptr) {
+      if (!CreateStaging(dev, total, &staging, &mapped)) {
+        LogFailure("could not allocate a host-visible staging buffer");
+        return result;
+      }
+      result.staging_allocated = true;
+      buffer = staging.buffer;
+    }
     const std::uint64_t record_call =
         Tracing() ? record_sequence.fetch_add(1, std::memory_order_relaxed) + 1
                   : 0;
@@ -947,9 +1051,10 @@ struct VulkanEtc2Emulation::State {
     }
     result.first_upload =
         Record(command_buffer, dev.device, destination, std::move(uploads),
-               staging);
+               result.staging_allocated ? &staging : nullptr,
+               range.arena_id != 0 ? &range : nullptr);
     result.recorded = true;
-    host_copy(staging.buffer, rewritten.data());
+    host_copy(buffer, rewritten.data());
     return result;
   }
 
@@ -989,6 +1094,9 @@ struct VulkanEtc2Emulation::State {
       if (result.staging_allocated) {
         ++totals.staging_allocs;
       }
+      if (result.staging_fallback) {
+        ++totals.staging_fallbacks;
+      }
       if (!result.recorded) {
         totals.dropped_uploads += count;
       }
@@ -1015,11 +1123,12 @@ struct VulkanEtc2Emulation::State {
     });
   }
 
-  // Keeps the uploads and their staging with the command buffer. True when
-  // these are the command buffer's first uploads.
+  // Keeps the uploads and their staging (a one-off buffer or an arena
+  // range) with the command buffer. True when these are the command
+  // buffer's first uploads.
   bool Record(VkCommandBuffer command_buffer, VkDevice device,
               VkImage destination, std::vector<PendingUpload> uploads,
-              const Staging& staging) {
+              const Staging* staging, const ArenaRef* range) {
     std::lock_guard<std::mutex> lock(mutex);
     CommandRecord& record = commands[command_buffer];
     if (record.device == VK_NULL_HANDLE) {
@@ -1028,7 +1137,12 @@ struct VulkanEtc2Emulation::State {
     const bool first = !record.HasUploads();
     record.uploads.insert(record.uploads.end(), uploads.begin(),
                           uploads.end());
-    record.staging.push_back(staging);
+    if (staging != nullptr) {
+      record.staging.push_back(*staging);
+    }
+    if (range != nullptr) {
+      record.staging_refs.push_back(*range);
+    }
     if (options.frame_stats) {
       const auto image = images.find(destination);
       if (image != images.end()) {
@@ -1199,8 +1313,44 @@ struct VulkanEtc2Emulation::State {
     image_bindings.erase(binding);
   }
 
+  // One upload of a submit as the CPU route serves it.
+  struct CpuWork {
+    PendingUpload upload;
+    std::uint8_t* source = nullptr;  // mapped by Roblox, or null
+    VkDeviceMemory memory = VK_NULL_HANDLE;  // to map for the submit
+    VkDeviceSize memory_offset = 0;
+    std::uint32_t memory_type = UINT32_MAX;  // diagnostics and trace only
+    bool repeat = false;  // its command buffer came up earlier in the batch
+  };
+  // What a CPU pass logs and counts about its source memory.
+  struct SourceTypes {
+    std::uint64_t bytes[kEtc2CountedMemoryTypes] = {};
+    std::uint64_t unknown = 0;
+  };
+
+  unsigned WorkerCount() const {
+    return options.workers != 0 ? options.workers : DecodeWorkerCount();
+  }
+  void CollectCpuWork(const VkCommandBuffer* command_buffers,
+                      std::uint32_t count, std::vector<CpuWork>* work);
+  SourceTypes CountSourceTypes(const std::vector<CpuWork>& work);
   std::uint32_t RunCpuUploads(const VkCommandBuffer* command_buffers,
                               std::uint32_t count);
+  std::uint32_t RunCpuUploadsFast(std::vector<CpuWork>* work,
+                                  const SourceTypes& types);
+  std::uint32_t RunCpuUploadsLegacy(std::vector<CpuWork>* work,
+                                    const SourceTypes& types);
+  // A CPU pass's stall line, totals and milestone.
+  void FinishCpuPass(std::size_t uploads, VkDeviceSize compressed_total,
+                     VkDeviceSize host_total, std::uint64_t decode_ns,
+                     const std::uint64_t (&phase_ms)[4], unsigned threads,
+                     const SourceTypes& types);
+  // Upscaled uploads: resample from the image's base level, or from these
+  // decoded texels. Thread-safe; uploads of one image must come in order.
+  void EmitScaled(const PendingUpload& upload, const std::uint8_t* decoded);
+  // At most once a second, from OnPresent and the CPU route: trims the
+  // host staging arenas and gives back idle scratch.
+  void Housekeeping(Clock::time_point now);
 };
 
 VulkanEtc2Emulation::VulkanEtc2Emulation(Etc2EmulationOptions options)
@@ -1340,6 +1490,28 @@ void VulkanEtc2Emulation::RegisterDevice(
                   "vkGetPhysicalDeviceMemoryProperties2",
                   "vkGetPhysicalDeviceMemoryProperties2KHR");
   }
+  if (emulated && state_->options.fast_path) {
+    // The CPU route's staging (DESIGN C1). Chunks come on first use.
+    const HostDevice* const host = dev.get();
+    const Etc2StagingMemory kind = state_->options.staging_memory;
+    const bool log = state_->options.frame_stats;
+    ChunkArena::Config config;
+    config.chunk_bytes = kHostStagingChunkBytes;
+    config.keep_idle_bytes = kHostStagingKeepIdleBytes;
+    ChunkArena::Backend backend;
+    backend.create = [host, kind, log](VkDeviceSize size, bool,
+                                       ArenaChunkStorage* storage) {
+      return CreateStagingChunk(*host, kind,
+                                log && ShouldLog(&g_chunk_logs, 16), size,
+                                storage);
+    };
+    backend.destroy = [host](const ArenaChunkStorage& storage) {
+      host->destroy_buffer(host->device, storage.buffer, nullptr);
+      host->free_memory(host->device, storage.memory, nullptr);
+    };
+    dev->host_staging =
+        std::make_unique<ChunkArena>(config, std::move(backend));
+  }
   if (emulated) {
     std::fprintf(stderr,
                  "  [vulkan] ETC2/EAC emulation enabled: compressed uploads "
@@ -1417,8 +1589,29 @@ void VulkanEtc2Emulation::DestroyDevice(VkDevice device) {
       }
     }
   }
-  if (removed != nullptr) {
-    state_->DestroyDeviceResources(*removed);
+  if (removed == nullptr) {
+    return;
+  }
+  state_->DestroyDeviceResources(*removed);
+  if (!removed->emulated) {
+    return;
+  }
+  bool emulated_left = false;
+  {
+    std::lock_guard<std::mutex> lock(state_->devices_mutex);
+    for (const auto& dev : state_->devices) {
+      emulated_left = emulated_left || dev->emulated;
+    }
+  }
+  if (!emulated_left) {
+    // Nothing decodes until the next emulated device: the pool's threads
+    // and the scratch go (the pool starts again on first use).
+    WorkerPool::ShutdownShared();
+    std::lock_guard<std::mutex> lock(state_->scratch_mutex);
+    state_->fast_source.Release();
+    state_->fast_decoded.Release();
+    std::vector<std::uint8_t>().swap(state_->scratch_source);
+    std::vector<std::uint8_t>().swap(state_->scratch_decoded);
   }
 }
 
@@ -2024,115 +2217,183 @@ void VulkanEtc2Emulation::NoteDispatch(VkCommandBuffer command_buffer) {
   }
 }
 
+void VulkanEtc2Emulation::State::CollectCpuWork(
+    const VkCommandBuffer* command_buffers, std::uint32_t count,
+    std::vector<CpuWork>* work) {
+  std::lock_guard<std::mutex> lock(mutex);
+  std::vector<VkCommandBuffer> collected;
+  auto collect = [&](VkCommandBuffer command_buffer) {
+    const auto record = commands.find(command_buffer);
+    if (record == commands.end()) {
+      return;
+    }
+    // A secondary executed twice in the batch decodes into the same staging
+    // twice; the second pass only needs counting.
+    const bool repeat = std::find(collected.begin(), collected.end(),
+                                  command_buffer) != collected.end();
+    collected.push_back(command_buffer);
+    for (const PendingUpload& upload : record->second.uploads) {
+      const auto binding = buffers.find(upload.source);
+      if (binding == buffers.end()) {
+        LogFailure("upload source buffer has no tracked memory binding");
+        continue;
+      }
+      CpuWork item;
+      item.upload = upload;
+      item.repeat = repeat;
+      if (TrackMemory()) {
+        const auto memory = memories.find(binding->second.memory);
+        if (memory != memories.end()) {
+          item.memory_type = memory->second.type;
+        }
+      }
+      const VkDeviceSize absolute =
+          binding->second.offset + upload.source_offset;
+      const auto mapping = mappings.find(binding->second.memory);
+      if (mapping == mappings.end()) {
+        item.memory = binding->second.memory;
+        item.memory_offset = absolute;
+      } else if (absolute >= mapping->second.offset &&
+                 (mapping->second.size == VK_WHOLE_SIZE ||
+                  (absolute - mapping->second.offset <=
+                       mapping->second.size &&
+                   upload.source_span <= mapping->second.size -
+                                            (absolute -
+                                             mapping->second.offset)))) {
+        item.source = static_cast<std::uint8_t*>(mapping->second.data) +
+                      (absolute - mapping->second.offset);
+      } else {
+        LogFailure("upload source lies outside the mapped range");
+        continue;
+      }
+      work->push_back(item);
+    }
+  };
+  for (std::uint32_t index = 0; index < count; ++index) {
+    collect(command_buffers[index]);
+    const auto record = commands.find(command_buffers[index]);
+    if (record != commands.end()) {
+      const std::vector<VkCommandBuffer> secondaries =
+          record->second.secondaries;
+      for (VkCommandBuffer secondary : secondaries) {
+        collect(secondary);
+      }
+    }
+  }
+}
+
+VulkanEtc2Emulation::State::SourceTypes
+VulkanEtc2Emulation::State::CountSourceTypes(
+    const std::vector<CpuWork>& work) {
+  SourceTypes types;
+  if (!options.frame_stats) {
+    return types;
+  }
+  // Which memory Roblox's upload sources live in.
+  std::uint64_t non_host_visible = 0;
+  const HostDevice* dev = nullptr;
+  for (const CpuWork& item : work) {
+    if (dev == nullptr || dev->device != item.upload.device) {
+      dev = Find(item.upload.device);
+    }
+    if (item.memory_type >= kEtc2CountedMemoryTypes || dev == nullptr ||
+        item.memory_type >= dev->memory.memoryTypeCount) {
+      types.unknown += item.upload.compressed;
+      continue;
+    }
+    types.bytes[item.memory_type] += item.upload.compressed;
+    if ((dev->memory.memoryTypes[item.memory_type].propertyFlags &
+         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0) {
+      ++non_host_visible;
+    }
+  }
+  CountTotals([&](Etc2DecodeTotals& totals) {
+    for (std::size_t type = 0; type < kEtc2CountedMemoryTypes; ++type) {
+      totals.source_bytes_by_type[type] += types.bytes[type];
+    }
+    totals.source_bytes_unknown_type += types.unknown;
+    totals.non_host_visible_sources += non_host_visible;
+  });
+  return types;
+}
+
 std::uint32_t VulkanEtc2Emulation::State::RunCpuUploads(
     const VkCommandBuffer* command_buffers, std::uint32_t count) {
   if (command_buffers == nullptr || count == 0 ||
       !has_commands.load(std::memory_order_acquire)) {
     return 0;
   }
-  struct Work {
-    PendingUpload upload;
-    std::uint8_t* source = nullptr;
-    VkDeviceMemory memory = VK_NULL_HANDLE;
-    VkDeviceSize memory_offset = 0;
-    std::uint32_t memory_type = UINT32_MAX;  // diagnostics and trace only
-  };
-  std::vector<Work> work;
-  {
-    std::lock_guard<std::mutex> lock(mutex);
-    auto collect = [this, &work](VkCommandBuffer command_buffer) {
-      const auto record = commands.find(command_buffer);
-      if (record == commands.end()) {
-        return;
-      }
-      for (const PendingUpload& upload : record->second.uploads) {
-        const auto binding = buffers.find(upload.source);
-        if (binding == buffers.end()) {
-          LogFailure("upload source buffer has no tracked memory binding");
-          continue;
-        }
-        Work item;
-        item.upload = upload;
-        if (TrackMemory()) {
-          const auto memory = memories.find(binding->second.memory);
-          if (memory != memories.end()) {
-            item.memory_type = memory->second.type;
-          }
-        }
-        const VkDeviceSize absolute =
-            binding->second.offset + upload.source_offset;
-        const auto mapping = mappings.find(binding->second.memory);
-        if (mapping == mappings.end()) {
-          item.memory = binding->second.memory;
-          item.memory_offset = absolute;
-        } else if (absolute >= mapping->second.offset &&
-                   (mapping->second.size == VK_WHOLE_SIZE ||
-                    (absolute - mapping->second.offset <=
-                         mapping->second.size &&
-                     upload.source_span <= mapping->second.size -
-                                              (absolute -
-                                               mapping->second.offset)))) {
-          item.source = static_cast<std::uint8_t*>(mapping->second.data) +
-                        (absolute - mapping->second.offset);
-        } else {
-          LogFailure("upload source lies outside the mapped range");
-          continue;
-        }
-        work.push_back(item);
-      }
-    };
-    for (std::uint32_t index = 0; index < count; ++index) {
-      collect(command_buffers[index]);
-      const auto record = commands.find(command_buffers[index]);
-      if (record != commands.end()) {
-        const std::vector<VkCommandBuffer> secondaries =
-            record->second.secondaries;
-        for (VkCommandBuffer secondary : secondaries) {
-          collect(secondary);
-        }
-      }
-    }
-  }
+  std::vector<CpuWork> work;
+  CollectCpuWork(command_buffers, count, &work);
   if (work.empty()) {
     // Most submits; never wait for another submit's decode for nothing.
     return 0;
   }
-  if (options.frame_stats) {
-    // Which memory Roblox's upload sources live in.
-    std::uint64_t by_type[kEtc2CountedMemoryTypes] = {};
-    std::uint64_t unknown_type = 0;
-    std::uint64_t non_host_visible = 0;
-    const HostDevice* dev = nullptr;
-    for (const Work& item : work) {
-      if (dev == nullptr || dev->device != item.upload.device) {
-        dev = Find(item.upload.device);
+  const SourceTypes types = CountSourceTypes(work);
+  const std::uint32_t decoded = options.fast_path
+                                    ? RunCpuUploadsFast(&work, types)
+                                    : RunCpuUploadsLegacy(&work, types);
+  Housekeeping(Clock::now());
+  return decoded;
+}
+
+namespace {
+
+// Roblox's upload memory that it does not keep mapped, mapped for one CPU
+// pass. Each allocation is mapped once: Vulkan forbids concurrent mappings.
+class TemporaryMappings {
+ public:
+  TemporaryMappings() = default;
+  ~TemporaryMappings() { UnmapAll(); }
+  TemporaryMappings(const TemporaryMappings&) = delete;
+  TemporaryMappings& operator=(const TemporaryMappings&) = delete;
+
+  const std::uint8_t* Map(const HostDevice* dev, VkDeviceMemory memory,
+                          VkDeviceSize offset) {
+    auto found = mappings_.find(memory);
+    if (found == mappings_.end()) {
+      void* data = nullptr;
+      if (dev == nullptr || dev->map_memory == nullptr ||
+          dev->map_memory(dev->device, memory, 0, VK_WHOLE_SIZE, 0, &data) !=
+              VK_SUCCESS) {
+        return nullptr;
       }
-      if (item.memory_type >= kEtc2CountedMemoryTypes || dev == nullptr ||
-          item.memory_type >= dev->memory.memoryTypeCount) {
-        unknown_type += item.upload.compressed;
-        continue;
-      }
-      by_type[item.memory_type] += item.upload.compressed;
-      if ((dev->memory.memoryTypes[item.memory_type].propertyFlags &
-           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0) {
-        ++non_host_visible;
+      found = mappings_
+                  .emplace(memory,
+                           Mapping{dev, static_cast<std::uint8_t*>(data)})
+                  .first;
+    }
+    return found->second.data + offset;
+  }
+
+  void UnmapAll() {
+    for (const auto& [memory, mapping] : mappings_) {
+      if (mapping.dev->unmap_memory != nullptr) {
+        mapping.dev->unmap_memory(mapping.dev->device, memory);
       }
     }
-    CountTotals([&](Etc2DecodeTotals& totals) {
-      for (std::size_t type = 0; type < kEtc2CountedMemoryTypes; ++type) {
-        totals.source_bytes_by_type[type] += by_type[type];
-      }
-      totals.source_bytes_unknown_type += unknown_type;
-      totals.non_host_visible_sources += non_host_visible;
-    });
+    mappings_.clear();
   }
-  // Decode in cached RAM; mapped Vulkan memory makes scattered reads slow.
-  // Map each source allocation once: Vulkan forbids concurrent mappings.
-  struct TemporaryMapping {
+
+ private:
+  struct Mapping {
     const HostDevice* dev = nullptr;
     std::uint8_t* data = nullptr;
   };
-  std::unordered_map<VkDeviceMemory, TemporaryMapping> temporary;
+  std::unordered_map<VkDeviceMemory, Mapping> mappings_;
+};
+
+std::uint64_t Milliseconds(Clock::duration duration) {
+  return static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(duration).count());
+}
+
+}  // namespace
+
+std::uint32_t VulkanEtc2Emulation::State::RunCpuUploadsLegacy(
+    std::vector<CpuWork>* work, const SourceTypes& types) {
+  // Decode in cached RAM; mapped Vulkan memory makes scattered reads slow.
+  TemporaryMappings temporary;
   struct Copy {
     const std::uint8_t* source = nullptr;
     VkDeviceSize compressed = 0;
@@ -2145,27 +2406,16 @@ std::uint32_t VulkanEtc2Emulation::State::RunCpuUploads(
   std::vector<std::uint32_t> copied_types;
   VkDeviceSize compressed_total = 0;
   VkDeviceSize decoded_total = 0;
-  for (const Work& item : work) {
+  for (const CpuWork& item : *work) {
     const PendingUpload& upload = item.upload;
     const std::uint8_t* source = item.source;
     if (source == nullptr) {
-      auto found = temporary.find(item.memory);
-      if (found == temporary.end()) {
-        const HostDevice* dev = Find(upload.device);
-        void* data = nullptr;
-        if (dev == nullptr || dev->map_memory == nullptr ||
-            dev->map_memory(dev->device, item.memory, 0, VK_WHOLE_SIZE, 0,
-                            &data) != VK_SUCCESS) {
-          LogFailure("could not map an unmapped upload source");
-          continue;
-        }
-        found = temporary
-                    .emplace(item.memory,
-                             TemporaryMapping{
-                                 dev, static_cast<std::uint8_t*>(data)})
-                    .first;
+      source = temporary.Map(Find(upload.device), item.memory,
+                             item.memory_offset);
+      if (source == nullptr) {
+        LogFailure("could not map an unmapped upload source");
+        continue;
       }
-      source = found->second.data + item.memory_offset;
     }
     copies.push_back({source, upload.compressed, upload.decoded});
     copied_uploads.push_back(&upload);
@@ -2174,7 +2424,7 @@ std::uint32_t VulkanEtc2Emulation::State::RunCpuUploads(
     decoded_total += upload.decoded;
   }
 
-  std::lock_guard<std::mutex> scratch_lock(scratch_mutex);
+  std::unique_lock<std::mutex> scratch_lock(scratch_mutex);
   const auto copy_start = Clock::now();
   if (scratch_source.size() < compressed_total) {
     scratch_source.resize(compressed_total);
@@ -2226,14 +2476,10 @@ std::uint32_t VulkanEtc2Emulation::State::RunCpuUploads(
                    upload.width, upload.height, upload.layers);
     }
   }
-  for (const auto& [memory, mapping] : temporary) {
-    if (mapping.dev->unmap_memory != nullptr) {
-      mapping.dev->unmap_memory(mapping.dev->device, memory);
-    }
-  }
+  temporary.UnmapAll();
   const auto jobs_start = Clock::now();
-  DecodeEtcJobs(jobs.data(), jobs.size(),
-                options.workers != 0 ? options.workers : DecodeWorkerCount());
+  const unsigned threads =
+      std::max(1U, DecodeEtcJobs(jobs.data(), jobs.size(), WorkerCount()));
   const auto jobs_end = Clock::now();
   for (const EtcDecodeJob& job : jobs) {
     if (!job.ok) {
@@ -2257,42 +2503,392 @@ std::uint32_t VulkanEtc2Emulation::State::RunCpuUploads(
           : 0;
   ReleaseOversizedEtc2Scratch(&scratch_source);
   ReleaseOversizedEtc2Scratch(&scratch_decoded);
+  scratch_lock.unlock();
   if (copied_uploads.empty()) {
     return 0;
   }
   const std::uint64_t decode_ns =
       Nanoseconds(Clock::now() - decode_start) - trace_ns;
+  const std::uint64_t phase_ms[4] = {
+      Milliseconds(copy_start - decode_start),
+      Milliseconds(jobs_start - copy_start),
+      Milliseconds(jobs_end - jobs_start), Milliseconds(emit_end - jobs_end)};
+  FinishCpuPass(copied_uploads.size(), compressed_total, host_total,
+                decode_ns, phase_ms, threads, types);
+  return static_cast<std::uint32_t>(copied_uploads.size());
+}
+
+// The fast path (DESIGN C2): copy-in with streaming loads and decode on the
+// worker pool; unscaled uploads decode straight into their staging, which
+// rewritten regions lay out exactly as the decoder writes; upscaled ones
+// resample per image in parallel. Its output is the same, byte for byte.
+std::uint32_t VulkanEtc2Emulation::State::RunCpuUploadsFast(
+    std::vector<CpuWork>* work, const SourceTypes& types) {
+  constexpr VkDeviceSize kIntoStaging = ~VkDeviceSize{0};
+  struct Item {
+    const PendingUpload* upload = nullptr;
+    const std::uint8_t* source = nullptr;  // Roblox's bytes, mapped
+    VkDeviceSize compressed_offset = 0;    // in fast_source
+    VkDeviceSize decoded_offset = kIntoStaging;  // in fast_decoded
+    bool repeat = false;
+  };
+  TemporaryMappings temporary;
+  // Everything from here on holds up the submit.
+  const auto decode_start = Clock::now();
+  std::vector<Item> items;
+  items.reserve(work->size());
+  std::vector<const PendingUpload*> traced;
+  std::vector<std::uint32_t> traced_types;
+  VkDeviceSize compressed_total = 0;
+  VkDeviceSize decoded_total = 0;  // of the uploads that need scratch
+  VkDeviceSize emit_total = 0;
+  VkDeviceSize host_total = 0;
+  for (const CpuWork& entry : *work) {
+    const PendingUpload& upload = entry.upload;
+    Item item;
+    item.upload = &upload;
+    item.repeat = entry.repeat;
+    item.source = entry.source;
+    if (item.source == nullptr) {
+      item.source = temporary.Map(Find(upload.device), entry.memory,
+                                  entry.memory_offset);
+      if (item.source == nullptr) {
+        LogFailure("could not map an unmapped upload source");
+        continue;
+      }
+    }
+    item.compressed_offset = compressed_total;
+    compressed_total += upload.compressed;
+    // Upscaled uploads resample, and override candidates may be replaced
+    // or dumped, from decoded texels; everything else is final as decoded.
+    if (upload.scale > 1 || MayOverride(upload)) {
+      item.decoded_offset = decoded_total;
+      decoded_total += upload.decoded;
+      emit_total += upload.target_bytes;
+    }
+    host_total += upload.target_bytes;
+    items.push_back(item);
+    if (Tracing()) {
+      traced.push_back(&upload);
+      traced_types.push_back(entry.memory_type);
+    }
+  }
+  if (items.empty()) {
+    return 0;
+  }
+
+  std::unique_lock<std::mutex> scratch_lock(scratch_mutex);
+  const auto copy_start = Clock::now();
+  std::uint8_t* const compressed =
+      fast_source.Reserve(compressed_total, copy_start);
+  std::uint8_t* const decoded =
+      decoded_total != 0 ? fast_decoded.Reserve(decoded_total, copy_start)
+                         : nullptr;
+  if ((compressed_total != 0 && compressed == nullptr) ||
+      (decoded_total != 0 && decoded == nullptr)) {
+    LogFailure("could not allocate decode scratch; uploads skipped");
+    return 0;
+  }
+  const unsigned workers = WorkerCount();
+  WorkerPool* const pool =
+      workers > 1 ? &WorkerPool::Shared(workers) : nullptr;
+  unsigned threads = 1;
+
+  // Copy-in: pieces of at most 256 KiB, whole block rows of strided
+  // uploads, batched into tasks of at least 128 KiB.
+  struct Piece {
+    const std::uint8_t* source;
+    std::uint8_t* destination;
+    std::size_t row_bytes;
+    std::size_t rows;
+    std::size_t stride;
+  };
+  std::vector<Piece> pieces;
+  std::vector<std::size_t> task_ends;
+  std::size_t task_bytes = 0;
+  const auto add_piece = [&](const Piece& piece) {
+    pieces.push_back(piece);
+    task_bytes += piece.row_bytes * piece.rows;
+    if (task_bytes >= kCopyTaskBytes) {
+      task_ends.push_back(pieces.size());
+      task_bytes = 0;
+    }
+  };
+  for (const Item& item : items) {
+    const PendingUpload& upload = *item.upload;
+    std::uint8_t* destination = compressed + item.compressed_offset;
+    if (upload.source_span == upload.compressed) {
+      for (VkDeviceSize offset = 0; offset < upload.compressed;
+           offset += kCopyPieceBytes) {
+        const std::size_t bytes = static_cast<std::size_t>(std::min<
+            VkDeviceSize>(kCopyPieceBytes, upload.compressed - offset));
+        add_piece({item.source + offset, destination + offset, bytes, 1,
+                   bytes});
+      }
+      continue;
+    }
+    const VkDeviceSize compressed_layer = upload.compressed / upload.layers;
+    const VkDeviceSize block_rows =
+        (static_cast<VkDeviceSize>(upload.height) + 3) / 4;
+    const VkDeviceSize packed_row = compressed_layer / block_rows;
+    const VkDeviceSize rows_per_piece =
+        std::max<VkDeviceSize>(1, kCopyPieceBytes / packed_row);
+    for (std::uint32_t layer = 0; layer < upload.layers; ++layer) {
+      for (VkDeviceSize row = 0; row < block_rows; row += rows_per_piece) {
+        add_piece({item.source + layer * upload.source_layer_stride +
+                       row * upload.source_row_stride,
+                   destination + layer * compressed_layer + row * packed_row,
+                   static_cast<std::size_t>(packed_row),
+                   static_cast<std::size_t>(
+                       std::min(rows_per_piece, block_rows - row)),
+                   static_cast<std::size_t>(upload.source_row_stride)});
+      }
+    }
+  }
+  if (task_bytes != 0) {
+    task_ends.push_back(pieces.size());
+  }
+  const auto copy_task = [&](std::size_t task) {
+    for (std::size_t index = task == 0 ? 0 : task_ends[task - 1];
+         index < task_ends[task]; ++index) {
+      const Piece& piece = pieces[index];
+      CopyStridedFromMappedMemory(piece.destination, piece.source,
+                                  piece.row_bytes, piece.rows, piece.stride);
+    }
+  };
+  if (pool != nullptr && task_ends.size() > 1 &&
+      compressed_total >= kParallelCopyMinimumBytes) {
+    threads = std::max(threads, pool->ParallelFor(task_ends.size(), copy_task));
+  } else {
+    for (std::size_t task = 0; task < task_ends.size(); ++task) {
+      copy_task(task);
+    }
+  }
+  temporary.UnmapAll();
+  for (const Item& item : items) {
+    if (g_decode_logs.load(std::memory_order_relaxed) >= 4 ||
+        !ShouldLog(&g_decode_logs, 4)) {
+      break;
+    }
+    std::fprintf(stderr, "  [vulkan] ETC2 upload decoded %ux%u layers=%u\n",
+                 item.upload->width, item.upload->height,
+                 item.upload->layers);
+  }
+
+  // Decode, in bands on the pool.
+  const auto jobs_start = Clock::now();
+  std::vector<EtcDecodeJob> jobs;
+  jobs.reserve(items.size());
+  for (const Item& item : items) {
+    const PendingUpload& upload = *item.upload;
+    const bool into_staging = item.decoded_offset == kIntoStaging;
+    if (into_staging && item.repeat) {
+      continue;  // its first pass writes the same texels to the same place
+    }
+    const VkDeviceSize compressed_layer = upload.compressed / upload.layers;
+    const VkDeviceSize decoded_layer = upload.decoded / upload.layers;
+    std::uint8_t* destination =
+        into_staging ? upload.target : decoded + item.decoded_offset;
+    for (std::uint32_t layer = 0; layer < upload.layers; ++layer) {
+      EtcDecodeJob job;
+      job.format = upload.format;
+      job.source = compressed + item.compressed_offset + layer * compressed_layer;
+      job.source_bytes = compressed_layer;
+      job.width = upload.width;
+      job.height = upload.height;
+      job.destination = destination + layer * decoded_layer;
+      job.destination_bytes = decoded_layer;
+      jobs.push_back(job);
+    }
+  }
+  threads = std::max(threads, DecodeEtcJobs(jobs.data(), jobs.size(), workers));
+  const auto jobs_end = Clock::now();
+  for (const EtcDecodeJob& job : jobs) {
+    if (!job.ok) {
+      LogFailure("could not decode an upload layer");
+    }
+  }
+
+  // Emit what did not decode straight into staging.
+  if (overrides.active()) {
+    // Hashing, dumps and lookups, in submit order as before.
+    for (const Item& item : items) {
+      if (item.decoded_offset != kIntoStaging) {
+        EmitUpload(*item.upload, compressed + item.compressed_offset,
+                   decoded + item.decoded_offset);
+      }
+    }
+  } else if (emit_total != 0) {
+    // Per image, in submit order within it: mip 0 sets the base that the
+    // image's later mips resample from.
+    std::vector<std::vector<std::size_t>> groups;
+    std::unordered_map<VkImage, std::size_t> group_of;
+    for (std::size_t index = 0; index < items.size(); ++index) {
+      if (items[index].decoded_offset == kIntoStaging) {
+        continue;
+      }
+      const auto found =
+          group_of.emplace(items[index].upload->image, groups.size());
+      if (found.second) {
+        groups.emplace_back();
+      }
+      groups[found.first->second].push_back(index);
+    }
+    const auto emit_group = [&](std::size_t group) {
+      for (std::size_t index : groups[group]) {
+        EmitScaled(*items[index].upload, decoded + items[index].decoded_offset);
+      }
+    };
+    if (pool != nullptr && groups.size() > 1 &&
+        emit_total >= kParallelEmitMinimumBytes) {
+      threads = std::max(threads, pool->ParallelFor(groups.size(), emit_group));
+    } else {
+      for (std::size_t group = 0; group < groups.size(); ++group) {
+        emit_group(group);
+      }
+    }
+  }
+  const auto emit_end = Clock::now();
+  const std::uint64_t trace_ns =
+      Tracing() ? TraceUploads(traced, traced_types, compressed) : 0;
+  const Clock::time_point done = Clock::now();
+  fast_source.MarkUsed(done);
+  if (decoded_total != 0) {
+    fast_decoded.MarkUsed(done);
+  }
+  scratch_lock.unlock();
+  const std::uint64_t decode_ns = Nanoseconds(done - decode_start) - trace_ns;
+  const std::uint64_t phase_ms[4] = {
+      Milliseconds(copy_start - decode_start),
+      Milliseconds(jobs_start - copy_start),
+      Milliseconds(jobs_end - jobs_start), Milliseconds(emit_end - jobs_end)};
+  FinishCpuPass(items.size(), compressed_total, host_total, decode_ns,
+                phase_ms, threads, types);
+  return static_cast<std::uint32_t>(items.size());
+}
+
+void VulkanEtc2Emulation::State::FinishCpuPass(
+    std::size_t uploads, VkDeviceSize compressed_total,
+    VkDeviceSize host_total, std::uint64_t decode_ns,
+    const std::uint64_t (&phase_ms)[4], unsigned threads,
+    const SourceTypes& types) {
   // MOCKTAIL_FRAME_STATS=1: name each submit that held the render thread.
   if (options.frame_stats && decode_ns >= 20000000ULL) {
     std::fprintf(stderr,
                  "  [vulkan] ETC2 decode stall %llu ms: %zu uploads, "
                  "%.1f MiB compressed, %.1f MiB written "
-                 "(prepare %lld, copy %lld, decode %lld, write %lld ms)\n",
+                 "(prepare %llu, copy %llu, decode %llu, write %llu ms)%s\n",
                  static_cast<unsigned long long>(decode_ns / 1000000ULL),
-                 copied_uploads.size(),
-                 static_cast<double>(compressed_total) / 1048576.0,
+                 uploads, static_cast<double>(compressed_total) / 1048576.0,
                  static_cast<double>(host_total) / 1048576.0,
-                 static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(copy_start - decode_start).count()),
-                 static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(jobs_start - copy_start).count()),
-                 static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(jobs_end - jobs_start).count()),
-                 static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(emit_end - jobs_end).count()));
+                 static_cast<unsigned long long>(phase_ms[0]),
+                 static_cast<unsigned long long>(phase_ms[1]),
+                 static_cast<unsigned long long>(phase_ms[2]),
+                 static_cast<unsigned long long>(phase_ms[3]),
+                 FormatEtc2StallSuffix(threads, options.fast_path,
+                                       types.bytes, types.unknown)
+                     .c_str());
   }
   bool milestone = false;
   {
     std::lock_guard<std::mutex> lock(totals_mutex);
     const std::uint64_t before = totals.host_bytes;
-    AddEtc2SubmitDecode(&totals, copied_uploads.size(), compressed_total,
-                        host_total, decode_ns);
+    AddEtc2SubmitDecode(&totals, uploads, compressed_total, host_total,
+                        decode_ns);
     if (options.frame_stats) {
-      AddEtc2SubmitDecode(&window, copied_uploads.size(), compressed_total,
-                          host_total, decode_ns);
+      AddEtc2SubmitDecode(&window, uploads, compressed_total, host_total,
+                          decode_ns);
     }
     milestone = Etc2DecodeTotalsMilestone(before, totals.host_bytes);
   }
   if (milestone) {
     LogTotals(" so far");
   }
-  return static_cast<std::uint32_t>(copied_uploads.size());
+}
+
+void VulkanEtc2Emulation::State::EmitScaled(const PendingUpload& upload,
+                                            const std::uint8_t* decoded) {
+  std::shared_ptr<const RgbaImage> base;
+  if (upload.full_mip) {
+    // A whole mip 0 becomes the image's base, its block padding clipped.
+    std::shared_ptr<RgbaImage> level0;
+    if (upload.mip_level == 0) {
+      level0 = std::make_shared<RgbaImage>();
+      level0->width = upload.source_width;
+      level0->height = upload.source_height;
+      const std::size_t row = static_cast<std::size_t>(upload.source_width) * 4;
+      if (upload.source_width == upload.width) {
+        level0->pixels.assign(decoded, decoded + row * upload.source_height);
+      } else {
+        level0->pixels.resize(row * upload.source_height);
+        for (std::uint32_t y = 0; y < upload.source_height; ++y) {
+          std::memcpy(level0->pixels.data() + y * row,
+                      decoded + static_cast<std::size_t>(y) * upload.width * 4,
+                      row);
+        }
+      }
+    }
+    std::lock_guard<std::mutex> lock(mutex);
+    const auto record = images.find(upload.image);
+    if (record != images.end()) {
+      if (level0 != nullptr) {
+        record->second.base = std::move(level0);
+      }
+      base = record->second.base;
+    }
+  }
+  if (base != nullptr) {
+    ResampleRgba(*base, upload.target_width, upload.target_height,
+                 upload.target);
+    return;
+  }
+  ResampleRgba(decoded, upload.source_width, upload.source_height,
+               static_cast<std::size_t>(upload.width) * 4,
+               upload.target_width, upload.target_height, upload.target);
+}
+
+void VulkanEtc2Emulation::State::Housekeeping(Clock::time_point now) {
+  const std::int64_t now_ns = static_cast<std::int64_t>(
+      Nanoseconds(now.time_since_epoch()));
+  std::int64_t due = next_housekeeping_ns.load(std::memory_order_relaxed);
+  if (now_ns < due ||
+      !next_housekeeping_ns.compare_exchange_strong(
+          due, now_ns + 1000000000LL, std::memory_order_relaxed)) {
+    return;
+  }
+  std::vector<VkDevice> staged;
+  {
+    std::lock_guard<std::mutex> lock(devices_mutex);
+    for (const auto& dev : devices) {
+      if (dev->host_staging != nullptr) {
+        staged.push_back(dev->device);
+      }
+    }
+  }
+  for (VkDevice device : staged) {
+    // Hand over hand: once the device's own lock is held, DestroyDevice
+    // waits for it before it destroys the arena and the device record.
+    std::unique_lock<std::mutex> list(devices_mutex);
+    HostDevice* dev = nullptr;
+    for (const auto& candidate : devices) {
+      if (candidate->device == device) {
+        dev = candidate.get();
+      }
+    }
+    if (dev == nullptr) {
+      continue;
+    }
+    std::lock_guard<std::mutex> own(dev->mutex);
+    list.unlock();
+    if (dev->host_staging != nullptr) {
+      dev->host_staging->Trim(now);
+    }
+  }
+  std::unique_lock<std::mutex> scratch(scratch_mutex, std::try_to_lock);
+  if (scratch.owns_lock()) {
+    fast_source.ReleaseIfIdle(now);
+    fast_decoded.ReleaseIfIdle(now);
+  }
 }
 
 void VulkanEtc2Emulation::PrepareSubmit(VkQueue queue, std::uint32_t count,
@@ -2388,10 +2984,11 @@ void VulkanEtc2Emulation::ReleaseCommandBuffer(VkCommandBuffer command_buffer) {
 }
 
 void VulkanEtc2Emulation::OnPresent() {
+  const Clock::time_point now = Clock::now();
+  state_->Housekeeping(now);
   if (!state_->options.frame_stats) {
     return;
   }
-  const Clock::time_point now = Clock::now();
   {
     std::lock_guard<std::mutex> lock(state_->totals_mutex);
     if (state_->window_start == Clock::time_point{}) {
