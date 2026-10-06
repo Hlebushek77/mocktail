@@ -59,6 +59,10 @@ class Selftest {
   guint RenderEnvironmentDialog();
   guint MoveThenDropMovedValues();
   guint MoveEnvironment();
+  // Compressed textures (BC) is locked, with the reason, while the draft's
+  // backend is OpenGL ES or ANGLE, and the Graphics page is rendered so.
+  guint LockTextureCompression();
+  guint CheckTextureCompressionLock();
   // Sets every kind of Roblox override and opens the overview.
   guint ShowRobloxDecides();
   guint Resize(int width, int height);

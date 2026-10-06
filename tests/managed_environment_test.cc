@@ -110,6 +110,7 @@ TEST(ManagedEnvironmentTest, CoversEverySettingTheLauncherNeeds) {
       {"MOCKTAIL_GRAPHICS_QUALITY", "engine.graphics_quality"},
       {"MOCKTAIL_GPU", "engine.gpu"},
       {"MOCKTAIL_NVIDIA_SHADER_MT", "engine.nvidia_shader_mt"},
+      {"MOCKTAIL_ETC2_TO_BC", "engine.etc2_to_bc"},
       {"MOCKTAIL_LAUNCHER_SHOW_ON_START", "launcher.show_on_start"},
       {"MOCKTAIL_VSYNC", "graphics.vsync"},
       {"MOCKTAIL_GRAPHICS_BACKEND", "graphics.backend"},
@@ -175,6 +176,7 @@ TEST(ManagedEnvironmentTest, ImportedValuesLoadToTheSameSettings) {
       {"MOCKTAIL_GRAPHICS_QUALITY", "auto"},
       {"MOCKTAIL_GPU", "integrated"},
       {"MOCKTAIL_NVIDIA_SHADER_MT", "off"},
+      {"MOCKTAIL_ETC2_TO_BC", "on"},
       {"MOCKTAIL_FRAME_RATE_LIMIT", "165"},
       {"MOCKTAIL_VSYNC", "off"},
       {"MOCKTAIL_WINDOW_START_MODE", "maximized"},
@@ -255,6 +257,7 @@ TEST(ManagedEnvironmentTest, ImportedValuesLoadToTheSameSettings) {
     EXPECT_EQ(a.engine().gpu, b.engine().gpu) << entry.name;
     EXPECT_EQ(a.engine().nvidia_shader_mt, b.engine().nvidia_shader_mt)
         << entry.name;
+    EXPECT_EQ(a.engine().etc2_to_bc, b.engine().etc2_to_bc) << entry.name;
     EXPECT_EQ(a.frame_rate().mode, b.frame_rate().mode) << entry.name;
     EXPECT_EQ(a.frame_rate().fixed_fps, b.frame_rate().fixed_fps)
         << entry.name;

@@ -128,7 +128,9 @@ DisplayServer AvailableDisplayServer(DisplayServer configured);
 // MOCKTAIL_NVIDIA_SHADER_MT is published for the canaries as well. With
 // direct Vulkan and engine.nvidia_shader_mt false, the NVIDIA shader loading
 // deny is merged into MOCKTAIL_CLIENT_SETTINGS_OVERRIDES_JSON (see
-// MergeNvidiaShaderLoadingClientSettingsOverrides).
+// MergeNvidiaShaderLoadingClientSettingsOverrides). So is
+// MOCKTAIL_ETC2_TO_BC (engine.etc2_to_bc), so a canary keeps Roblox's
+// textures the way the game will.
 //
 // The policy runs before the session log starts, so what it has to say for
 // the log (DescribeVulkanGpuSelection) is appended to `*log` for the caller

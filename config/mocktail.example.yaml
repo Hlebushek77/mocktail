@@ -156,6 +156,13 @@ engine:
   # false makes Roblox load it on one thread there, as Mocktail did before
   # this setting existed; use it only if shader loading fails on NVIDIA.
   nvidia_shader_mt: true
+  # Boolean (default: false): on graphics cards that cannot read ETC2
+  # textures (NVIDIA, some others), convert Roblox's ETC2 textures to BC
+  # instead of unpacking them, so they take 4 to 8 times less video memory.
+  # Fine detail can lose some quality, and loading can take longer when the
+  # conversion runs on the processor instead of the graphics card. Only the
+  # Vulkan backend reads it.
+  etc2_to_bc: false
 
 launcher:
   # Boolean (default: true): show the Mocktail settings window before Roblox

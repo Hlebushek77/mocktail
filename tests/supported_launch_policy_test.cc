@@ -122,6 +122,7 @@ int RunGraphicsPolicyProbe(const char* backend) {
   for (const char* name : {
            "MOCKTAIL_GRAPHICS_BACKEND",
            "MOCKTAIL_NVIDIA_SHADER_MT",
+           "MOCKTAIL_ETC2_TO_BC",
            "MOCKTAIL_PRELOAD_VULKAN_SHIM",
            "MOCKTAIL_DISABLE_AUTO_ANGLE_FALLBACK",
            "MOCKTAIL_SOFTWARE_WINDOW_FALLBACK",
@@ -145,10 +146,12 @@ int RunGraphicsPolicyProbe(const char* backend) {
   const char* resolved = getenv("MOCKTAIL_GRAPHICS_BACKEND");
   const char* preload = getenv("MOCKTAIL_PRELOAD_VULKAN_SHIM");
   const char* nvidia_shader_mt = getenv("MOCKTAIL_NVIDIA_SHADER_MT");
+  const char* etc2_to_bc = getenv("MOCKTAIL_ETC2_TO_BC");
   if (resolved == nullptr || preload == nullptr ||
       std::string(resolved) != (open_gl ? "opengl" : "direct-vulkan") ||
       std::string(preload) != (open_gl ? "0" : "1") ||
-      nvidia_shader_mt == nullptr || std::string(nvidia_shader_mt) != "1") {
+      nvidia_shader_mt == nullptr || std::string(nvidia_shader_mt) != "1" ||
+      etc2_to_bc == nullptr || std::string(etc2_to_bc) != "0") {
     return 23;
   }
   if (open_gl) {
@@ -362,6 +365,73 @@ TEST(GraphicsLaunchPolicyTest, MergesTheNvidiaShaderDenyIntoClientSettings) {
   }
   EXPECT_FALSE(
       MergeNvidiaShaderLoadingClientSettingsOverrides(false, "{}", nullptr));
+}
+
+// engine.etc2_to_bc reaches the updater's canaries (readiness_canary.cc
+// inherits MOCKTAIL_ETC2_TO_BC), resolved as 1 or 0 for every backend.
+int RunEtc2ConversionPolicyProbe(const char* backend, const char* value,
+                                 const char* expected) {
+  if (unsetenv("MOCKTAIL_ETC2_TO_BC") != 0 ||
+      setenv("MOCKTAIL_GRAPHICS_BACKEND", backend, 1) != 0 ||
+      (value != nullptr && setenv("MOCKTAIL_ETC2_TO_BC", value, 1) != 0)) {
+    return 20;
+  }
+  const RuntimeConfig config =
+      RuntimeConfig::FromEnvironment(ProcessEnvironment());
+  std::string error;
+  if (!ApplyGraphicsLaunchPolicy(config, &error)) return 21;
+  const char* published = getenv("MOCKTAIL_ETC2_TO_BC");
+  return published != nullptr && std::string(published) == expected ? 0 : 22;
+}
+
+TEST(GraphicsLaunchPolicyTest, PublishesTheEtc2ConversionForTheCanaries) {
+  struct Case {
+    const char* backend;
+    const char* value;
+    const char* expected;
+  };
+  for (const Case& entry : {
+           Case{"direct-vulkan", nullptr, "0"},
+           Case{"direct-vulkan", "on", "1"},
+           Case{"direct-vulkan", "false", "0"},
+           Case{"opengl", "true", "1"},
+       }) {
+    const pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+      std::_Exit(RunEtc2ConversionPolicyProbe(entry.backend, entry.value,
+                                              entry.expected));
+    }
+    int status = 0;
+    ASSERT_EQ(waitpid(child, &status, 0), child);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(WEXITSTATUS(status), 0)
+        << entry.backend << " MOCKTAIL_ETC2_TO_BC="
+        << (entry.value != nullptr ? entry.value : "(unset)");
+  }
+
+  const pid_t child = fork();
+  ASSERT_GE(child, 0);
+  if (child == 0) {
+    if (setenv("MOCKTAIL_GRAPHICS_BACKEND", "direct-vulkan", 1) != 0 ||
+        setenv("MOCKTAIL_ETC2_TO_BC", "yes", 1) != 0) {
+      std::_Exit(20);
+    }
+    const RuntimeConfig invalid =
+        RuntimeConfig::FromEnvironment(ProcessEnvironment());
+    std::string error;
+    std::_Exit(!invalid.engine().etc2_to_bc_valid &&
+                       !ApplyGraphicsLaunchPolicy(invalid, {}, &error) &&
+                       error.find("ETC2 texture conversion") !=
+                           std::string::npos &&
+                       std::string(getenv("MOCKTAIL_ETC2_TO_BC")) == "yes"
+                   ? 0
+                   : 21);
+  }
+  int status = 0;
+  ASSERT_EQ(waitpid(child, &status, 0), child);
+  ASSERT_TRUE(WIFEXITED(status));
+  EXPECT_EQ(WEXITSTATUS(status), 0);
 }
 
 TEST(GraphicsLaunchPolicyTest, RefusesAnInvalidNvidiaShaderSwitch) {

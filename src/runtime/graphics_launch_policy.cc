@@ -697,6 +697,12 @@ bool ApplyGraphicsLaunchPolicy(const RuntimeConfig& config,
     }
     return false;
   }
+  if (!config.engine().etc2_to_bc_valid) {
+    if (error != nullptr) {
+      *error = "cannot apply an invalid ETC2 texture conversion";
+    }
+    return false;
+  }
   if (!UserSelectsVideoDriver(user_environment) &&
       !ApplyDisplayServer(AvailableDisplayServer(config.display().server),
                           error)) {
@@ -709,6 +715,8 @@ bool ApplyGraphicsLaunchPolicy(const RuntimeConfig& config,
                 config.graphics_backend_name(), error) ||
       !SetValue("MOCKTAIL_NVIDIA_SHADER_MT",
                 config.engine().nvidia_shader_mt ? "1" : "0", error) ||
+      !SetValue("MOCKTAIL_ETC2_TO_BC", config.engine().etc2_to_bc ? "1" : "0",
+                error) ||
       !SetValue("MOCKTAIL_PRELOAD_VULKAN_SHIM",
                 direct_vulkan ? "1" : "0", error) ||
       !SetDefault("MOCKTAIL_REQUIRE_REAL_GRAPHICS", "1", error)) {

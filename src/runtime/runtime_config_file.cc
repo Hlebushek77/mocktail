@@ -210,6 +210,7 @@ bool ValidateAndMap(const ValueMap& yaml, ValueMap* environment,
       "engine.graphics_quality",
       "engine.gpu",
       "engine.nvidia_shader_mt",
+      "engine.etc2_to_bc",
       "launcher.show_on_start",
   };
   for (const auto& [key, ignored] : yaml) {
@@ -631,6 +632,15 @@ bool ValidateAndMap(const ValueMap& yaml, ValueMap* environment,
     }
     (*environment)["MOCKTAIL_NVIDIA_SHADER_MT"] = parsed ? "1" : "0";
   }
+  if (const auto etc2_to_bc = value("engine.etc2_to_bc");
+      etc2_to_bc.has_value()) {
+    bool parsed = false;
+    if (!ParseBoolean(*etc2_to_bc, &parsed)) {
+      *error = "engine.etc2_to_bc must be true or false";
+      return false;
+    }
+    (*environment)["MOCKTAIL_ETC2_TO_BC"] = parsed ? "1" : "0";
+  }
   if (const auto show_on_start = value("launcher.show_on_start");
       show_on_start.has_value()) {
     bool parsed = false;
@@ -888,6 +898,10 @@ RuntimeConfigLoadResult LoadRuntimeConfig(
     result.error =
         "NVIDIA shader loading policy is invalid: MOCKTAIL_NVIDIA_SHADER_MT "
         "must be true or false";
+  } else if (!result.config.engine().etc2_to_bc_valid) {
+    result.error =
+        "ETC2 texture conversion is invalid: MOCKTAIL_ETC2_TO_BC must be "
+        "true or false";
   } else if (!result.config.launcher().show_on_start_valid) {
     result.error =
         "launcher start policy is invalid: MOCKTAIL_LAUNCHER_SHOW_ON_START "
@@ -971,6 +985,12 @@ bool ExportRuntimeConfigEnvironment(const RuntimeConfig& config,
   if (!config.engine().nvidia_shader_mt_valid) {
     if (error != nullptr) {
       *error = "cannot export an invalid NVIDIA shader loading policy";
+    }
+    return false;
+  }
+  if (!config.engine().etc2_to_bc_valid) {
+    if (error != nullptr) {
+      *error = "cannot export an invalid ETC2 texture conversion";
     }
     return false;
   }
@@ -1095,6 +1115,8 @@ bool ExportRuntimeConfigEnvironment(const RuntimeConfig& config,
       SetEnvironmentValue("MOCKTAIL_NVIDIA_SHADER_MT",
                           config.engine().nvidia_shader_mt ? "1" : "0",
                           error) &&
+      SetEnvironmentValue("MOCKTAIL_ETC2_TO_BC",
+                          config.engine().etc2_to_bc ? "1" : "0", error) &&
       SetEnvironmentValue("MOCKTAIL_LAUNCHER_SHOW_ON_START",
                           config.launcher().show_on_start ? "1" : "0", error);
   if (!base_exported) {

@@ -101,6 +101,8 @@ TEST(RuntimeConfigTest, UsesSupportedDefaults) {
   EXPECT_TRUE(config.engine().gpu_valid);
   EXPECT_TRUE(config.engine().nvidia_shader_mt);
   EXPECT_TRUE(config.engine().nvidia_shader_mt_valid);
+  EXPECT_FALSE(config.engine().etc2_to_bc);
+  EXPECT_TRUE(config.engine().etc2_to_bc_valid);
   EXPECT_TRUE(config.launcher().show_on_start);
   EXPECT_TRUE(config.launcher().show_on_start_valid);
 }
@@ -577,6 +579,7 @@ TEST(RuntimeConfigTest, ReadsLauncherManagedSettingsFromEnvironment) {
       {"MOCKTAIL_GRAPHICS_QUALITY", "9"},
       {"MOCKTAIL_GPU", "discrete"},
       {"MOCKTAIL_NVIDIA_SHADER_MT", "off"},
+      {"MOCKTAIL_ETC2_TO_BC", "on"},
       {"MOCKTAIL_LAUNCHER_SHOW_ON_START", "off"},
   }));
   EXPECT_EQ(config.display().server, DisplayServer::kX11);
@@ -586,6 +589,7 @@ TEST(RuntimeConfigTest, ReadsLauncherManagedSettingsFromEnvironment) {
             (GraphicsQuality{GraphicsQualityMode::kLevel, 9}));
   EXPECT_EQ(config.engine().gpu, GpuPreference::kDiscrete);
   EXPECT_FALSE(config.engine().nvidia_shader_mt);
+  EXPECT_TRUE(config.engine().etc2_to_bc);
   EXPECT_FALSE(config.launcher().show_on_start);
 
   const RuntimeConfig invalid = RuntimeConfig::FromEnvironment(MapEnvironment({
@@ -594,6 +598,7 @@ TEST(RuntimeConfigTest, ReadsLauncherManagedSettingsFromEnvironment) {
       {"MOCKTAIL_GRAPHICS_QUALITY", "40"},
       {"MOCKTAIL_GPU", "igpu"},
       {"MOCKTAIL_NVIDIA_SHADER_MT", "auto"},
+      {"MOCKTAIL_ETC2_TO_BC", "yes"},
       {"MOCKTAIL_LAUNCHER_SHOW_ON_START", "sometimes"},
   }));
   EXPECT_FALSE(invalid.display().server_valid);
@@ -601,6 +606,7 @@ TEST(RuntimeConfigTest, ReadsLauncherManagedSettingsFromEnvironment) {
   EXPECT_FALSE(invalid.engine().graphics_quality_valid);
   EXPECT_FALSE(invalid.engine().gpu_valid);
   EXPECT_FALSE(invalid.engine().nvidia_shader_mt_valid);
+  EXPECT_FALSE(invalid.engine().etc2_to_bc_valid);
   EXPECT_FALSE(invalid.launcher().show_on_start_valid);
   // Invalid values keep the defaults, so nothing downstream sees garbage.
   EXPECT_EQ(invalid.display().server, DisplayServer::kAuto);
@@ -608,6 +614,7 @@ TEST(RuntimeConfigTest, ReadsLauncherManagedSettingsFromEnvironment) {
   EXPECT_EQ(invalid.engine().graphics_quality, GraphicsQuality{});
   EXPECT_EQ(invalid.engine().gpu, GpuPreference::kAuto);
   EXPECT_TRUE(invalid.engine().nvidia_shader_mt);
+  EXPECT_FALSE(invalid.engine().etc2_to_bc);
   EXPECT_TRUE(invalid.launcher().show_on_start);
 }
 

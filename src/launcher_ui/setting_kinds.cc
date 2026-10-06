@@ -11,6 +11,7 @@ constexpr std::string_view kBooleanKeys[] = {
     "performance.multithreaded_rendering",
     // runtime_config_file.cc reads it with ParseBoolean, like the others.
     "engine.nvidia_shader_mt",
+    "engine.etc2_to_bc",
     "window.high_dpi",
     "network.use_system_proxy",
     "integrations.fleasion.enabled",

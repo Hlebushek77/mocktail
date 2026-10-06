@@ -8,7 +8,9 @@
 #include <iterator>
 #include <map>
 #include <nlohmann/json.hpp>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <utility>
 
@@ -20,14 +22,17 @@
 #include "launcher_ui/recommendations.h"
 #include "launcher_ui/roblox_decides.h"
 #include "launcher_ui/roblox_overrides.h"
+#include "runtime/environment.h"
 #include "runtime/launcher_ui_launch.h"
 #include "runtime/runtime_config_bootstrap.h"
+#include "runtime/runtime_config_file.h"
 #include "window/video_driver_policy.h"
 
 namespace mocktail::launcher_ui {
 namespace {
 
 constexpr char kBindingPageName[] = "selftest-bindings";
+constexpr char kTextureCompressionKey[] = "engine.etc2_to_bc";
 constexpr guint kSettleMilliseconds = 450;
 constexpr guint kResizeMilliseconds = 1800;
 constexpr int kMachineWaitLimit = 150;  // x 100 ms
@@ -65,6 +70,51 @@ constexpr const char* kIcons[] = {
     "view-more-symbolic",
     "input-gaming-symbolic",
 };
+
+// What the game would read from the saved config.yaml alone, as
+// ConfigDocument::Validate checks it.
+class EmptyEnvironment final : public runtime::Environment {
+ public:
+  std::optional<std::string> Get(std::string_view) const override {
+    return std::nullopt;
+  }
+};
+
+// Why the compressed textures row is locked without direct Vulkan
+// (graphics_page.cc BuildTextureCompressionRow).
+std::string NotVulkanReason() {
+  return _("Only the Vulkan backend reads this setting");
+}
+
+GtkWidget* RowForKey(LauncherContext* context, std::string_view key) {
+  for (const RowRecord& record : context->rows()) {
+    if (record.row != nullptr && record.key == key) return record.row;
+  }
+  return nullptr;
+}
+
+GtkWidget* FindSwitch(GtkWidget* widget) {
+  for (GtkWidget* child = gtk_widget_get_first_child(widget); child != nullptr;
+       child = gtk_widget_get_next_sibling(child)) {
+    if (GTK_IS_SWITCH(child)) return child;
+    if (GtkWidget* found = FindSwitch(child)) return found;
+  }
+  return nullptr;
+}
+
+// Whether a bound switch row is locked (bindings.cc): then its switch is
+// insensitive and `reason` is its subtitle's last line, otherwise neither.
+// nullopt when the row has no switch or the two disagree.
+std::optional<bool> SwitchRowLocked(GtkWidget* row, const std::string& reason) {
+  GtkWidget* control = row != nullptr ? FindSwitch(row) : nullptr;
+  if (control == nullptr) return std::nullopt;
+  const char* subtitle = adw_action_row_get_subtitle(ADW_ACTION_ROW(row));
+  const bool says_why = subtitle != nullptr &&
+                        std::string(subtitle).find(reason) != std::string::npos;
+  const bool insensitive = !gtk_widget_is_sensitive(control);
+  if (says_why != insensitive) return std::nullopt;
+  return insensitive;
+}
 
 std::string Quote(const std::string& text) {
   return nlohmann::json(text).dump(-1, ' ', false,
@@ -212,7 +262,8 @@ void Selftest::Start() {
   // The worked example, plus any rows named in
   // MOCKTAIL_LAUNCHER_SELFTEST_HINTS (comma-separated keys or titles), a
   // developer aid for checking hint text by eye.
-  std::vector<std::string> hints = {"graphics.backend"};
+  std::vector<std::string> hints = {"graphics.backend",
+                                    kTextureCompressionKey};
   if (const char* extra = std::getenv("MOCKTAIL_LAUNCHER_SELFTEST_HINTS")) {
     std::string list = extra;
     std::size_t start = 0;
@@ -240,6 +291,10 @@ void Selftest::Start() {
   steps_.push_back([this] { return RenderEnvironmentDialog(); });
   steps_.push_back([this] { return MoveThenDropMovedValues(); });
   steps_.push_back([this] { return MoveEnvironment(); });
+  steps_.push_back([this] { return LockTextureCompression(); });
+  steps_.push_back(
+      [this] { return RenderSection(Section::kGraphics, "opengl"); });
+  steps_.push_back([this] { return CheckTextureCompressionLock(); });
   // What Mocktail decides and what Roblox decides: every kind of override
   // at once, with a level above 3 under the performance preset, shown on
   // the Advanced page's overview and as badges on the Graphics page.
@@ -714,6 +769,19 @@ guint Selftest::ChangeRows() {
     expect("appearance.theme", "dark");
   }
 
+  // Compressed textures (BC): a switch row in the Renderer group, usable
+  // while the game uses direct Vulkan (MOCKTAIL_GRAPHICS_BACKEND here).
+  GtkWidget* textures = RowForKey(context_, kTextureCompressionKey);
+  if (textures == nullptr || !ADW_IS_SWITCH_ROW(textures)) {
+    Error("the compressed textures row is missing");
+  } else if (SwitchRowLocked(textures, NotVulkanReason()) != false) {
+    Error("the compressed textures row is locked with direct Vulkan");
+  } else {
+    const bool on = adw_switch_row_get_active(ADW_SWITCH_ROW(textures));
+    adw_switch_row_set_active(ADW_SWITCH_ROW(textures), !on);
+    expect(kTextureCompressionKey, on ? "false" : "true");
+  }
+
   GtkWidget* backend = nullptr;
   for (const RowRecord& record : context_->rows()) {
     if (record.key == "graphics.backend") backend = record.row;
@@ -732,8 +800,8 @@ guint Selftest::ChangeRows() {
   context_->SetValue("window.width", "1366");
   context_->SetValue("window.height", "768");
   Note("unsaved_before_save", std::to_string(context_->unsaved_count()));
-  if (context_->unsaved_count() < 7) {
-    Error("expected at least 7 unsaved changes, have " +
+  if (context_->unsaved_count() < 8) {
+    Error("expected at least 8 unsaved changes, have " +
           std::to_string(context_->unsaved_count()));
   }
   return 100;
@@ -815,8 +883,23 @@ guint Selftest::SaveStep() {
   expect("appearance.theme", "dark");
   expect("graphics.backend", "opengl");
   expect("window.width", "1366");
+  expect(kTextureCompressionKey, "true");
   if (saved.bytes().rfind("# Mocktail configuration.", 0) != 0) {
     Error("the template's comments did not survive Save");
+  }
+  // The game's own loader reads the switch back from the template's
+  // engine: section, where Save edited it in place.
+  const runtime::RuntimeConfigLoadResult loaded =
+      runtime::LoadRuntimeConfig(EmptyEnvironment(), context_->config_file());
+  const bool etc2_to_bc = loaded && loaded.config.engine().etc2_to_bc;
+  Note("saved_etc2_to_bc", etc2_to_bc ? "true" : "false");
+  if (!loaded) {
+    Error("the runtime cannot load the saved config.yaml: " + loaded.error);
+  } else if (!etc2_to_bc) {
+    Error("the runtime reads engine.etc2_to_bc as false after Save");
+  }
+  if (saved.bytes().find("\n  etc2_to_bc: true\n") == std::string::npos) {
+    Error("engine.etc2_to_bc was not written in place of the template's line");
   }
   launcher::RememberedWindowState state;
   if (!launcher::ReadRememberedWindowState(context_->window_state_file(),
@@ -978,6 +1061,42 @@ guint Selftest::MoveEnvironment() {
   }
   Note("environment_moved",
        context_->ignoring_environment() ? "true" : "false");
+  return kSettleMilliseconds;
+}
+
+// After MoveEnvironment no variable overrides graphics.backend, so the
+// window follows the draft's backend.
+guint Selftest::LockTextureCompression() {
+  GtkWidget* row = RowForKey(context_, kTextureCompressionKey);
+  if (row == nullptr) {
+    Error("the compressed textures row is missing");
+    return 50;
+  }
+  if (!context_->SetValue("graphics.backend", "opengl")) {
+    Error("cannot set graphics.backend to opengl");
+  }
+  window_->Reveal(row);
+  return kSettleMilliseconds * 2;
+}
+
+guint Selftest::CheckTextureCompressionLock() {
+  GtkWidget* row = RowForKey(context_, kTextureCompressionKey);
+  bool locked = true;
+  for (const char* backend : {"opengl", "angle-vulkan"}) {
+    context_->SetValue("graphics.backend", backend);
+    if (SwitchRowLocked(row, NotVulkanReason()) != true) {
+      locked = false;
+      Error(std::string("the compressed textures row is not locked, with "
+                        "its reason, for graphics.backend ") +
+            backend);
+    }
+  }
+  context_->SetValue("graphics.backend", "direct-vulkan");
+  if (SwitchRowLocked(row, NotVulkanReason()) != false) {
+    locked = false;
+    Error("the compressed textures row stayed locked with direct Vulkan");
+  }
+  Note("etc2_to_bc_locked_without_vulkan", locked ? "true" : "false");
   return kSettleMilliseconds;
 }
 

@@ -764,6 +764,133 @@ GtkWidget* BuildShaderLoadingRow(LauncherContext* context) {
   return BindSwitchRow(context, std::move(spec));
 }
 
+constexpr char kEtc2ToBcKey[] = "engine.etc2_to_bc";
+
+Etc2ConversionState Etc2Conversion(const LauncherContext& context) {
+  return ResolveEtc2Conversion(
+      context.machine(), context.GameValue("graphics.backend", "direct-vulkan"),
+      context.GameValue(kGpuKey, "auto"));
+}
+
+// engine.etc2_to_bc (vulkan_etc2_emulation.cc: Etc2EmulationOptions reads
+// MOCKTAIL_ETC2_TO_BC, LookupEmulatedEtc2Format maps ETC2/EAC to BC1, BC3,
+// BC4 and BC5 in BC mode).
+//
+// The 4–8× factor: LookupEmulatedEtc2Format unpacks ETC2 RGB8 and RGB8A1
+// (half a byte per texel) to RGBA8 (4 bytes), ETC2 RGBA8 (1 byte) to RGBA8,
+// and EAC R11 and RG11 to R16 and R16G16; each BC format has the block
+// size of the ETC2/EAC format it replaces.
+GtkWidget* BuildTextureCompressionRow(LauncherContext* context) {
+  RowSpec spec;
+  spec.key = kEtc2ToBcKey;
+  spec.title = _("Compressed textures (BC)");
+  // runtime_config.cc: MOCKTAIL_ETC2_TO_BC defaults to off.
+  spec.fallback = "false";
+  spec.keywords = {"bc",         "dxt",          "etc2",       "texture",
+                   "textures",   "compression",  "compressed", "video memory",
+                   "vram",       "memory",       "текстуры",   "сжатие",
+                   "сжатые",     "видеопамять",  "память"};
+  spec.hint.subtitle_for = [](LauncherContext& ctx, const std::string& value) {
+    // runtime_config_file.cc ParseBoolean: config.yaml holds true or false.
+    const bool on = value == "true";
+    switch (Etc2Conversion(ctx)) {
+      case Etc2ConversionState::kNvidia:
+        return on ? std::string(_("Converted to BC and kept compressed: 4–8× "
+                                  "less video memory for ETC2 textures"))
+                  : std::string(_("ETC2 textures are unpacked to full size, "
+                                  "which takes 4–8× more video memory"));
+      case Etc2ConversionState::kOtherCard:
+      case Etc2ConversionState::kUnknown:
+        return on ? std::string(_("On a card without ETC2, ETC2 textures are "
+                                  "converted to BC and kept compressed"))
+                  : std::string(_("On a card without ETC2, ETC2 textures are "
+                                  "unpacked to full size"));
+      case Etc2ConversionState::kNotVulkan:
+        break;
+    }
+    // The reason it does not apply is the row's last line.
+    return std::string();
+  };
+  spec.hint.details =
+      // The session logs' "[vulkan] ETC2 decode totals": 366 to 2552 MiB of
+      // ETC2/EAC uploads per session on an RTX 3060.
+      _("Roblox sends most textures in the ETC2 format. NVIDIA graphics "
+        "cards, and some others, cannot read ETC2, so Mocktail converts these "
+        "textures for the card. By default it unpacks them to full size, "
+        "which takes 4 to 8 times the video memory of the compressed "
+        "texture.") +
+      std::string("\n\n") +
+      // FAQ.md "Why is ETC2 kept": the ETC2 / MOCKTAIL_ADVERTISE_ETC2=0 A/B
+      // (Roblox 2.738.1397, RTX 3060 Laptop, driver 615.71.09).
+      _("With this setting on, Mocktail converts them to BC (also called "
+        "DXT) instead, a compressed format these cards read natively, so the "
+        "textures take about as much video memory as Roblox itself counts "
+        "for them. Roblox keeps using ETC2: letting it switch to DXT itself "
+        "(MOCKTAIL_ADVERTISE_ETC2=0) was much slower in a test on an RTX "
+        "3060.") +
+      "\n\n" +
+      // BC1 keeps 2 colours and 2 blends per 4x4 block: about 35 dB PSNR
+      // on the APK's own ETC1 textures. BC mode creates images at scale 1;
+      // otherwise MOCKTAIL_SMALL_TEXTURE_UPSCALE (default 4) enlarges
+      // colour textures of up to kSmallTextureMaxExtent (64) pixels a side.
+      // The loading sentence is provisional until BC mode's loading time is
+      // measured in a real game: converting on the graphics card may cost
+      // nothing, since BC uploads are 4 to 8 times smaller, while
+      // converting on the processor, whenever the graphics card cannot do
+      // it, costs several times the work of unpacking. Keep config.yaml's
+      // template in step (runtime_config_bootstrap.cc).
+      _("The cost: fine detail can lose some quality, so sharp edges in text "
+        "and icons or smooth gradients may look blockier. Small textures (up "
+        "to 64 pixels across) also keep their own size instead of the "
+        "fourfold enlargement Mocktail gives them otherwise. Loading can take "
+        "longer when the conversion has to run on the processor instead of "
+        "the graphics card.") +
+      "\n\n" +
+      // vulkan_etc2_emulation.cc logs "ETC2/EAC emulation enabled" when it
+      // emulates for a device; Etc2EmulationOptions are read once, when the
+      // game creates its Vulkan device.
+      _("Turn it on if video memory runs short: on a card with 4 GB or less, "
+        "at a high resolution, or while other programs use the graphics "
+        "card. The change applies the next time Roblox starts. On a card "
+        "that reads ETC2 itself the setting changes nothing; the session log "
+        "says whether textures are converted (a “[vulkan] ETC2/EAC emulation "
+        "enabled” line).");
+  spec.hint.details_for = [](LauncherContext& ctx) {
+    const Etc2ConversionState state = Etc2Conversion(ctx);
+    const VulkanDriverSelection driver =
+        ctx.machine().VulkanDriver(ctx.GameValue(kGpuKey, "auto"));
+    if (!driver.gpu.has_value()) return std::string();
+    const std::string name = GpuCardName(*driver.gpu);
+    if (state == Etc2ConversionState::kNvidia) {
+      // FAQ.md: NVIDIA's Vulkan driver has no ETC2 textures (vulkaninfo:
+      // textureCompressionETC2 false on driver 615); NVK offers it on
+      // Tegra only.
+      return Format(_("The game renders on the %s card here, which has no "
+                      "ETC2 in Vulkan, so this setting applies."),
+                    name.c_str());
+    }
+    if (state != Etc2ConversionState::kOtherCard) return std::string();
+    return driver.gpu->integrated
+               ? Format(_("The game renders on the integrated %s graphics "
+                          "here. If their Vulkan driver reads ETC2 itself, "
+                          "this setting changes nothing."),
+                        name.c_str())
+               : Format(_("The game renders on the %s card here. If its "
+                          "Vulkan driver reads ETC2 itself, this setting "
+                          "changes nothing."),
+                        name.c_str());
+  };
+  // No recommendation: it trades image quality for video memory, and the
+  // launcher cannot read how much video memory the card has without
+  // loading its driver.
+  spec.unavailable = [](LauncherContext& ctx) {
+    return Etc2Conversion(ctx) == Etc2ConversionState::kNotVulkan
+               ? std::string(_("Only the Vulkan backend reads this setting"))
+               : std::string();
+  };
+  return BindSwitchRow(context, std::move(spec));
+}
+
 constexpr char kQualityKey[] = "engine.graphics_quality";
 constexpr char kFrameRateKey[] = "graphics.frame_rate_limit";
 constexpr char kVsyncKey[] = "graphics.vsync";
@@ -1523,6 +1650,7 @@ GtkWidget* BuildGraphicsPage(LauncherContext* context) {
   GtkWidget* quality_level = BuildQualityLevelRow(context);
   state->set_quality_spin(quality_level);
   AddRow(renderer, quality_level);
+  AddRow(renderer, BuildTextureCompressionRow(context));
   GtkWidget* advanced = adw_expander_row_new();
   adw_preferences_row_set_title(ADW_PREFERENCES_ROW(advanced),
                                 _("More renderer options"));

@@ -379,6 +379,7 @@ TEST(SettingKindsTest, WritesEachKeyAsTheLoaderReadsIt) {
   EXPECT_EQ(ScalarKindFor("engine.gpu", "integrated"), ScalarKind::kEnum);
   EXPECT_EQ(ScalarKindFor("engine.nvidia_shader_mt", "false"),
             ScalarKind::kBool);
+  EXPECT_EQ(ScalarKindFor("engine.etc2_to_bc", "true"), ScalarKind::kBool);
   EXPECT_TRUE(IsTextKey("integrations.discord_rpc.text.playing"));
   EXPECT_FALSE(IsTextKey("graphics.vsync"));
 }
@@ -448,36 +449,43 @@ TEST(EnvOverridesTest, MovesValuesIntoTheDraft) {
   EXPECT_TRUE(draft.Validate(&error)) << error;
 }
 
-// engine.gpu and engine.nvidia_shader_mt have no row, but their variables
-// still count as overrides and move into an engine: section the draft adds.
+// The engine variables count as overrides of their rows and move into an
+// engine: section the draft adds.
 TEST(EnvOverridesTest, MovesTheEngineVariablesIntoTheDraft) {
   SettingsDraft draft;
   draft.LoadBytes(kUserConfig);
   const MapEnvironment environment({
       {"MOCKTAIL_GPU", "integrated"},
       {"MOCKTAIL_NVIDIA_SHADER_MT", "off"},
+      {"MOCKTAIL_ETC2_TO_BC", "on"},
   });
   const EnvOverrides overrides = EnvOverrides::FromNames(
-      "MOCKTAIL_GPU,MOCKTAIL_NVIDIA_SHADER_MT", environment);
-  EXPECT_EQ(overrides.SettingCount(), 2);
+      "MOCKTAIL_GPU,MOCKTAIL_NVIDIA_SHADER_MT,MOCKTAIL_ETC2_TO_BC",
+      environment);
+  EXPECT_EQ(overrides.SettingCount(), 3);
   const EnvOverride* gpu = overrides.Effective("engine.gpu");
   ASSERT_NE(gpu, nullptr);
   EXPECT_EQ(gpu->imported, "integrated");
   const EnvOverride* shader = overrides.Effective("engine.nvidia_shader_mt");
   ASSERT_NE(shader, nullptr);
   EXPECT_EQ(shader->imported, "false");
+  const EnvOverride* textures = overrides.Effective("engine.etc2_to_bc");
+  ASSERT_NE(textures, nullptr);
+  EXPECT_EQ(textures->imported, "true");
 
   const EnvImportReport report = ImportEnvOverrides(overrides, &draft);
   EXPECT_TRUE(report.errors.empty())
       << (report.errors.empty() ? "" : report.errors.front());
-  EXPECT_EQ(report.imported.size(), 2U);
+  EXPECT_EQ(report.imported.size(), 3U);
   EXPECT_EQ(draft.Get("engine.gpu"), "integrated");
   EXPECT_EQ(draft.Get("engine.nvidia_shader_mt"), "false");
+  EXPECT_EQ(draft.Get("engine.etc2_to_bc"), "true");
   // Plain YAML, as the template writes them.
   const std::string& bytes = draft.working_bytes();
   EXPECT_NE(bytes.find("\n  gpu: integrated\n"), std::string::npos) << bytes;
   EXPECT_NE(bytes.find("\n  nvidia_shader_mt: false\n"), std::string::npos)
       << bytes;
+  EXPECT_NE(bytes.find("\n  etc2_to_bc: true\n"), std::string::npos) << bytes;
   std::string error;
   EXPECT_TRUE(draft.Validate(&error)) << error;
 }
@@ -1745,6 +1753,59 @@ TEST_F(MachineProfileTest, ExplainsNvidiaShaderLoading) {
   EXPECT_EQ(
       ResolveShaderLoading(profile, "direct-vulkan", "integrated", "false"),
       ShaderLoadingState::kOtherCard);
+}
+
+TEST_F(MachineProfileTest, ExplainsEtc2Conversion) {
+  // Only direct Vulkan goes through Mocktail's ETC2 emulation, detected or
+  // not; until detection finishes the card is unknown.
+  for (const char* backend :
+       {"opengl", "gles", "system", "auto", "angle-vulkan",
+        "angle-swiftshader"}) {
+    EXPECT_EQ(ResolveEtc2Conversion(MachineProfile{}, backend, "auto"),
+              Etc2ConversionState::kNotVulkan)
+        << backend;
+  }
+  EXPECT_EQ(ResolveEtc2Conversion(MachineProfile{}, "", ""),
+            Etc2ConversionState::kUnknown);
+
+  // AMD only: converts only if its driver lacks ETC2.
+  AddPciGpu(0, "pci0000:00/0000:00:01.1/0000:0a:00.0", "0x1002", "0x73df");
+  root_.Write("usr/share/vulkan/icd.d/radeon_icd.x86_64.json", "{}");
+  MachineProfile profile = DetectMachineProfile(MapEnvironment(), Probe());
+  EXPECT_EQ(ResolveEtc2Conversion(profile, "", ""),
+            Etc2ConversionState::kOtherCard);
+  EXPECT_EQ(ResolveEtc2Conversion(profile, "opengl", ""),
+            Etc2ConversionState::kNotVulkan);
+
+  // An Intel + NVIDIA laptop: the card engine.gpu picks decides.
+  std::filesystem::remove_all(root_.path() / "sys");
+  AddPciGpu(0, "pci0000:00/0000:00:02.0", "0x8086", "0x9a49");
+  AddPciGpu(1, "pci0000:00/0000:00:01.0/0000:01:00.0", "0x10de", "0x2520");
+  root_.Write("usr/share/vulkan/icd.d/intel_icd.x86_64.json", "{}");
+  root_.Write("usr/share/vulkan/icd.d/nvidia_icd.json", "{}");
+  profile = DetectMachineProfile(MapEnvironment(), Probe());
+  EXPECT_EQ(ResolveEtc2Conversion(profile, "", ""),
+            Etc2ConversionState::kNvidia);
+  EXPECT_EQ(ResolveEtc2Conversion(profile, "vulkan", "discrete"),
+            Etc2ConversionState::kNvidia);
+  EXPECT_EQ(ResolveEtc2Conversion(profile, "direct-vulkan", "integrated"),
+            Etc2ConversionState::kOtherCard);
+  EXPECT_EQ(ResolveEtc2Conversion(profile, "angle-vulkan", "discrete"),
+            Etc2ConversionState::kNotVulkan);
+  // The user's own driver list: Mocktail does not pick, and both kinds are
+  // here.
+  profile = DetectMachineProfile(
+      MapEnvironment({{"VK_DRIVER_FILES", "/opt/vk/my_icd.json"}}), Probe());
+  EXPECT_EQ(ResolveEtc2Conversion(profile, "", ""),
+            Etc2ConversionState::kUnknown);
+
+  // NVIDIA alone keeps its answer behind the user's driver list.
+  std::filesystem::remove_all(root_.path() / "sys");
+  AddPciGpu(1, "pci0000:00/0000:00:01.0/0000:01:00.0", "0x10de", "0x2520");
+  profile = DetectMachineProfile(
+      MapEnvironment({{"VK_DRIVER_FILES", "/opt/vk/my_icd.json"}}), Probe());
+  EXPECT_EQ(ResolveEtc2Conversion(profile, "", ""),
+            Etc2ConversionState::kNvidia);
 }
 
 }  // namespace
