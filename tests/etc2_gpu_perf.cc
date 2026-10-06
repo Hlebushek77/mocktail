@@ -3,8 +3,13 @@
 // timings. It refuses to run while a live Mocktail or Sober session runs
 // (CR-25).
 //
-//   etc2_gpu_perf [--reps N] [--no-verify] [--no-cpu] [--arena-mb N]
+//   etc2_gpu_perf [--reps N] [--no-verify] [--no-cpu] [--arena-mb N] [--bc]
 //                 [--workload NAME]...
+//
+// --bc runs everything in ETC2->BC mode (MOCKTAIL_ETC2_TO_BC=1): the GPU
+// route's pass transcodes with the etc2_bc pipeline ("decode" below is that
+// transcode), the CPU route encodes on the CPU, and the images are BC1/BC3
+// host images compared with the CPU BC encoder.
 //
 // Workloads (all by default) are the bursts of plus2-design/pipeline_bench.cc
 // without the x4 upscale, which keeps upscaled images on the CPU route:
@@ -41,6 +46,7 @@
 #include <string>
 #include <vector>
 
+#include "mocktail/graphics/bc_encoder.h"
 #include "mocktail/graphics/etc2_decoder.h"
 #include "mocktail/graphics/vulkan_etc2_emulation.h"
 #include "mocktail/graphics/vulkan_etc2_gpu.h"
@@ -166,6 +172,18 @@ class Bench {
     info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     info.queueCreateInfoCount = 1;
     info.pQueueCreateInfos = &queue;
+    if (options.to_bc) {
+      // The adapter's vkCreateDevice decides ETC2->BC mode first.
+      const PFN_vkGetInstanceProcAddr instance_proc =
+          device->get_instance_proc_addr();
+      bc_ = emulation_.PhysicalDeviceUsesBc(
+          device->physical_device(),
+          reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures>(
+              instance_proc(device->instance(), "vkGetPhysicalDeviceFeatures")),
+          reinterpret_cast<PFN_vkGetPhysicalDeviceFormatProperties>(
+              instance_proc(device->instance(),
+                            "vkGetPhysicalDeviceFormatProperties")));
+    }
     emulation_.RegisterDevice(
         device->device(), device->physical_device(), true, device->memory(),
         device->properties(), device->queue_families(), info,
@@ -212,6 +230,7 @@ class Bench {
   const HeadlessVulkanDevice::Dispatch& vk() const { return device_->vk(); }
   Etc2GpuDevice* gpu() const { return Etc2GpuDevice::Find(device_->device()); }
   VulkanEtc2Emulation& emulation() { return emulation_; }
+  bool bc() const { return bc_; }
 
   // The pipelines and the selftest, through empty submits.
   bool WarmUp() {
@@ -255,7 +274,7 @@ class Bench {
       texture.shape = HostShapeFor(
           ScenarioImage{texture.format, texture.width, texture.height,
                         texture.mips, 1},
-          emulation_.options().upscale, true);
+          emulation_.options().upscale, true, bc_);
       if (!backend_.PrepareImage(texture.image, texture.shape)) {
         return false;
       }
@@ -505,14 +524,20 @@ class Bench {
         VkDeviceSize compressed = 0;
         VkDeviceSize decoded = 0;
         Etc2UploadByteCounts(texture.etc, extent, 1, &compressed, &decoded);
-        std::vector<std::uint8_t> expected(decoded);
-        DecodeEtcImage(texture.etc, bytes_.data() + offset, compressed,
-                       extent.width, extent.height, expected.data(),
-                       expected.size());
+        std::vector<std::uint8_t> expected(bc_ ? compressed : decoded);
+        if (bc_) {
+          TranscodeEtcToBc(texture.etc, bytes_.data() + offset, compressed,
+                           expected.data(), expected.size(), kEtc2ToBcRefine);
+        } else {
+          DecodeEtcImage(texture.etc, bytes_.data() + offset, compressed,
+                         extent.width, extent.height, expected.data(),
+                         expected.size());
+        }
         if (texels[mip] != expected) {
           *failure = std::to_string(texture.width) + "x" +
                      std::to_string(texture.height) + " mip " +
-                     std::to_string(mip) + " differs from the CPU decoder";
+                     std::to_string(mip) + " differs from the CPU " +
+                     (bc_ ? "BC encoder" : "decoder");
           return false;
         }
         offset += compressed;
@@ -536,10 +561,13 @@ class Bench {
   VkQueryPool queries_ = VK_NULL_HANDLE;
   VkBuffer arena_like_ = VK_NULL_HANDLE;
   VkDeviceMemory arena_like_memory_ = VK_NULL_HANDLE;
+  bool bc_ = false;
 };
 
 // --arena-mb: MOCKTAIL_ETC2_GPU_ARENA_MB, the output arenas' device-local cap.
 std::uint64_t g_arena_bytes = 0;
+// --bc: MOCKTAIL_ETC2_TO_BC=1.
+bool g_bc = false;
 
 // MOCKTAIL_FRAME_STATS gives the route's timestamps, and costs some CPU in
 // the hooks: the record times are measured without it too.
@@ -549,6 +577,7 @@ Etc2EmulationOptions Options(bool gpu, bool frame_stats = true) {
   options.gpu_arena_bytes = g_arena_bytes;
   options.upscale = 1;
   options.frame_stats = frame_stats;
+  options.to_bc = g_bc;
   return options;
 }
 
@@ -641,7 +670,8 @@ int RunGpu(HeadlessVulkanDevice* device, const Workload& workload,
       std::printf("    MISMATCH: %s\n", failure.c_str());
       return 1;
     }
-    std::printf("    every mip of every image matches the CPU decoder\n");
+    std::printf("    every mip of every image matches the CPU %s\n",
+                bench.bc() ? "BC encoder" : "decoder");
   }
   return 0;
 }
@@ -706,12 +736,14 @@ int Main(int argc, char** argv) {
       cpu = false;
     } else if (argument == "--arena-mb" && index + 1 < argc) {
       g_arena_bytes = std::strtoull(argv[++index], nullptr, 10) << 20;
+    } else if (argument == "--bc") {
+      g_bc = true;
     } else if (argument == "--workload" && index + 1 < argc) {
       kinds.push_back(argv[++index]);
     } else {
       std::fprintf(stderr,
                    "usage: etc2_gpu_perf [--reps N] [--no-verify] [--no-cpu] "
-                   "[--arena-mb N] [--workload small|big|mixed]...\n");
+                   "[--arena-mb N] [--bc] [--workload small|big|mixed]...\n");
       return 2;
     }
   }
@@ -727,9 +759,15 @@ int Main(int argc, char** argv) {
   }
   std::printf("GPU: %s\n", device->Describe().c_str());
 
-  std::printf("pipeline build (shader module, layouts, pipeline):\n");
+  std::printf("pipeline build (shader module%s, layouts, pipeline%s):\n",
+              g_bc ? "s" : "", g_bc ? "s: decode and etc2_bc" : "");
   for (int round = 0; round < 2; ++round) {
     Bench bench(device.get(), Options(true));
+    if (g_bc && !bench.bc()) {
+      std::fprintf(stderr, "etc2_gpu_perf: the device cannot enter ETC2->BC "
+                           "mode\n");
+      return 1;
+    }
     if (!bench.WarmUp()) {
       std::printf("  device %d: the GPU route did not get ready (%s)\n",
                   round + 1,
