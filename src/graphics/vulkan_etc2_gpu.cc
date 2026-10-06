@@ -694,10 +694,12 @@ struct Etc2GpuDevice::Impl {
       Fail("building the decode pipeline returned " + std::to_string(result));
       return;
     }
+    const std::uint64_t built_ns = Nanoseconds(Clock::now() - start);
     {
       std::lock_guard<std::mutex> lock(state_mutex);
-      build_ns = Nanoseconds(Clock::now() - start);
+      build_ns = built_ns;
     }
+    CountStats([built_ns](Stats& counts) { counts.build_ns = built_ns; });
     SetState(State::kBuilt);
   }
 
@@ -922,6 +924,10 @@ struct Etc2GpuDevice::Impl {
     if (slot.uploads == 0) {
       return;
     }
+    CountStats([copy_ns, decode_ns](Stats& counts) {
+      counts.gpu_copy_ns += copy_ns;
+      counts.gpu_decode_ns += decode_ns;
+    });
     const std::uint64_t gpu_ns = copy_ns + decode_ns;
     if (gpu_ns != 0) {
       Count([gpu_ns](Etc2DecodeTotals& totals) {

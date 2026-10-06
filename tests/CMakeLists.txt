@@ -797,6 +797,12 @@ target_link_libraries(vulkan_etc2_gpu_route_test PRIVATE
 )
 mocktail_apply_compile_options(vulkan_etc2_gpu_route_test)
 
+# The GPU route's manual benchmark (not a test: it needs a GPU and an idle
+# machine, and prints timings).
+add_executable(etc2_gpu_perf etc2_gpu_perf.cc)
+target_link_libraries(etc2_gpu_perf PRIVATE mocktail_etc2_test_support)
+mocktail_apply_compile_options(etc2_gpu_perf)
+
 add_executable(etc2_emulation_gpu_test etc2_emulation_gpu_test.cc)
 target_link_libraries(etc2_emulation_gpu_test PRIVATE
   mocktail_etc2_test_support

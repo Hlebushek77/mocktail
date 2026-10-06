@@ -159,6 +159,11 @@ class Etc2GpuDevice {
     std::uint64_t fences_destroyed = 0;
     std::uint64_t teardown_waits = 0;  // fences Destroy waited for
     std::uint32_t live_slots = 0;
+    // GPU time of the passes, from their timestamps (MOCKTAIL_FRAME_STATS
+    // only), added up when their slots come back.
+    std::uint64_t gpu_copy_ns = 0;
+    std::uint64_t gpu_decode_ns = 0;
+    std::uint64_t build_ns = 0;  // the pipeline build, once built
     VkDeviceSize arena_bytes = 0;
     VkDeviceSize arena_over_cap_bytes = 0;
     VkDeviceSize input_bytes = 0;  // every slot's input buffer
