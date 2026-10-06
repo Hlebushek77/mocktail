@@ -21,7 +21,9 @@
 // burst it reports the CPU time of the record hooks (and per 2000 uploads),
 // of PrepareSubmit (the decode pass's recording), of releasing the command
 // buffer, and the GPU time of the copy-in, the decode (the route's own
-// timestamps, MOCKTAIL_FRAME_STATS) and Roblox's copies. The first burst
+// timestamps, MOCKTAIL_FRAME_STATS) and Roblox's copies. The driver's own
+// vkCmdCopyBufferToImage is part of the record time; the same host copies
+// recorded without the emulation show how much of it is the driver's. The first burst
 // creates the arena chunks and the slot; the rest reuse them. With the CPU
 // route (MOCKTAIL_ETC2_GPU=0, plus.1's code until WP1 lands) the same burst
 // is timed once more for comparison. Every image is read back once and
@@ -200,6 +202,10 @@ class Bench {
       emulation_.FreeMemory(device_->device(), memory_, nullptr);
     }
     vk().vkDestroyQueryPool(device_->device(), queries_, nullptr);
+    if (arena_like_ != VK_NULL_HANDLE) {
+      vk().vkDestroyBuffer(device_->device(), arena_like_, nullptr);
+      vk().vkFreeMemory(device_->device(), arena_like_memory_, nullptr);
+    }
     emulation_.DestroyDevice(device_->device());
   }
 
@@ -379,6 +385,88 @@ class Bench {
     return burst;
   }
 
+  // The driver's share of the record time: the copies the emulation hands
+  // the host for this burst (padded rows into the host images), recorded
+  // straight into the command buffer, timed the same way, never submitted.
+  double RecordDriverOnly(bool per_mip) {
+    if (arena_like_ == VK_NULL_HANDLE) {
+      // Device-local, like the output arena the rewritten copies read.
+      VkBufferCreateInfo info{};
+      info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+      info.size = 32ULL << 20;
+      info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                   VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                   VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+      info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+      VkMemoryRequirements requirements{};
+      VkMemoryAllocateInfo allocate{};
+      allocate.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+      if (vk().vkCreateBuffer(device_->device(), &info, nullptr,
+                              &arena_like_) != VK_SUCCESS) {
+        return 0;
+      }
+      vk().vkGetBufferMemoryRequirements(device_->device(), arena_like_,
+                                         &requirements);
+      allocate.allocationSize = requirements.size;
+      allocate.memoryTypeIndex =
+          device_->FindMemoryType(requirements.memoryTypeBits,
+                                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0,
+                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+      if (vk().vkAllocateMemory(device_->device(), &allocate, nullptr,
+                                &arena_like_memory_) != VK_SUCCESS ||
+          vk().vkBindBufferMemory(device_->device(), arena_like_,
+                                  arena_like_memory_, 0) != VK_SUCCESS) {
+        return 0;
+      }
+    }
+    const VkCommandBufferUsageFlags flags =
+        VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    backend_.Begin(command_buffer_, false, flags);
+    Clock::duration record{};
+    std::vector<VkBufferImageCopy> regions;
+    for (const Texture& texture : workload_.textures) {
+      regions.clear();
+      VkDeviceSize offset = 0;
+      for (std::uint32_t mip = 0; mip < texture.mips; ++mip) {
+        VkBufferImageCopy region{};
+        region.bufferOffset = offset;
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 0, 1};
+        region.imageExtent = {std::max(1u, texture.width >> mip),
+                              std::max(1u, texture.height >> mip), 1};
+        region.bufferRowLength = (region.imageExtent.width + 3) & ~3u;
+        region.bufferImageHeight = (region.imageExtent.height + 3) & ~3u;
+        regions.push_back(region);
+        // Packed as in the arena, within the buffer (recorded, never run).
+        const VkDeviceSize bytes = static_cast<VkDeviceSize>(
+                                       region.bufferRowLength) *
+                                   region.bufferImageHeight * 4;
+        offset = (offset + bytes + 255) & ~VkDeviceSize{255};
+        if (offset + (4ULL << 20) > (32ULL << 20)) {
+          offset = 0;
+        }
+      }
+      if (per_mip) {
+        for (const VkBufferImageCopy& region : regions) {
+          const Clock::time_point start = Clock::now();
+          vk().vkCmdCopyBufferToImage(command_buffer_, arena_like_,
+                                      texture.image, VK_IMAGE_LAYOUT_GENERAL,
+                                      1, &region);
+          record += Clock::now() - start;
+        }
+      } else {
+        const Clock::time_point start = Clock::now();
+        vk().vkCmdCopyBufferToImage(
+            command_buffer_, arena_like_, texture.image,
+            VK_IMAGE_LAYOUT_GENERAL,
+            static_cast<std::uint32_t>(regions.size()), regions.data());
+        record += Clock::now() - start;
+      }
+    }
+    backend_.End(command_buffer_);
+    backend_.Reset(command_buffer_);
+    return Ms(record);
+  }
+
   // Roblox's submit of its command buffer (or of nothing), the way the
   // adapter makes it. Returns the PrepareSubmit time.
   double Submit(bool with_command_buffer) {
@@ -446,6 +534,8 @@ class Bench {
   VkCommandPool pool_ = VK_NULL_HANDLE;
   VkCommandBuffer command_buffer_ = VK_NULL_HANDLE;
   VkQueryPool queries_ = VK_NULL_HANDLE;
+  VkBuffer arena_like_ = VK_NULL_HANDLE;
+  VkDeviceMemory arena_like_memory_ = VK_NULL_HANDLE;
 };
 
 // --arena-mb: MOCKTAIL_ETC2_GPU_ARENA_MB, the output arenas' device-local cap.
@@ -575,6 +665,17 @@ int RunGpuQuiet(HeadlessVulkanDevice* device, const Workload& workload,
               burst.record_ms,
               burst.record_ms * 2000.0 / static_cast<double>(workload.uploads),
               burst.prepare_ms, burst.release_ms);
+  std::vector<double> driver;
+  for (int rep = 0; rep < std::max(reps, 3); ++rep) {
+    driver.push_back(bench.RecordDriverOnly(per_mip));
+  }
+  std::sort(driver.begin(), driver.end());
+  const double host = driver[driver.size() / 2];
+  const double per_2000 = 2000.0 / static_cast<double>(workload.uploads);
+  std::printf("    driver record %7.2f ms (%5.2f per 2000 uploads): the host "
+              "copies alone; Mocktail's hooks add %.2f ms (%.2f per 2000)\n",
+              host, host * per_2000, burst.record_ms - host,
+              (burst.record_ms - host) * per_2000);
   return 0;
 }
 
