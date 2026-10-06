@@ -3,6 +3,7 @@
 #include <pthread.h>
 #include <sys/stat.h>
 
+#include "mocktail/graphics/bc_encoder.h"
 #include "mocktail/graphics/chunk_arena.h"
 #include "mocktail/graphics/etc2_decode_totals.h"
 #include "mocktail/graphics/mapped_memory_copy.h"
@@ -427,10 +428,10 @@ struct Mapping {
   VkDeviceSize size = VK_WHOLE_SIZE;
 };
 
+// `bc` (in the shape): the host image holds BC blocks (ETC2->BC mode).
 struct ImageRecord : Etc2ImageShape {
   VkDevice device = VK_NULL_HANDLE;
   VkFormat app_format = VK_FORMAT_UNDEFINED;
-  bool bc = false;  // the host image holds BC blocks (ETC2->BC mode)
   std::uint32_t copies = 0;  // record calls, with MOCKTAIL_FRAME_STATS=1
   std::shared_ptr<const RgbaImage> override;
   std::shared_ptr<const RgbaImage> base;
@@ -534,8 +535,15 @@ constexpr std::size_t kParallelCopyMinimumBytes = 64U << 10;
 constexpr std::size_t kParallelEmitMinimumBytes = 256U << 10;
 std::atomic<unsigned> g_bc_fallback_logs{0};
 
-// See SetEtc2BcUploadsReadyForTesting: no route writes BC blocks yet.
-std::atomic<bool> g_bc_uploads_ready{false};
+// ETC2->BC mode on the CPU route (DESIGN C4.4): every block gets the
+// endpoint refinement, as in the GPU route's etc2_bc pipeline, so a BC
+// image's bytes do not depend on which route served an upload. (CR-13
+// leaves it to the user whether this route may skip it: a quarter of the
+// transcode time for RGB8->BC1, a fifth for RGBA8->BC3, at the price of
+// route-dependent bytes.) Transcoding comes in pieces of at most 1024
+// blocks, about 0.2 ms on one core, batched into tasks of at least as many.
+constexpr bool kBcRefine = true;
+constexpr std::size_t kBcPieceBlocks = 1024;
 
 void LogFailure(const char* message) {
   if (ShouldLog(&g_failure_logs, 8)) {
@@ -1013,6 +1021,10 @@ struct VulkanEtc2Emulation::State {
                   const std::uint8_t* decoded) {
     const std::shared_ptr<const RgbaImage> replacement =
         FindOverride(upload, compressed, decoded);
+    if (upload.bc) {
+      EmitBc(upload, compressed, replacement.get());
+      return;
+    }
     if (replacement != nullptr) {
       ResampleRgba(*replacement, upload.target_width, upload.target_height,
                    upload.target);
@@ -1020,6 +1032,36 @@ struct VulkanEtc2Emulation::State {
       EmitScaled(upload, decoded);
     } else {
       std::memcpy(upload.target, decoded, upload.decoded);
+    }
+  }
+
+  // An upload into a BC image. Roblox's blocks transcode as the GPU route
+  // does it: whole decoded blocks, padding texels of edge blocks included.
+  // An override is resampled to the region (never upscaled in BC mode) and
+  // encoded, its edge texels repeated; for RGB8A1, texels with alpha below
+  // 128 become transparent black and the rest opaque, where RGBA8 hosts
+  // keep the override's alpha (CR-24).
+  void EmitBc(const PendingUpload& upload, const std::uint8_t* compressed,
+              const RgbaImage* replacement) {
+    bool encoded = false;
+    if (replacement != nullptr) {
+      std::vector<std::uint8_t> texels(
+          static_cast<std::size_t>(upload.target_width) *
+          upload.target_height * 4);
+      ResampleRgba(*replacement, upload.target_width, upload.target_height,
+                   texels.data());
+      encoded = TranscodeDecodedToBc(
+          upload.format, texels.data(), upload.target_width,
+          upload.target_height, 1, upload.target,
+          static_cast<std::size_t>(upload.target_bytes), kBcRefine);
+    } else {
+      encoded = TranscodeEtcToBc(
+          upload.format, compressed, static_cast<std::size_t>(upload.compressed),
+          upload.target, static_cast<std::size_t>(upload.target_bytes),
+          kBcRefine);
+    }
+    if (!encoded) {
+      LogFailure("could not encode an upload as BC");
     }
   }
 
@@ -1861,10 +1903,6 @@ bool VulkanEtc2Emulation::PhysicalDeviceNeedsEmulation(
   return needed;
 }
 
-void SetEtc2BcUploadsReadyForTesting(bool ready) {
-  g_bc_uploads_ready.store(ready, std::memory_order_relaxed);
-}
-
 bool VulkanEtc2Emulation::PhysicalDeviceUsesBc(
     VkPhysicalDevice physical_device,
     PFN_vkGetPhysicalDeviceFeatures get_features,
@@ -1889,9 +1927,6 @@ bool VulkanEtc2Emulation::PhysicalDeviceUsesBc(
   } else if (!PhysicalDeviceNeedsEmulation(physical_device, get_features)) {
     std::snprintf(reason, sizeof(reason),
                   "not needed, the graphics card reads ETC2 itself");
-  } else if (!g_bc_uploads_ready.load(std::memory_order_relaxed)) {
-    std::snprintf(reason, sizeof(reason),
-                  "no upload route of this build writes BC blocks yet");
   } else {
     VkPhysicalDeviceFeatures features{};
     get_features(physical_device, &features);
@@ -3140,6 +3175,8 @@ std::uint32_t VulkanEtc2Emulation::State::RunCpuUploadsLegacy(
 // worker pool; unscaled uploads decode straight into their staging, which
 // rewritten regions lay out exactly as the decoder writes; upscaled ones
 // resample per image in parallel. Its output is the same, byte for byte.
+// Uploads into BC images (C4.4) transcode straight into their staging, in
+// pieces on the pool, unless an override may replace them.
 std::uint32_t VulkanEtc2Emulation::State::RunCpuUploadsFast(
     std::vector<CpuWork>* work, const SourceTypes& types) {
   constexpr VkDeviceSize kIntoStaging = ~VkDeviceSize{0};
@@ -3178,7 +3215,8 @@ std::uint32_t VulkanEtc2Emulation::State::RunCpuUploadsFast(
     item.compressed_offset = compressed_total;
     compressed_total += upload.compressed;
     // Upscaled uploads resample, and override candidates may be replaced
-    // or dumped, from decoded texels; everything else is final as decoded.
+    // or dumped, from decoded texels; everything else is final as decoded
+    // (or, for a BC image, as transcoded).
     if (upload.scale > 1 || MayOverride(upload)) {
       item.decoded_offset = decoded_total;
       decoded_total += upload.decoded;
@@ -3293,15 +3331,44 @@ std::uint32_t VulkanEtc2Emulation::State::RunCpuUploadsFast(
                  item.upload->layers);
   }
 
-  // Decode, in bands on the pool.
+  // Decode, in bands on the pool; transcode to BC, in pieces on the pool.
   const auto jobs_start = Clock::now();
   std::vector<EtcDecodeJob> jobs;
   jobs.reserve(items.size());
+  struct BcPiece {
+    EtcFormat format;
+    const std::uint8_t* source;
+    std::uint8_t* target;
+    std::size_t bytes;
+  };
+  std::vector<BcPiece> bc_pieces;
+  std::vector<std::size_t> bc_task_ends;
+  std::size_t bc_task_blocks = 0;
   for (const Item& item : items) {
     const PendingUpload& upload = *item.upload;
     const bool into_staging = item.decoded_offset == kIntoStaging;
     if (into_staging && item.repeat) {
       continue;  // its first pass writes the same texels to the same place
+    }
+    if (into_staging && upload.bc) {
+      // The blocks of every layer lie one after another in both, so the
+      // upload is one run of blocks.
+      const std::size_t block_bytes = EtcBlockBytes(upload.format);
+      const std::size_t bytes = static_cast<std::size_t>(upload.compressed);
+      for (std::size_t offset = 0; offset < bytes;
+           offset += kBcPieceBlocks * block_bytes) {
+        const std::size_t piece =
+            std::min(kBcPieceBlocks * block_bytes, bytes - offset);
+        bc_pieces.push_back({upload.format,
+                             compressed + item.compressed_offset + offset,
+                             upload.target + offset, piece});
+        bc_task_blocks += piece / block_bytes;
+        if (bc_task_blocks >= kBcPieceBlocks) {
+          bc_task_ends.push_back(bc_pieces.size());
+          bc_task_blocks = 0;
+        }
+      }
+      continue;
     }
     const VkDeviceSize compressed_layer = upload.compressed / upload.layers;
     const VkDeviceSize decoded_layer = upload.decoded / upload.layers;
@@ -3320,11 +3387,35 @@ std::uint32_t VulkanEtc2Emulation::State::RunCpuUploadsFast(
     }
   }
   threads = std::max(threads, DecodeEtcJobs(jobs.data(), jobs.size(), workers));
+  if (bc_task_blocks != 0) {
+    bc_task_ends.push_back(bc_pieces.size());
+  }
+  std::atomic<bool> bc_failed{false};
+  const auto bc_task = [&](std::size_t task) {
+    for (std::size_t index = task == 0 ? 0 : bc_task_ends[task - 1];
+         index < bc_task_ends[task]; ++index) {
+      const BcPiece& piece = bc_pieces[index];
+      if (!TranscodeEtcToBc(piece.format, piece.source, piece.bytes,
+                            piece.target, piece.bytes, kBcRefine)) {
+        bc_failed.store(true, std::memory_order_relaxed);
+      }
+    }
+  };
+  if (pool != nullptr && bc_task_ends.size() > 1) {
+    threads = std::max(threads, pool->ParallelFor(bc_task_ends.size(), bc_task));
+  } else {
+    for (std::size_t task = 0; task < bc_task_ends.size(); ++task) {
+      bc_task(task);
+    }
+  }
   const auto jobs_end = Clock::now();
   for (const EtcDecodeJob& job : jobs) {
     if (!job.ok) {
       LogFailure("could not decode an upload layer");
     }
+  }
+  if (bc_failed.load(std::memory_order_relaxed)) {
+    LogFailure("could not encode an upload as BC");
   }
 
   // Emit what did not decode straight into staging.

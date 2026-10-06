@@ -14,9 +14,9 @@
 // cannot take (storage) left RGBA8/R16, and a format list rewritten for the
 // host. Run once more under the Khronos validation layer, which must report
 // nothing (CR-15: a list that still named ETC2 formats would be flagged).
-// No upload is recorded: the CPU route encodes BC blocks only once its
-// encode step lands. Skips without a device, on a device that reads ETC2
-// itself, and while a live game runs (CR-25).
+// Uploads into BC images run in etc2_emulation_gpu_test (every scenario in
+// BC mode). Skips without a device, on a device that reads ETC2 itself, and
+// while a live game runs (CR-25).
 
 namespace mocktail::graphics::testing {
 namespace {
@@ -37,9 +37,7 @@ class Etc2BcGpuTest : public ::testing::Test {
     if (device_ == nullptr) {
       GTEST_SKIP() << skip_reason_;
     }
-    SetEtc2BcUploadsReadyForTesting(true);
   }
-  void TearDown() override { SetEtc2BcUploadsReadyForTesting(false); }
 
   template <typename Function>
   static Function InstanceProc(const char* name) {

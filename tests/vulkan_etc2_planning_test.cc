@@ -287,6 +287,97 @@ TEST(PlanRegionsTest, StartsEveryRegionOnASixteenByteBoundary) {
   EXPECT_EQ(plan.uploads[2].target_bytes, 6U);
 }
 
+// ETC2->BC mode: a BC block per ETC2/EAC block, tightly packed in staging
+// (bufferRowLength 0 counts texels, so a row is ceil(width / 4) blocks),
+// the app's extent and the 16-byte region starts kept.
+TEST(PlanRegionsTest, PlansTightBcBlocksForBcImages) {
+  Etc2ImageShape shape = Shape(VK_FORMAT_EAC_R11_UNORM_BLOCK, 1, 70, 50);
+  shape.bc = true;
+  // 70x50 from 80-texel rows: 18x13 blocks of 8 bytes, 1872 bytes from
+  // 160-byte source rows; 35x25: 9x7 blocks, 504 bytes; 6x2 at the corner:
+  // 2x1 blocks, 16 bytes, at 2376 rounded up to 2384.
+  const Plan plan = PlanAll(shape, {Region(0, 80, 0, 0, 0, 1, 0, 0, 70, 50),
+                                    Region(4096, 0, 0, 1, 0, 1, 0, 0, 35, 25),
+                                    Region(8192, 0, 0, 0, 0, 1, 64, 48, 6, 2)});
+  ASSERT_TRUE(plan.ok);
+  ASSERT_EQ(plan.uploads.size(), 3U);
+  const VkDeviceSize offsets[] = {0, 1872, 2384};
+  const VkDeviceSize bytes[] = {1872, 504, 16};
+  for (std::size_t index = 0; index < 3; ++index) {
+    const Etc2PendingUpload& upload = plan.uploads[index];
+    const VkBufferImageCopy& region = plan.rewritten[index];
+    EXPECT_TRUE(upload.bc);
+    EXPECT_EQ(upload.compressed, bytes[index]);
+    EXPECT_EQ(upload.target_bytes, bytes[index]);
+    EXPECT_EQ(upload.target_offset, offsets[index]);
+    EXPECT_EQ(region.bufferOffset, offsets[index]);
+    EXPECT_EQ(region.bufferRowLength, 0U);
+    EXPECT_EQ(region.bufferImageHeight, 0U);
+  }
+  EXPECT_EQ(plan.uploads[0].source_row_stride, 160U);
+  EXPECT_EQ(plan.rewritten[2].imageOffset.x, 64);
+  EXPECT_EQ(plan.rewritten[2].imageExtent.width, 6U);
+  EXPECT_EQ(plan.rewritten[2].imageExtent.height, 2U);
+  EXPECT_EQ(plan.total, 2400U);
+
+  // Layers lie one after another: 33x20 RGBA8 -> BC3, 9x5 blocks of 16
+  // bytes, three layers from 24-row source layers.
+  Etc2ImageShape layered =
+      Shape(VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK, 1, 33, 20);
+  layered.bc = true;
+  const Plan layers =
+      PlanAll(layered, {Region(0, 0, 24, 0, 0, 3, 0, 0, 33, 20)});
+  ASSERT_TRUE(layers.ok);
+  EXPECT_EQ(layers.uploads[0].target_bytes, 9U * 5 * 16 * 3);
+  EXPECT_EQ(layers.uploads[0].source_layer_stride, 9U * 6 * 16);
+  EXPECT_EQ(layers.total, 9U * 5 * 16 * 3);
+  EXPECT_EQ(layers.rewritten[0].imageSubresource.layerCount, 3U);
+
+  // BC images are never upscaled; a shape saying so is refused.
+  Etc2ImageShape scaled = Shape(VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK, 4, 16, 16);
+  scaled.bc = true;
+  EXPECT_FALSE(PlanAll(scaled, {Region(0, 0, 0, 0, 0, 1, 0, 0, 16, 16)}).ok);
+}
+
+// Extents rounded up to whole blocks past a small mip's edge (which the x4
+// upscale clipped) reach a BC host clipped to the mip, reading the same
+// staging rows; a region starting outside the mip is refused.
+TEST(PlanRegionsTest, ClipsBlockRoundedExtentsOfBcImagesToTheMip) {
+  Etc2ImageShape shape = Shape(VK_FORMAT_EAC_R11G11_UNORM_BLOCK, 1, 6, 6);
+  shape.bc = true;
+  // 8x8 on the 6x6 mip 0: 2x2 blocks of 16 bytes; 4x4 on the 1x1 mip 2:
+  // one block; 4x4 at 4,4 of mip 0: one block, 2x2 of it inside.
+  const Plan plan = PlanAll(shape, {Region(0, 0, 0, 0, 0, 1, 0, 0, 8, 8),
+                                    Region(64, 0, 0, 2, 0, 1, 0, 0, 4, 4),
+                                    Region(80, 0, 0, 0, 0, 1, 4, 4, 4, 4)});
+  ASSERT_TRUE(plan.ok);
+  ASSERT_EQ(plan.rewritten.size(), 3U);
+  const std::uint32_t extents[][2] = {{6, 6}, {1, 1}, {2, 2}};
+  const std::uint32_t pitches[][2] = {{8, 8}, {4, 4}, {4, 4}};
+  const VkDeviceSize bytes[] = {64, 16, 16};
+  for (std::size_t index = 0; index < 3; ++index) {
+    const VkBufferImageCopy& region = plan.rewritten[index];
+    EXPECT_EQ(region.imageExtent.width, extents[index][0]) << index;
+    EXPECT_EQ(region.imageExtent.height, extents[index][1]) << index;
+    EXPECT_EQ(region.bufferRowLength, pitches[index][0]) << index;
+    EXPECT_EQ(region.bufferImageHeight, pitches[index][1]) << index;
+    EXPECT_EQ(plan.uploads[index].target_bytes, bytes[index]) << index;
+    // The upload itself keeps the region as given.
+    EXPECT_EQ(plan.uploads[index].target_width,
+              plan.uploads[index].width) << index;
+  }
+  EXPECT_EQ(plan.rewritten[2].imageOffset.x, 4);
+  EXPECT_EQ(plan.total, 64U + 16 + 16);
+  EXPECT_FALSE(PlanAll(shape, {Region(0, 0, 0, 0, 0, 1, 8, 0, 4, 4)}).ok);
+  EXPECT_FALSE(PlanAll(shape, {Region(0, 0, 0, 1, 0, 1, 0, 4, 4, 4)}).ok);
+  // The default mode keeps such regions as they are.
+  shape.bc = false;
+  const Plan rgba = PlanAll(shape, {Region(0, 0, 0, 0, 0, 1, 0, 0, 8, 8)});
+  ASSERT_TRUE(rgba.ok);
+  EXPECT_EQ(rgba.rewritten[0].imageExtent.width, 8U);
+  EXPECT_EQ(rgba.rewritten[0].bufferRowLength, 0U);
+}
+
 TEST(PlanRegionsTest, ScalesRegionsOfAnUpscaledImage) {
   // ETC2 RGBA8 20x12 held 4x larger: 80x48 on the host.
   const Etc2ImageShape shape =

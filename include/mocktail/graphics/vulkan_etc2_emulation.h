@@ -296,14 +296,6 @@ class VulkanEtc2Emulation final {
   State* state_;
 };
 
-// ETC2->BC mode also needs an upload route that writes BC blocks: the CPU
-// route encodes them once its fast path (plus.2 WP1) is in, and the GPU
-// route with the etc2_bc pipeline. Until then no device enters BC mode
-// (PhysicalDeviceUsesBc logs it unavailable) and MOCKTAIL_ETC2_TO_BC=1
-// changes nothing. Tests open this gate to check the images, views and
-// capabilities of BC mode; it goes when the CPU encode step lands.
-void SetEtc2BcUploadsReadyForTesting(bool ready);
-
 }  // namespace mocktail::graphics
 
 #endif  // MOCKTAIL_GRAPHICS_VULKAN_ETC2_EMULATION_H_

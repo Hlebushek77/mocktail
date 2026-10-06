@@ -225,14 +225,8 @@ const char kUnavailable[] = "  [vulkan] ETC2->BC unavailable: ";
 
 class Etc2BcModeTest : public ::testing::Test {
  protected:
-  void SetUp() override {
-    g_model = &model_;
-    SetEtc2BcUploadsReadyForTesting(true);
-  }
-  void TearDown() override {
-    SetEtc2BcUploadsReadyForTesting(false);
-    g_model = nullptr;
-  }
+  void SetUp() override { g_model = &model_; }
+  void TearDown() override { g_model = nullptr; }
 
   static Etc2EmulationOptions Options(bool to_bc) {
     Etc2EmulationOptions options = CpuRouteOptions();
@@ -327,31 +321,6 @@ TEST_F(Etc2BcModeTest, OffChangesNothing) {
       fake.physical_device(), &ModelFeatures, &ModelFormatProperties));
   EXPECT_EQ(model_.format_queries, 0);
   EXPECT_TRUE(fake.errors().empty()) << fake.errors().front();
-}
-
-// Until an upload route writes BC blocks, MOCKTAIL_ETC2_TO_BC=1 keeps the
-// default mode and says why.
-TEST_F(Etc2BcModeTest, ClosedGateKeepsTheDefaultMode) {
-  SetEtc2BcUploadsReadyForTesting(false);
-  FakeVulkanDevice fake;
-  VulkanEtc2Emulation emulation(Options(true));
-  ::testing::internal::CaptureStderr();
-  EXPECT_FALSE(Register(&emulation, &fake));
-  VkImageCreateInfo host{};
-  const VkImage image =
-      Create(&emulation, &fake,
-             ImageInfo(VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK, 32, 32), &host);
-  EXPECT_EQ(host.format, VK_FORMAT_R8G8B8A8_UNORM);
-  EXPECT_EQ(host.extent.width, 128U);  // the x4 upscale as before
-  emulation.DestroyImage(fake.device(), image, nullptr);
-  emulation.DestroyDevice(fake.device());
-  const std::string log = ::testing::internal::GetCapturedStderr();
-  EXPECT_EQ(CountLines(log, kRgbaLine), 1) << log;
-  EXPECT_EQ(CountLines(log, std::string(kUnavailable) +
-                                "no upload route of this build writes BC "
-                                "blocks yet; ETC2 textures stay RGBA8/R16"),
-            1)
-      << log;
 }
 
 TEST_F(Etc2BcModeTest, CreatesBcImagesAndViewsWithoutUpscale) {

@@ -81,6 +81,9 @@ bool PlanRegions(const Etc2ImageShape& record, VkDevice device,
     return false;
   }
   const std::uint32_t scale = record.scale;
+  if (record.bc && scale > 1) {
+    return false;  // BC images are never upscaled (no BLIT_DST)
+  }
   for (std::uint32_t index = 0; index < count; ++index) {
     const Region& region = regions[index];
     Etc2PendingUpload upload;
@@ -139,6 +142,41 @@ bool PlanRegions(const Etc2ImageShape& record, VkDevice device,
     copy.bufferOffset = *total;
     copy.bufferRowLength = 0;
     copy.bufferImageHeight = 0;
+    if (record.bc) {
+      // A BC block per ETC2/EAC block, of the same size and in the same
+      // order: the rewritten region reads them tightly packed, rows of
+      // ceil(width / 4) blocks, with the app's extent.
+      upload.bc = true;
+      upload.target_bytes = upload.compressed;
+      // An extent rounded up to whole blocks past a small mip's edge (8x8
+      // for 6x6), which the x4 upscale clipped, may not reach a
+      // block-compressed host (VUID-vkCmdCopyBufferToImage-
+      // imageSubresource-07971): the host copies the part inside the mip,
+      // from staging rows and layers of the extent given (the same blocks).
+      // A region that starts outside the mip is refused, as for an
+      // upscaled image.
+      const std::uint32_t mip =
+          std::min<std::uint32_t>(region.imageSubresource.mipLevel, 31);
+      const std::uint32_t mip_width =
+          std::max<std::uint32_t>(1, record.width >> mip);
+      const std::uint32_t mip_height =
+          std::max<std::uint32_t>(1, record.height >> mip);
+      if (region.imageOffset.x < 0 || region.imageOffset.y < 0 ||
+          static_cast<std::uint32_t>(region.imageOffset.x) >= mip_width ||
+          static_cast<std::uint32_t>(region.imageOffset.y) >= mip_height) {
+        return false;
+      }
+      const std::uint32_t room_x =
+          mip_width - static_cast<std::uint32_t>(region.imageOffset.x);
+      const std::uint32_t room_y =
+          mip_height - static_cast<std::uint32_t>(region.imageOffset.y);
+      if (upload.width > room_x || upload.height > room_y) {
+        copy.imageExtent.width = std::min(upload.width, room_x);
+        copy.imageExtent.height = std::min(upload.height, room_y);
+        copy.bufferRowLength = (upload.width + 3) & ~3U;
+        copy.bufferImageHeight = (upload.height + 3) & ~3U;
+      }
+    }
     if (scale > 1) {
       const std::uint32_t mip = region.imageSubresource.mipLevel;
       const auto axis = [&](std::uint32_t base, std::int32_t offset,
