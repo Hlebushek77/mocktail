@@ -685,6 +685,7 @@ add_executable(vulkan_etc2_diagnostics_test
   vulkan_etc2_diagnostics_test.cc
   ${PROJECT_SOURCE_DIR}/src/graphics/vulkan_etc2_emulation.cc
   ${PROJECT_SOURCE_DIR}/src/graphics/vulkan_etc2_planning.cc
+  ${PROJECT_SOURCE_DIR}/src/graphics/vulkan_etc2_gpu.cc
   ${PROJECT_SOURCE_DIR}/src/graphics/vulkan_etc2_gpu_plan.cc
   ${PROJECT_SOURCE_DIR}/src/graphics/chunk_arena.cc
   ${PROJECT_SOURCE_DIR}/src/graphics/etc2_decode_totals.cc
@@ -711,6 +712,7 @@ mocktail_apply_compile_options(vulkan_etc2_diagnostics_test)
 add_library(mocktail_etc2_emulation_for_tests STATIC
   ${PROJECT_SOURCE_DIR}/src/graphics/vulkan_etc2_emulation.cc
   ${PROJECT_SOURCE_DIR}/src/graphics/vulkan_etc2_planning.cc
+  ${PROJECT_SOURCE_DIR}/src/graphics/vulkan_etc2_gpu.cc
   ${PROJECT_SOURCE_DIR}/src/graphics/vulkan_etc2_gpu_plan.cc
   ${PROJECT_SOURCE_DIR}/src/graphics/chunk_arena.cc
   ${PROJECT_SOURCE_DIR}/src/graphics/etc2_decode_totals.cc

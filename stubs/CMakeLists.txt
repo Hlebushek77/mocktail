@@ -109,6 +109,7 @@ add_library(stub_vulkan SHARED
   ${CMAKE_SOURCE_DIR}/src/graphics/vulkan_text_overlay_compositor.cc
   ${CMAKE_SOURCE_DIR}/src/graphics/vulkan_etc2_emulation.cc
   ${CMAKE_SOURCE_DIR}/src/graphics/vulkan_etc2_planning.cc
+  ${CMAKE_SOURCE_DIR}/src/graphics/vulkan_etc2_gpu.cc
   ${CMAKE_SOURCE_DIR}/src/graphics/vulkan_etc2_gpu_plan.cc
   ${CMAKE_SOURCE_DIR}/src/graphics/etc2_decode_totals.cc
   ${CMAKE_SOURCE_DIR}/src/graphics/chunk_arena.cc
