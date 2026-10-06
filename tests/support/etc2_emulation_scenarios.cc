@@ -890,6 +890,49 @@ std::vector<Scenario> BuildScenarios() {
     scenarios.push_back(b.Build());
   }
 
+  {
+    // Added with ETC2->BC mode (plus.2 WP3a): the copies Roblox makes most,
+    // which stay valid between BC hosts, where the scenarios above copy
+    // between formats of different block sizes.
+    ScenarioBuilder b("CopyImageMipMoves", 21,
+                      "the texture manager's mip moves (L0: about 92k "
+                      "vkCmdCopyImage a session): every mip of a texture "
+                      "into the next mip of a larger one of the same format, "
+                      "parts at block offsets back, layers of an array, in "
+                      "every ETC2/EAC format");
+    const std::uint32_t source = b.Source();
+    const std::uint32_t upload = b.CommandBuffer();
+    const std::uint32_t moves = b.CommandBuffer();
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> pairs;
+    for (VkFormat format : kEtc2Formats) {
+      const std::uint32_t small = b.Image(format, 40, 24, 4);
+      const std::uint32_t large = b.Image(format, 80, 48, 5);
+      b.Copy(upload, small, source, b.MipChain(source, small));
+      b.Copy(upload, large, source, b.MipChain(source, large));
+      pairs.emplace_back(small, large);
+    }
+    const std::uint32_t array_a = b.Image(kRg11Snorm, 32, 32, 2, 3);
+    const std::uint32_t array_b = b.Image(kRg11Snorm, 32, 32, 2, 3);
+    b.Copy(upload, array_a, source, b.MipChain(source, array_a));
+    b.Copy(upload, array_b, source, b.MipChain(source, array_b));
+    b.Submit({{upload}}).Checkpoint();
+    for (const auto& [small, large] : pairs) {
+      std::vector<VkImageCopy> chain;
+      for (std::uint32_t mip = 0; mip < 4; ++mip) {
+        chain.push_back(ImageCopy(mip, 0, 0, mip + 1, 0, 0, Mip(40, mip),
+                                  Mip(24, mip)));
+      }
+      b.CopyImage(moves, small, large, chain)
+          .CopyImage(moves, large, small,
+                     {ImageCopy(0, 8, 4, 0, 16, 8, 16, 12)}, true);
+    }
+    b.CopyImage(moves, array_a, array_b,
+                {ImageCopy(0, 0, 0, 0, 0, 0, 32, 32, 1, 2),
+                 ImageCopy(1, 4, 4, 1, 8, 8, 8, 8, 0, 1)})
+        .Submit({{moves}});
+    scenarios.push_back(b.Build());
+  }
+
   return scenarios;
 }
 
