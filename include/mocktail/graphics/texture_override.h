@@ -29,6 +29,12 @@ void ResampleRgba(const RgbaImage& source, std::uint32_t width,
 void ResampleRgba(const std::uint8_t* source, std::uint32_t source_width,
                   std::uint32_t source_height, std::uint32_t width,
                   std::uint32_t height, std::uint8_t* destination);
+// The same for a source whose rows lie `source_row_bytes` apart (a region
+// cropped out of a wider image).
+void ResampleRgba(const std::uint8_t* source, std::uint32_t source_width,
+                  std::uint32_t source_height, std::size_t source_row_bytes,
+                  std::uint32_t width, std::uint32_t height,
+                  std::uint8_t* destination);
 
 class TextureOverrides {
  public:

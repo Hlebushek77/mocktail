@@ -145,5 +145,39 @@ TEST(ResampleRgbaTest, ImageOverloadChecksPixelCount) {
   EXPECT_EQ(untouched, std::vector<std::uint8_t>(52 * 28 * 4, 0x11));
 }
 
+// The row-stride overload reads a region cropped out of a wider image (the
+// emulation's partial uploads) as if it had been copied out first.
+TEST(ResampleRgbaTest, StridedSourceMatchesACroppedCopy) {
+  std::mt19937_64 rng(0x5EED0103);
+  for (int index = 0; index < 2000; ++index) {
+    const std::uint32_t source_width =
+        1 + static_cast<std::uint32_t>(rng() % 40);
+    const std::uint32_t source_height =
+        1 + static_cast<std::uint32_t>(rng() % 40);
+    const std::uint32_t padding = static_cast<std::uint32_t>(rng() % 5);
+    const std::uint32_t width = 1 + static_cast<std::uint32_t>(rng() % 160);
+    const std::uint32_t height = 1 + static_cast<std::uint32_t>(rng() % 160);
+    const std::vector<std::uint8_t> wide =
+        RandomRgba(&rng, source_width + padding, source_height);
+    std::vector<std::uint8_t> cropped;
+    for (std::uint32_t y = 0; y < source_height; ++y) {
+      const auto row = wide.begin() + static_cast<std::ptrdiff_t>(
+                                          y * (source_width + padding) * 4);
+      cropped.insert(cropped.end(), row, row + source_width * 4);
+    }
+    const std::size_t size = static_cast<std::size_t>(width) * height * 4;
+    std::vector<std::uint8_t> actual(size, 0x11);
+    std::vector<std::uint8_t> expected(size, 0xEE);
+    ResampleRgba(wide.data(), source_width, source_height,
+                 static_cast<std::size_t>(source_width + padding) * 4, width,
+                 height, actual.data());
+    reference::ResampleRgba(cropped.data(), source_width, source_height,
+                            width, height, expected.data());
+    ASSERT_EQ(actual, expected)
+        << source_width << "x" << source_height << " (+" << padding
+        << ") -> " << width << "x" << height;
+  }
+}
+
 }  // namespace
 }  // namespace mocktail::graphics
