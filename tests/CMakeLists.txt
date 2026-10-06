@@ -879,6 +879,12 @@ target_link_libraries(etc2_bc_gpu_test PRIVATE
 )
 mocktail_apply_compile_options(etc2_bc_gpu_test)
 
+# Manual, not run by ctest: the PSNR of ETC2->BC mode on a texture corpus
+# (the APK's .ktx and .png, MOCKTAIL_ETC2_TRACE_BLOCKS dumps).
+add_executable(etc2_bc_quality etc2_bc_quality.cc)
+target_link_libraries(etc2_bc_quality PRIVATE mocktail_etc2_test_support)
+mocktail_apply_compile_options(etc2_bc_quality)
+
 add_executable(video_driver_policy_test
   video_driver_policy_test.cc
 )
