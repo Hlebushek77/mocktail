@@ -954,6 +954,71 @@ INSTANTIATE_TEST_SUITE_P(
              TeardownName(std::get<2>(info.param));
     });
 
+std::vector<std::string> BcModeScenarioNames() {
+  std::vector<std::string> names;
+  for (const Scenario& scenario : Etc2EmulationScenarios()) {
+    if (scenario.bc_mode_fake_errors.empty()) {
+      names.push_back(scenario.name);
+    }
+  }
+  return names;
+}
+
+// With the GPU route on as well (MOCKTAIL_ETC2_GPU's default) and ready:
+// its decode pass writes RGBA texels and has no BC pipeline yet (WP3b), so
+// every upload into a BC image must stay on the CPU route and give the same
+// BC blocks.
+class Etc2BcGpuRouteTest : public ::testing::TestWithParam<std::string> {};
+
+TEST_P(Etc2BcGpuRouteTest, KeepsBcImagesOnTheCpuRoute) {
+  const Scenario* scenario = FindEtc2EmulationScenario(GetParam());
+  ASSERT_NE(scenario, nullptr);
+  FakeVulkanDevice fake;
+  FakeEmulationBackend backend(&fake);
+  ScenarioOptions options;
+  options.emulation.to_bc = true;
+  options.emulation.gpu = true;
+  options.fake = &fake;
+  ::testing::internal::CaptureStderr();
+  const ScenarioRun run = RunEtc2Scenario(*scenario, &backend, options);
+  const std::string log = ::testing::internal::GetCapturedStderr();
+  ASSERT_FALSE(run.skipped) << run.skip_reason;
+  for (const std::string& failure : run.failures) {
+    ADD_FAILURE() << failure;
+  }
+  ExpectOnlyBcModeErrors(fake, *scenario);
+  ExpectEverythingReleased(fake);
+  EXPECT_EQ(fake.counts().pipelines.live(), 0U);
+  EXPECT_EQ(fake.counts().fences.live(), 0U);
+  std::uint64_t golden = 0;
+  ASSERT_TRUE(FindEtc2BcEmulationGolden(scenario->name, &golden));
+  EXPECT_EQ(run.hash, golden)
+      << "the BC blocks of " << scenario->name
+      << " changed with the GPU route on; this run gives "
+      << GoldenLine(scenario->name, run.hash);
+  if (!scenario->emulated) {
+    EXPECT_FALSE(run.gpu_route);
+    return;
+  }
+  ASSERT_TRUE(run.gpu_route);
+  const std::vector<VkQueueFamilyProperties> families =
+      backend.queue_families();
+  if (scenario->queue_family < families.size() &&
+      (families[scenario->queue_family].queueFlags & VK_QUEUE_COMPUTE_BIT) !=
+          0) {
+    EXPECT_EQ(run.gpu_state, "ready") << log;
+  }
+  EXPECT_EQ(run.gpu_stats.passes, 0U) << "a BC upload took the GPU route";
+  EXPECT_EQ(run.gpu_stats.rescues, 0U);
+  EXPECT_EQ(run.gpu_stats.dropped_uploads, 0U);
+}
+
+INSTANTIATE_TEST_SUITE_P(Scenarios, Etc2BcGpuRouteTest,
+                         ::testing::ValuesIn(BcModeScenarioNames()),
+                         [](const ::testing::TestParamInfo<std::string>& info) {
+                           return info.param;
+                         });
+
 TEST(Etc2BcScenarioListTest, EveryScenarioValidInBcModeHasABcGolden) {
   for (const Scenario& scenario : Etc2EmulationScenarios()) {
     std::uint64_t hash = 0;

@@ -1182,6 +1182,13 @@ struct VulkanEtc2Emulation::State {
       default:  // building, or the selftest not done yet
         return {Etc2Route::kCpu, Etc2CpuReason::kGpuNotReady};
     }
+    // The decode pass writes RGBA texels: BC images (ETC2->BC mode) have no
+    // GPU route until the etc2_bc pipeline exists (WP3b), so the CPU route
+    // encodes them. Their storage and attachment fallbacks stay RGBA and may
+    // take the route.
+    if (target.image.bc) {
+      return {Etc2Route::kCpu, Etc2CpuReason::kGpuUnavailable};
+    }
     // Upscaled small textures need the CPU's resampling (DESIGN C3.5).
     if (target.image.scale > 1) {
       return {Etc2Route::kCpu, Etc2CpuReason::kUpscaled};
