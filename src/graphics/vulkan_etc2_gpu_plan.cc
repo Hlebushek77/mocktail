@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <limits>
 
+#include "mocktail/graphics/bc_encoder.h"
+
 namespace mocktail::graphics {
 
 namespace {
@@ -115,8 +117,11 @@ bool PlanGpuRegions(const Etc2ImageShape& image, VkBuffer source,
         width, mip_width - static_cast<std::uint32_t>(region.imageOffset.x));
     copy.imageExtent.height = std::min(
         height, mip_height - static_cast<std::uint32_t>(region.imageOffset.y));
-    upload.decoded = static_cast<VkDeviceSize>(copy.imageExtent.width) *
-                     copy.imageExtent.height * texel_bytes * upload.layers;
+    // BC mode writes the blocks themselves, as the CPU route counts them.
+    upload.decoded = bc ? upload.compressed
+                        : static_cast<VkDeviceSize>(copy.imageExtent.width) *
+                              copy.imageExtent.height * texel_bytes *
+                              upload.layers;
     rewritten->push_back(copy);
     uploads->push_back(upload);
     *total = upload.output_offset + upload.output_bytes;
@@ -157,14 +162,17 @@ bool BuildDecodePass(const std::vector<Etc2GpuUpload>& uploads,
                      Etc2DecodePass* pass) {
   *pass = Etc2DecodePass{};
   input_base = AlignUp(input_base, kEtc2GpuInputAlignment);
-  // Jobs grouped by output buffer, so each buffer is one dispatch; the
-  // order inside a group is the recording order.
+  // Jobs grouped by pipeline (decode, then BC) and output buffer, so each
+  // group is one dispatch; the order inside a group is the recording order.
   std::vector<std::size_t> order(uploads.size());
   for (std::size_t index = 0; index < order.size(); ++index) {
     order[index] = index;
   }
   std::stable_sort(order.begin(), order.end(),
                    [&](std::size_t left, std::size_t right) {
+                     if (uploads[left].bc != uploads[right].bc) {
+                       return uploads[right].bc;
+                     }
                      return uploads[left].output < uploads[right].output;
                    });
   // The input layout follows the recording order, so neighbouring source
@@ -233,11 +241,13 @@ bool BuildDecodePass(const std::vector<Etc2GpuUpload>& uploads,
   };
   for (const std::size_t index : order) {
     const Etc2GpuUpload& upload = uploads[index];
-    if (dispatch == nullptr || dispatch->output != upload.output) {
+    if (dispatch == nullptr || dispatch->output != upload.output ||
+        dispatch->bc != upload.bc) {
       close();
       pass->dispatches.push_back({});
       dispatch = &pass->dispatches.back();
       dispatch->output = upload.output;
+      dispatch->bc = upload.bc;
       dispatch->job_first =
           job_base + static_cast<std::uint32_t>(pass->jobs.size());
       groups = 0;
@@ -282,6 +292,7 @@ bool BuildDecodePass(const std::vector<Etc2GpuUpload>& uploads,
     job.dst_row_words = static_cast<std::uint32_t>(dst_row / 4);
     job.dst_layer_words = static_cast<std::uint32_t>(dst_layer / 4);
     job.group_begin = static_cast<std::uint32_t>(groups);
+    job.flags = upload.bc && kEtc2ToBcRefine ? kEtc2BcJobRefine : 0;
     groups += Etc2DecodeGroups(blocks);
     pass->jobs.push_back(job);
     ++dispatch->job_count;

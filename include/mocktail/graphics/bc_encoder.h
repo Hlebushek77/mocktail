@@ -15,6 +15,14 @@
 // BCn formats store them in (little-endian 32-bit words).
 namespace mocktail::graphics {
 
+// ETC2->BC mode refines every BC1 colour block (EncodeBc1Block's `refine`),
+// on the CPU route and in the GPU route's etc2_bc pipeline alike, so a BC
+// image's bytes do not depend on which route served an upload. (CR-13
+// leaves it to the user whether the CPU route may skip it: a quarter of the
+// transcode time for RGB8->BC1, a fifth for RGBA8->BC3, at the price of
+// route-dependent bytes.)
+inline constexpr bool kEtc2ToBcRefine = true;
+
 // `rgba`: 16 RGBA8 texels of one block, row-major (y * 4 + x). With
 // `punchthrough` (ETC2 RGB8A1 -> BC1_RGBA) a texel with alpha below 128
 // becomes transparent black: the block is then in 3-colour mode with index

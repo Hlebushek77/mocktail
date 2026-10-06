@@ -536,13 +536,10 @@ constexpr std::size_t kParallelEmitMinimumBytes = 256U << 10;
 std::atomic<unsigned> g_bc_fallback_logs{0};
 
 // ETC2->BC mode on the CPU route (DESIGN C4.4): every block gets the
-// endpoint refinement, as in the GPU route's etc2_bc pipeline, so a BC
-// image's bytes do not depend on which route served an upload. (CR-13
-// leaves it to the user whether this route may skip it: a quarter of the
-// transcode time for RGB8->BC1, a fifth for RGBA8->BC3, at the price of
-// route-dependent bytes.) Transcoding comes in pieces of at most 1024
-// blocks, about 0.2 ms on one core, batched into tasks of at least as many.
-constexpr bool kBcRefine = true;
+// endpoint refinement, as in the GPU route's etc2_bc pipeline
+// (kEtc2ToBcRefine). Transcoding comes in pieces of at most 1024 blocks,
+// about 0.2 ms on one core, batched into tasks of at least as many.
+constexpr bool kBcRefine = kEtc2ToBcRefine;
 constexpr std::size_t kBcPieceBlocks = 1024;
 
 void LogFailure(const char* message) {
@@ -1182,13 +1179,6 @@ struct VulkanEtc2Emulation::State {
       default:  // building, or the selftest not done yet
         return {Etc2Route::kCpu, Etc2CpuReason::kGpuNotReady};
     }
-    // The decode pass writes RGBA texels: BC images (ETC2->BC mode) have no
-    // GPU route until the etc2_bc pipeline exists (WP3b), so the CPU route
-    // encodes them. Their storage and attachment fallbacks stay RGBA and may
-    // take the route.
-    if (target.image.bc) {
-      return {Etc2Route::kCpu, Etc2CpuReason::kGpuUnavailable};
-    }
     // Upscaled small textures need the CPU's resampling (DESIGN C3.5).
     if (target.image.scale > 1) {
       return {Etc2Route::kCpu, Etc2CpuReason::kUpscaled};
@@ -1588,6 +1578,7 @@ struct VulkanEtc2Emulation::State {
     info.memory = dev.memory;
     info.properties = dev.properties;
     info.families = dev.queue_families;
+    info.bc = dev.bc;
     info.arena_cap_bytes = options.gpu_arena_bytes;
     info.frame_stats = options.frame_stats;
     info.count = [this](const std::function<void(Etc2DecodeTotals&)>& update) {
@@ -2091,9 +2082,6 @@ void VulkanEtc2Emulation::RegisterDevice(
     instance_proc(dev->enumerate_device_extensions,
                   "vkEnumerateDeviceExtensionProperties");
   }
-  if (emulated && state_->options.gpu) {
-    state_->MakeGpuDevice(*dev);
-  }
   if (emulated && state_->options.fast_path) {
     // The CPU route's staging (DESIGN C1). Chunks come on first use.
     const HostDevice* const host = dev.get();
@@ -2129,12 +2117,22 @@ void VulkanEtc2Emulation::RegisterDevice(
                    "RGBA8/R16\n");
     }
   }
+  if (emulated && state_->options.gpu) {
+    // After the BC decision: in ETC2->BC mode the GPU route builds the
+    // etc2_bc pipeline too.
+    state_->MakeGpuDevice(*dev);
+  }
   if (emulated) {
     if (dev->bc) {
-      // The GPU route names itself here once it transcodes too.
+      // The GPU route transcodes once its selftest passed; the CPU route
+      // until then, and wherever the GPU route cannot serve an upload.
       std::fprintf(stderr,
                    "  [vulkan] ETC2/EAC emulation enabled: compressed uploads "
-                   "become BC1/BC3/BC4/BC5 host images (CPU transcode)\n");
+                   "become BC1/BC3/BC4/BC5 host images (%s transcode)\n",
+                   dev->gpu != nullptr &&
+                           dev->gpu->state() != Etc2GpuDevice::State::kFailed
+                       ? "GPU"
+                       : "CPU");
     } else {
       std::fprintf(stderr,
                    "  [vulkan] ETC2/EAC emulation enabled: compressed uploads "
@@ -3609,7 +3607,9 @@ void VulkanEtc2Emulation::State::Housekeeping(Clock::time_point now) {
 
 // The rescue copies each upload with one region, so the CPU writes what the
 // decode pass would have: whole blocks, 4 x blocks_wide texels per row and
-// 4 x blocks_high rows per layer, layer after layer. The source bytes are
+// 4 x blocks_high rows per layer, layer after layer; for a BC image the
+// etc2_bc pass's tightly packed BC blocks, encoded as on the CPU route
+// (kBcRefine), so a rescued upload has the same bytes. The source bytes are
 // read now, inside vkQueueSubmit, as on the CPU route. The staging goes to
 // the record of a command buffer of the batch that holds GPU-route
 // uploads: its copies read the arena after the rescue pass's barrier, so
@@ -3620,13 +3620,6 @@ bool VulkanEtc2Emulation::State::RescueDecode(
     std::vector<Etc2RescueSource>* sources) {
   if (uploads.empty()) {
     return false;
-  }
-  for (const Etc2GpuUpload& upload : uploads) {
-    if (upload.bc) {
-      // BC mode's CPU encode is not part of the GPU route yet.
-      LogFailure("cannot rescue a BC upload on the CPU");
-      return false;
-    }
   }
   struct Source {
     const std::uint8_t* mapped = nullptr;  // Roblox's mapping, or null
@@ -3694,7 +3687,8 @@ bool VulkanEtc2Emulation::State::RescueDecode(
     return false;
   }
 
-  // Staging: decoded texels at 16-byte aligned offsets.
+  // Staging: decoded texels (BC blocks in ETC2->BC mode) at 16-byte aligned
+  // offsets.
   std::vector<VkDeviceSize> offsets(uploads.size());
   VkDeviceSize total = 0;
   VkDeviceSize compressed_total = 0;
@@ -3735,10 +3729,19 @@ bool VulkanEtc2Emulation::State::RescueDecode(
   };
 
   // Copy-in from Roblox's memory (streaming loads, whole block rows), then
-  // decode on the pool.
+  // decode on the pool; in ETC2->BC mode encode instead, as the CPU route
+  // does, in pieces on the pool. A BC upload's blocks stay in their order,
+  // tightly packed, which is the arena's layout for it too.
   std::vector<std::uint8_t> compressed(
       static_cast<std::size_t>(compressed_total));
   std::vector<EtcDecodeJob> jobs;
+  struct BcPiece {
+    EtcFormat format;
+    const std::uint8_t* source;
+    std::uint8_t* target;
+    std::size_t bytes;
+  };
+  std::vector<BcPiece> bc_pieces;
   {
     TemporaryMappings temporary;
     VkDeviceSize packed_offset = 0;
@@ -3766,26 +3769,62 @@ bool VulkanEtc2Emulation::State::RescueDecode(
             packed, source + layer * upload.source_layer_stride, row_bytes,
             upload.blocks_high,
             static_cast<std::size_t>(upload.source_row_stride));
+        std::uint8_t* const target =
+            mapped + offsets[index] + layer * output_layer;
+        if (upload.bc) {
+          const std::size_t block_bytes = EtcBlockBytes(upload.format);
+          const std::size_t layer_bytes =
+              static_cast<std::size_t>(packed_layer);
+          for (std::size_t offset = 0; offset < layer_bytes;
+               offset += kBcPieceBlocks * block_bytes) {
+            bc_pieces.push_back(
+                {upload.format, packed + offset, target + offset,
+                 std::min(kBcPieceBlocks * block_bytes, layer_bytes - offset)});
+          }
+          packed_offset += packed_layer;
+          continue;
+        }
         EtcDecodeJob job;
         job.format = upload.format;
         job.source = packed;
         job.source_bytes = static_cast<std::size_t>(packed_layer);
         job.width = 4 * upload.blocks_wide;
         job.height = 4 * upload.blocks_high;
-        job.destination = mapped + offsets[index] + layer * output_layer;
+        job.destination = target;
         job.destination_bytes = static_cast<std::size_t>(output_layer);
         jobs.push_back(job);
         packed_offset += packed_layer;
       }
     }
   }
-  DecodeEtcJobs(jobs.data(), jobs.size(), WorkerCount());
+  const unsigned workers = WorkerCount();
+  DecodeEtcJobs(jobs.data(), jobs.size(), workers);
   for (const EtcDecodeJob& job : jobs) {
     if (!job.ok) {
       LogFailure("could not decode a rescued upload");
       give_back();
       return false;
     }
+  }
+  std::atomic<bool> bc_failed{false};
+  const auto bc_task = [&](std::size_t index) {
+    const BcPiece& piece = bc_pieces[index];
+    if (!TranscodeEtcToBc(piece.format, piece.source, piece.bytes, piece.target,
+                          piece.bytes, kBcRefine)) {
+      bc_failed.store(true, std::memory_order_relaxed);
+    }
+  };
+  if (workers > 1 && bc_pieces.size() > 1) {
+    WorkerPool::Shared(workers).ParallelFor(bc_pieces.size(), bc_task);
+  } else {
+    for (std::size_t index = 0; index < bc_pieces.size(); ++index) {
+      bc_task(index);
+    }
+  }
+  if (bc_failed.load(std::memory_order_relaxed)) {
+    LogFailure("could not encode a rescued upload as BC");
+    give_back();
+    return false;
   }
 
   bool kept = false;

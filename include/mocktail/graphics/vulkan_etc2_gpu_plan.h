@@ -18,7 +18,8 @@
 
 namespace mocktail::graphics {
 
-// etc2_decode.comp's `Job` (std430, 64 bytes): one upload, all its layers.
+// etc2_decode.comp's and etc2_bc.comp's `Job` (std430, 64 bytes): one
+// upload, all its layers.
 struct Etc2DecodeJob {
   std::uint32_t format = 0;           // EtcFormat
   std::uint32_t src_word = 0;         // first block, in words of the input
@@ -28,12 +29,17 @@ struct Etc2DecodeJob {
   std::uint32_t blocks_high = 0;
   std::uint32_t block_count = 0;      // blocks_wide * blocks_high * layers
   std::uint32_t dst_word = 0;         // first output word in its buffer
-  std::uint32_t dst_row_words = 0;    // words per texel row (4 x blocks)
+  std::uint32_t dst_row_words = 0;    // words per texel row (4 x blocks),
+                                      // or per block row for BC
   std::uint32_t dst_layer_words = 0;
   std::uint32_t group_begin = 0;      // first workgroup, per dispatch
-  std::uint32_t pad[5] = {};
+  std::uint32_t flags = 0;            // etc2_bc.comp: kEtc2BcJobRefine
+  std::uint32_t pad[4] = {};
 };
 static_assert(sizeof(Etc2DecodeJob) == 64, "the shader's Job is 64 bytes");
+
+// etc2_bc.comp's job flag: refine BC1 endpoints (EncodeBc1Block's `refine`).
+inline constexpr std::uint32_t kEtc2BcJobRefine = 1;
 
 // The shader's local_size_x: one invocation per 4x4 block.
 inline constexpr std::uint32_t kEtc2DecodeGroupSize = 64;
@@ -53,9 +59,11 @@ struct Etc2InputCopies {
 };
 
 // One vkCmdDispatch over jobs [job_first, job_first + job_count) of the jobs
-// buffer, all of which write into `output` (bound as set 1).
+// buffer, all of which write into `output` (bound as set 1). `bc`: the jobs
+// transcode to BC blocks (the etc2_bc pipeline) rather than decode.
 struct Etc2DecodeDispatch {
   VkBuffer output = VK_NULL_HANDLE;
+  bool bc = false;
   std::uint32_t job_first = 0;
   std::uint32_t job_count = 0;
   std::uint32_t groups_x = 0;
@@ -81,9 +89,11 @@ VkDeviceSize Etc2DecodeInputBytes(const std::vector<Etc2GpuUpload>& uploads);
 // `output_offset` are final: copies of each source span into the input
 // buffer from `input_base` (16-byte aligned) on, merged where both sides are
 // contiguous, or block row by block row when the span is more than twice
-// the compressed bytes; one job per upload; dispatches grouped by output
-// buffer, with group_begin counted per dispatch and X split at 65535.
-// False when a value does not fit the shader's 32-bit words.
+// the compressed bytes; one job per upload; dispatches grouped by pipeline
+// (decode first, then the BC uploads of ETC2->BC mode, whose jobs refine as
+// the CPU route does) and output buffer, with group_begin counted per
+// dispatch and X split at 65535. False when a value does not fit the
+// shader's 32-bit words.
 bool BuildDecodePass(const std::vector<Etc2GpuUpload>& uploads,
                      VkDeviceSize input_base, std::uint32_t job_base,
                      Etc2DecodePass* pass);
