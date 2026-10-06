@@ -28,6 +28,11 @@ target_link_libraries(fleasion_probe PRIVATE Mocktail::Services libc_shim)
 mocktail_apply_compile_options(fleasion_probe)
 find_program(MOCKTAIL_TEST_PYTHON python3)
 find_program(MOCKTAIL_TEST_OPENSSL openssl)
+if(MOCKTAIL_TEST_PYTHON)
+  add_test(NAME FrameStatsSummaryTest.SummarisesSessionLogs
+    COMMAND ${MOCKTAIL_TEST_PYTHON}
+            ${CMAKE_CURRENT_SOURCE_DIR}/frame_stats_summary_test.py)
+endif()
 if(MOCKTAIL_TEST_PYTHON AND MOCKTAIL_TEST_OPENSSL)
   add_test(NAME FleasionIntegrationTest.ProxyAndTrust
     COMMAND ${MOCKTAIL_TEST_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/fleasion_integration_test.py
@@ -637,6 +642,44 @@ target_include_directories(etc2_decode_totals_test PRIVATE
 target_link_libraries(etc2_decode_totals_test PRIVATE GTest::gtest_main)
 mocktail_apply_compile_options(etc2_decode_totals_test)
 
+add_executable(chunk_arena_test
+  chunk_arena_test.cc
+  ${PROJECT_SOURCE_DIR}/src/graphics/chunk_arena.cc
+)
+target_include_directories(chunk_arena_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/include
+)
+target_link_libraries(chunk_arena_test PRIVATE
+  Vulkan::Headers
+  GTest::gtest_main
+  Threads::Threads
+)
+mocktail_apply_compile_options(chunk_arena_test)
+
+if(NOT TARGET PkgConfig::LIBPNG)
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(LIBPNG REQUIRED IMPORTED_TARGET libpng)
+endif()
+add_executable(vulkan_etc2_diagnostics_test
+  vulkan_etc2_diagnostics_test.cc
+  ${PROJECT_SOURCE_DIR}/src/graphics/vulkan_etc2_emulation.cc
+  ${PROJECT_SOURCE_DIR}/src/graphics/vulkan_etc2_planning.cc
+  ${PROJECT_SOURCE_DIR}/src/graphics/chunk_arena.cc
+  ${PROJECT_SOURCE_DIR}/src/graphics/etc2_decode_totals.cc
+  ${PROJECT_SOURCE_DIR}/src/graphics/etc2_decoder.cc
+  ${PROJECT_SOURCE_DIR}/src/graphics/texture_override.cc
+)
+target_include_directories(vulkan_etc2_diagnostics_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/include
+)
+target_link_libraries(vulkan_etc2_diagnostics_test PRIVATE
+  Vulkan::Headers
+  PkgConfig::LIBPNG
+  GTest::gtest_main
+  Threads::Threads
+)
+mocktail_apply_compile_options(vulkan_etc2_diagnostics_test)
+
 add_executable(video_driver_policy_test
   video_driver_policy_test.cc
 )
@@ -1176,6 +1219,8 @@ gtest_discover_tests(vulkan_surface_recovery_gate_test)
 gtest_discover_tests(vulkan_present_progress_gate_test)
 gtest_discover_tests(vulkan_text_overlay_compositor_test)
 gtest_discover_tests(etc2_decode_totals_test)
+gtest_discover_tests(chunk_arena_test)
+gtest_discover_tests(vulkan_etc2_diagnostics_test)
 gtest_discover_tests(video_driver_policy_test)
 gtest_discover_tests(wayland_global_probe_test)
 gtest_discover_tests(wayland_surface_commit_guard_test)

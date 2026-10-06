@@ -85,6 +85,9 @@ VKAPI_ATTR void VKAPI_CALL vkFreeCommandBuffers(
     VkDevice device, VkCommandPool command_pool,
     std::uint32_t command_buffer_count,
     const VkCommandBuffer* command_buffers);
+VKAPI_ATTR VkResult VKAPI_CALL vkCreateCommandPool(
+    VkDevice device, const VkCommandPoolCreateInfo* create_info,
+    const VkAllocationCallbacks* allocator, VkCommandPool* command_pool);
 VKAPI_ATTR void VKAPI_CALL vkDestroyCommandPool(
     VkDevice device, VkCommandPool command_pool,
     const VkAllocationCallbacks* allocator);
@@ -160,6 +163,7 @@ struct AdapterState {
     PFN_vkGetQueryPoolResults get_query_pool_results = nullptr;
     PFN_vkAllocateCommandBuffers allocate_command_buffers = nullptr;
     PFN_vkFreeCommandBuffers free_command_buffers = nullptr;
+    PFN_vkCreateCommandPool create_command_pool = nullptr;
     PFN_vkDestroyCommandPool destroy_command_pool = nullptr;
     PFN_vkBeginCommandBuffer begin_command_buffer = nullptr;
     PFN_vkEndCommandBuffer end_command_buffer = nullptr;
@@ -350,6 +354,7 @@ static thread_local ThreadDeviceDispatchCache t_device_cache;
 struct ThreadCommandBufferDispatchCache {
   uint64_t generation = 0;
   VkCommandBuffer command_buffer = VK_NULL_HANDLE;
+  VkCommandPool command_pool = VK_NULL_HANDLE;
   AdapterState::DeviceDispatch dispatch{};
 };
 static thread_local ThreadCommandBufferDispatchCache t_command_buffer_cache;
@@ -416,15 +421,24 @@ const AdapterState::DeviceDispatch& HostDispatchForDevice(VkDevice device) {
   return kEmptyDeviceDispatch;
 }
 
+// `command_pool`, when given, receives the pool the command buffer was
+// allocated from: these bindings are the only record of it, which the ETC2
+// emulation reads too instead of keeping its own.
 const AdapterState::DeviceDispatch& HostDispatchForCommandBuffer(
-    VkCommandBuffer command_buffer) {
+    VkCommandBuffer command_buffer, VkCommandPool* command_pool = nullptr) {
   const uint64_t gen = g_dispatch_generation.load(std::memory_order_acquire);
   if (__builtin_expect(command_buffer != VK_NULL_HANDLE &&
                            t_command_buffer_cache.command_buffer ==
                                command_buffer &&
                            t_command_buffer_cache.generation == gen,
                        1)) {
+    if (command_pool != nullptr) {
+      *command_pool = t_command_buffer_cache.command_pool;
+    }
     return t_command_buffer_cache.dispatch;
+  }
+  if (command_pool != nullptr) {
+    *command_pool = VK_NULL_HANDLE;
   }
   AdapterState& state = State();
   std::lock_guard<std::mutex> lock(state.mutex);
@@ -445,7 +459,11 @@ const AdapterState::DeviceDispatch& HostDispatchForCommandBuffer(
   if (dispatch != state.device_dispatches.end()) {
     t_command_buffer_cache.generation = gen;
     t_command_buffer_cache.command_buffer = command_buffer;
+    t_command_buffer_cache.command_pool = binding->command_pool;
     t_command_buffer_cache.dispatch = *dispatch;
+    if (command_pool != nullptr) {
+      *command_pool = binding->command_pool;
+    }
     return t_command_buffer_cache.dispatch;
   }
   return kEmptyDeviceDispatch;
@@ -496,6 +514,8 @@ void RegisterHostDeviceDispatch(VkDevice device,
           get_device_proc_addr(device, "vkAllocateCommandBuffers"));
   dispatch.free_command_buffers = reinterpret_cast<PFN_vkFreeCommandBuffers>(
       get_device_proc_addr(device, "vkFreeCommandBuffers"));
+  dispatch.create_command_pool = reinterpret_cast<PFN_vkCreateCommandPool>(
+      get_device_proc_addr(device, "vkCreateCommandPool"));
   dispatch.destroy_command_pool = reinterpret_cast<PFN_vkDestroyCommandPool>(
       get_device_proc_addr(device, "vkDestroyCommandPool"));
   dispatch.begin_command_buffer = reinterpret_cast<PFN_vkBeginCommandBuffer>(
@@ -729,6 +749,7 @@ PFN_vkVoidFunction AdapterProc(const char* name) {
   MOCKTAIL_VK_PROC(vkGetQueryPoolResults)
   MOCKTAIL_VK_PROC(vkAllocateCommandBuffers)
   MOCKTAIL_VK_PROC(vkFreeCommandBuffers)
+  MOCKTAIL_VK_PROC(vkCreateCommandPool)
   MOCKTAIL_VK_PROC(vkDestroyCommandPool)
   MOCKTAIL_VK_PROC(vkBeginCommandBuffer)
   MOCKTAIL_VK_PROC(vkEndCommandBuffer)
@@ -753,6 +774,9 @@ PFN_vkVoidFunction AdapterProc(const char* name) {
   MOCKTAIL_VK_PROC(vkCreateImageView)
   MOCKTAIL_VK_PROC(vkBindBufferMemory)
   MOCKTAIL_VK_PROC(vkBindBufferMemory2)
+  MOCKTAIL_VK_PROC(vkBindImageMemory)
+  MOCKTAIL_VK_PROC(vkBindImageMemory2)
+  MOCKTAIL_VK_PROC(vkAllocateMemory)
   MOCKTAIL_VK_PROC(vkMapMemory)
   MOCKTAIL_VK_PROC(vkMapMemory2)
   MOCKTAIL_VK_PROC(vkUnmapMemory)
@@ -776,6 +800,7 @@ PFN_vkVoidFunction AdapterProc(const char* name) {
   MOCKTAIL_VK_ALIAS(vkGetPhysicalDeviceImageFormatProperties2KHR,
                     vkGetPhysicalDeviceImageFormatProperties2)
   MOCKTAIL_VK_ALIAS(vkBindBufferMemory2KHR, vkBindBufferMemory2)
+  MOCKTAIL_VK_ALIAS(vkBindImageMemory2KHR, vkBindImageMemory2)
   MOCKTAIL_VK_ALIAS(vkCmdCopyImage2KHR, vkCmdCopyImage2)
   MOCKTAIL_VK_ALIAS(vkMapMemory2KHR, vkMapMemory2)
   MOCKTAIL_VK_ALIAS(vkUnmapMemory2KHR, vkUnmapMemory2)
@@ -805,6 +830,9 @@ bool IsEtc2DeviceProc(const char* name) {
       "vkCmdCopyImage",         "vkCmdCopyImage2",
       "vkCmdCopyImage2KHR",
       "vkCmdCopyBufferToImage2KHR", "vkCmdExecuteCommands",
+      "vkCreateCommandPool",    "vkAllocateMemory",
+      "vkBindImageMemory",      "vkBindImageMemory2",
+      "vkBindImageMemory2KHR",
   };
   return NameInList(name, kNames, sizeof(kNames) / sizeof(kNames[0]));
 }
@@ -1222,18 +1250,25 @@ void ReleaseEtc2PoolCommandBuffers(VkDevice device,
   }
 }
 
-void PrepareEtc2Submit2(std::uint32_t submit_count,
-                        const VkSubmitInfo2* submits) {
-  if (submits == nullptr) {
+// Mocktail-only batches go first, and always through the core
+// vkQueueSubmit, also inside the vkQueueSubmit2 hooks.
+void SubmitEtc2PreSubmits(VkQueue queue,
+                          const mocktail::graphics::Etc2SubmitPlan& plan) {
+  if (plan.pre_submits().empty()) {
     return;
   }
-  for (std::uint32_t index = 0; index < submit_count; ++index) {
-    for (std::uint32_t info = 0; info < submits[index].commandBufferInfoCount;
-         ++info) {
-      State().etc2.PrepareSubmit(
-          &submits[index].pCommandBufferInfos[info].commandBuffer, 1);
-    }
+  const PFN_vkQueueSubmit submit = HostDispatchForQueue(queue).queue_submit;
+  for (const mocktail::graphics::Etc2PreSubmit& pre : plan.pre_submits()) {
+    State().text_overlay.QueueSubmit(queue, 1, &pre.info, pre.fence, submit);
   }
+}
+
+void FinishEtc2Submit(VkQueue queue, mocktail::graphics::Etc2SubmitPlan* plan,
+                      VkResult result) {
+  const PFN_vkQueueSubmit submit = HostDispatchForQueue(queue).queue_submit;
+  State().etc2.FinishSubmit(plan, result, [queue, submit](VkFence fence) {
+    return State().text_overlay.QueueSubmit(queue, 0, nullptr, fence, submit);
+  });
 }
 
 }  // namespace
@@ -1578,9 +1613,6 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(
       host_memory_properties != nullptr) {
     host_memory_properties(physical_device, &memory_properties);
   }
-  State().etc2.RegisterDevice(*device, physical_device, etc2_emulated,
-                              memory_properties, host_get_device_proc_addr);
-
   std::uint32_t queue_family_count = 0;
   const auto host_get_queue_families =
       reinterpret_cast<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(
@@ -1595,6 +1627,10 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(
                             queue_families.data());
     queue_families.resize(queue_family_count);
   }
+  State().etc2.RegisterDevice(*device, physical_device, etc2_emulated,
+                              memory_properties, properties, queue_families,
+                              *create_info, host_get_device_proc_addr,
+                              host_get_instance_proc_addr, instance);
   std::uint32_t graphics_family = UINT32_MAX;
   std::uint32_t graphics_count = 0;
   for (std::uint32_t index = 0; index < create_info->queueCreateInfoCount;
@@ -1658,6 +1694,7 @@ VKAPI_ATTR void VKAPI_CALL vkGetDeviceQueue(VkDevice device,
     RegisterHostQueueBinding(device, *queue);
     (void)State().text_overlay.RegisterQueue(device, *queue, queue_family_index,
                                              queue_index);
+    State().etc2.RegisterQueue(device, *queue, queue_family_index, queue_index);
   }
 }
 
@@ -1673,6 +1710,8 @@ VKAPI_ATTR void VKAPI_CALL vkGetDeviceQueue2(
     RegisterHostQueueBinding(device, *queue);
     (void)State().text_overlay.RegisterQueue(
         device, *queue, queue_info->queueFamilyIndex, queue_info->queueIndex);
+    State().etc2.RegisterQueue(device, *queue, queue_info->queueFamilyIndex,
+                               queue_info->queueIndex);
   }
 }
 
@@ -1957,6 +1996,28 @@ VKAPI_ATTR void VKAPI_CALL vkFreeCommandBuffers(
   observation.SetResult(VK_SUCCESS);
 }
 
+VKAPI_ATTR VkResult VKAPI_CALL vkCreateCommandPool(
+    VkDevice device, const VkCommandPoolCreateInfo* create_info,
+    const VkAllocationCallbacks* allocator, VkCommandPool* command_pool) {
+  VulkanCallObservation observation("vkCreateCommandPool");
+  const PFN_vkCreateCommandPool host_create =
+      HostDispatchForDevice(device).create_command_pool;
+  if (host_create == nullptr) {
+    observation.SetResult(VK_ERROR_INITIALIZATION_FAILED);
+    return VK_ERROR_INITIALIZATION_FAILED;
+  }
+  const VkResult result =
+      host_create(device, create_info, allocator, command_pool);
+  if (result == VK_SUCCESS && create_info != nullptr &&
+      command_pool != nullptr) {
+    State().etc2.RegisterCommandPool(device, *command_pool,
+                                     create_info->queueFamilyIndex,
+                                     create_info->flags);
+  }
+  observation.SetResult(result);
+  return result;
+}
+
 VKAPI_ATTR void VKAPI_CALL vkDestroyCommandPool(
     VkDevice device, VkCommandPool command_pool,
     const VkAllocationCallbacks* allocator) {
@@ -1970,6 +2031,7 @@ VKAPI_ATTR void VKAPI_CALL vkDestroyCommandPool(
   ReleaseEtc2PoolCommandBuffers(device, command_pool);
   host_destroy(device, command_pool, allocator);
   RemoveHostCommandPoolBindings(device, command_pool);
+  State().etc2.ForgetCommandPool(device, command_pool);
   observation.SetResult(VK_SUCCESS);
 }
 
@@ -1977,13 +2039,17 @@ VKAPI_ATTR VkResult VKAPI_CALL vkBeginCommandBuffer(
     VkCommandBuffer command_buffer,
     const VkCommandBufferBeginInfo* begin_info) {
   VulkanCallObservation observation("vkBeginCommandBuffer");
+  VkCommandPool command_pool = VK_NULL_HANDLE;
   const PFN_vkBeginCommandBuffer host_begin =
-      HostDispatchForCommandBuffer(command_buffer).begin_command_buffer;
+      HostDispatchForCommandBuffer(command_buffer, &command_pool)
+          .begin_command_buffer;
   if (host_begin == nullptr) {
     observation.SetResult(VK_ERROR_INITIALIZATION_FAILED);
     return VK_ERROR_INITIALIZATION_FAILED;
   }
-  State().etc2.ReleaseCommandBuffer(command_buffer);
+  State().etc2.BeginCommandBuffer(
+      command_buffer, command_pool,
+      begin_info != nullptr ? begin_info->flags : 0);
   const VkResult result = host_begin(command_buffer, begin_info);
   observation.SetResult(result);
   return result;
@@ -2049,14 +2115,13 @@ VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(
     observation.SetResult(VK_ERROR_INITIALIZATION_FAILED);
     return VK_ERROR_INITIALIZATION_FAILED;
   }
-  if (submits != nullptr) {
-    for (std::uint32_t index = 0; index < submit_count; ++index) {
-      State().etc2.PrepareSubmit(submits[index].pCommandBuffers,
-                                 submits[index].commandBufferCount);
-    }
-  }
+  mocktail::graphics::Etc2SubmitPlan plan;
+  State().etc2.PrepareSubmit(queue, submit_count, submits, fence, &plan);
+  SubmitEtc2PreSubmits(queue, plan);
   const VkResult result = State().text_overlay.QueueSubmit(
-      queue, submit_count, submits, fence, host_submit);
+      queue, plan.count(submit_count), plan.submits(submits), plan.fence(fence),
+      host_submit);
+  FinishEtc2Submit(queue, &plan, result);
   observation.SetResult(result);
   return result;
 }
@@ -2071,9 +2136,13 @@ VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit2(
     observation.SetResult(VK_ERROR_INITIALIZATION_FAILED);
     return VK_ERROR_INITIALIZATION_FAILED;
   }
-  PrepareEtc2Submit2(submit_count, submits);
+  mocktail::graphics::Etc2SubmitPlan plan;
+  State().etc2.PrepareSubmit2(queue, submit_count, submits, fence, &plan);
+  SubmitEtc2PreSubmits(queue, plan);
   const VkResult result = State().text_overlay.QueueSubmit2(
-      queue, submit_count, submits, fence, host_submit);
+      queue, plan.count(submit_count), plan.submits2(submits),
+      plan.fence(fence), host_submit);
+  FinishEtc2Submit(queue, &plan, result);
   observation.SetResult(result);
   return result;
 }
@@ -2088,10 +2157,13 @@ VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit2KHR(
     observation.SetResult(VK_ERROR_INITIALIZATION_FAILED);
     return VK_ERROR_INITIALIZATION_FAILED;
   }
-  PrepareEtc2Submit2(submit_count, submits);
+  mocktail::graphics::Etc2SubmitPlan plan;
+  State().etc2.PrepareSubmit2(queue, submit_count, submits, fence, &plan);
+  SubmitEtc2PreSubmits(queue, plan);
   const VkResult result = State().text_overlay.QueueSubmit2(
-      queue, submit_count, submits, fence,
-      reinterpret_cast<PFN_vkQueueSubmit2>(host_submit));
+      queue, plan.count(submit_count), plan.submits2(submits),
+      plan.fence(fence), reinterpret_cast<PFN_vkQueueSubmit2>(host_submit));
+  FinishEtc2Submit(queue, &plan, result);
   observation.SetResult(result);
   return result;
 }
@@ -2270,6 +2342,7 @@ vkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* present_info) {
   if (normalized_result == VK_SUCCESS && note_present != nullptr) {
     note_present();
   }
+  state.etc2.OnPresent();
   if (present_info != nullptr && present_info->pResults != nullptr) {
     for (std::uint32_t index = 0; index < present_info->swapchainCount;
          ++index) {
@@ -2447,6 +2520,24 @@ VKAPI_ATTR VkResult VKAPI_CALL vkBindBufferMemory2(
     VkDevice device, std::uint32_t count,
     const VkBindBufferMemoryInfo* infos) {
   return State().etc2.BindBufferMemory2(device, count, infos);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL vkBindImageMemory(VkDevice device,
+                                                 VkImage image,
+                                                 VkDeviceMemory memory,
+                                                 VkDeviceSize offset) {
+  return State().etc2.BindImageMemory(device, image, memory, offset);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL vkBindImageMemory2(
+    VkDevice device, std::uint32_t count, const VkBindImageMemoryInfo* infos) {
+  return State().etc2.BindImageMemory2(device, count, infos);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL vkAllocateMemory(
+    VkDevice device, const VkMemoryAllocateInfo* info,
+    const VkAllocationCallbacks* allocator, VkDeviceMemory* memory) {
+  return State().etc2.AllocateMemory(device, info, allocator, memory);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL vkMapMemory(VkDevice device,
