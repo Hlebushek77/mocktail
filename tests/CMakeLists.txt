@@ -685,6 +685,7 @@ add_executable(vulkan_etc2_diagnostics_test
   vulkan_etc2_diagnostics_test.cc
   ${PROJECT_SOURCE_DIR}/src/graphics/vulkan_etc2_emulation.cc
   ${PROJECT_SOURCE_DIR}/src/graphics/vulkan_etc2_planning.cc
+  ${PROJECT_SOURCE_DIR}/src/graphics/vulkan_etc2_gpu_plan.cc
   ${PROJECT_SOURCE_DIR}/src/graphics/chunk_arena.cc
   ${PROJECT_SOURCE_DIR}/src/graphics/etc2_decode_totals.cc
   ${PROJECT_SOURCE_DIR}/src/graphics/etc2_decoder.cc
@@ -710,6 +711,7 @@ mocktail_apply_compile_options(vulkan_etc2_diagnostics_test)
 add_library(mocktail_etc2_emulation_for_tests STATIC
   ${PROJECT_SOURCE_DIR}/src/graphics/vulkan_etc2_emulation.cc
   ${PROJECT_SOURCE_DIR}/src/graphics/vulkan_etc2_planning.cc
+  ${PROJECT_SOURCE_DIR}/src/graphics/vulkan_etc2_gpu_plan.cc
   ${PROJECT_SOURCE_DIR}/src/graphics/chunk_arena.cc
   ${PROJECT_SOURCE_DIR}/src/graphics/etc2_decode_totals.cc
   ${PROJECT_SOURCE_DIR}/src/graphics/etc2_decoder.cc
@@ -775,6 +777,14 @@ target_link_libraries(vulkan_etc2_emulation_test PRIVATE
   GTest::gtest_main
 )
 mocktail_apply_compile_options(vulkan_etc2_emulation_test)
+
+# The GPU route's pure planning (plus.2 WP2).
+add_executable(vulkan_etc2_gpu_plan_test vulkan_etc2_gpu_plan_test.cc)
+target_link_libraries(vulkan_etc2_gpu_plan_test PRIVATE
+  mocktail_etc2_emulation_for_tests
+  GTest::gtest_main
+)
+mocktail_apply_compile_options(vulkan_etc2_gpu_plan_test)
 
 add_executable(etc2_emulation_gpu_test etc2_emulation_gpu_test.cc)
 target_link_libraries(etc2_emulation_gpu_test PRIVATE
@@ -1353,6 +1363,7 @@ gtest_discover_tests(vulkan_etc2_planning_test)
 gtest_discover_tests(vulkan_etc2_emulation_test)
 gtest_discover_tests(worker_pool_test)
 gtest_discover_tests(mapped_memory_copy_test)
+gtest_discover_tests(vulkan_etc2_gpu_plan_test)
 # The committed SPIR-V header must match the GLSL it was generated from;
 # the check needs no shader compiler.
 add_test(NAME etc2_shader_header_test
