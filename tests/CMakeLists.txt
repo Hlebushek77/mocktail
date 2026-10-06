@@ -680,9 +680,9 @@ target_link_libraries(vulkan_etc2_diagnostics_test PRIVATE
 )
 mocktail_apply_compile_options(vulkan_etc2_diagnostics_test)
 
-# ETC2/EAC emulation harnesses (plus.2 WP0T): the plus.1 decoder and
-# resampler frozen as references. The emulation's sources are compiled here
-# directly, without the stub libvulkan.
+# ETC2/EAC emulation harnesses (plus.2 WP0T): the reference decoder and
+# resampler, and the GPU-free fake device with the golden scenarios. The
+# emulation is compiled here directly, without the stub libvulkan.
 add_library(mocktail_etc2_emulation_for_tests STATIC
   ${PROJECT_SOURCE_DIR}/src/graphics/vulkan_etc2_emulation.cc
   ${PROJECT_SOURCE_DIR}/src/graphics/vulkan_etc2_planning.cc
@@ -707,6 +707,9 @@ mocktail_apply_compile_options(mocktail_etc2_emulation_for_tests)
 add_library(mocktail_etc2_test_support STATIC
   support/etc2_reference_decoder.cc
   support/resample_reference.cc
+  support/fake_vulkan_device.cc
+  support/etc2_emulation_scenarios.cc
+  support/etc2_emulation_harness.cc
 )
 target_include_directories(mocktail_etc2_test_support PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}
@@ -729,6 +732,13 @@ target_link_libraries(resample_rgba_test PRIVATE
   GTest::gtest_main
 )
 mocktail_apply_compile_options(resample_rgba_test)
+
+add_executable(vulkan_etc2_emulation_test vulkan_etc2_emulation_test.cc)
+target_link_libraries(vulkan_etc2_emulation_test PRIVATE
+  mocktail_etc2_test_support
+  GTest::gtest_main
+)
+mocktail_apply_compile_options(vulkan_etc2_emulation_test)
 
 add_executable(video_driver_policy_test
   video_driver_policy_test.cc
@@ -1273,6 +1283,7 @@ gtest_discover_tests(chunk_arena_test)
 gtest_discover_tests(vulkan_etc2_diagnostics_test)
 gtest_discover_tests(etc2_decoder_test)
 gtest_discover_tests(resample_rgba_test)
+gtest_discover_tests(vulkan_etc2_emulation_test)
 gtest_discover_tests(video_driver_policy_test)
 gtest_discover_tests(wayland_global_probe_test)
 gtest_discover_tests(wayland_surface_commit_guard_test)
