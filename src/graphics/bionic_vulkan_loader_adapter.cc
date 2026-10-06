@@ -18,6 +18,7 @@
 
 #include "mocktail/graphics/android_vulkan_wsi_adapter.h"
 #include "mocktail/graphics/present_mode_policy.h"
+#include "mocktail/graphics/vulkan_etc2_caps.h"
 #include "mocktail/graphics/vulkan_etc2_emulation.h"
 #include "mocktail/graphics/vulkan_text_overlay_compositor.h"
 #include "mocktail/platform/platform_runtime.h"
@@ -1233,6 +1234,35 @@ bool Etc2EmulatedPhysicalDevice(VkPhysicalDevice physical_device) {
                            "vkGetPhysicalDeviceFeatures", nullptr));
 }
 
+// textureCompressionETC2 as the feature hooks report it.
+bool Etc2FeatureAdvertised(VkPhysicalDevice physical_device) {
+  return mocktail::graphics::Etc2FeatureAdvertised(
+      Etc2EmulatedPhysicalDevice(physical_device),
+      mocktail::graphics::Etc2SupportAdvertised());
+}
+
+// Whether the format-property hooks answer for ETC2/EAC with the emulated
+// features. Only while the feature is advertised too, so that with
+// MOCKTAIL_ADVERTISE_ETC2=0 the formats report what the driver reports;
+// MOCKTAIL_ETC2_FORMAT_PROPS=legacy keeps plus.1's answer for the DXT probe.
+bool Etc2FormatsAdvertised(VkPhysicalDevice physical_device) {
+  const bool emulated = Etc2EmulatedPhysicalDevice(physical_device);
+  const bool advertised = mocktail::graphics::Etc2SupportAdvertised();
+  const mocktail::graphics::Etc2FormatPropsMode mode =
+      mocktail::graphics::Etc2FormatPropsModeFromEnvironment();
+  if (emulated && !advertised &&
+      mode == mocktail::graphics::Etc2FormatPropsMode::kLegacy) {
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true, std::memory_order_relaxed)) {
+      std::fprintf(stderr,
+                   "  [vulkan] MOCKTAIL_ETC2_FORMAT_PROPS=legacy: ETC2/EAC "
+                   "formats report emulated features while "
+                   "textureCompressionETC2 is hidden\n");
+    }
+  }
+  return mocktail::graphics::Etc2FormatsAdvertised(emulated, advertised, mode);
+}
+
 void ReleaseEtc2PoolCommandBuffers(VkDevice device,
                                    VkCommandPool command_pool) {
   std::vector<VkCommandBuffer> command_buffers;
@@ -2362,8 +2392,7 @@ VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures(
     return;
   }
   host(physical_device, features);
-  if (Etc2EmulatedPhysicalDevice(physical_device) &&
-      mocktail::graphics::Etc2SupportAdvertised()) {
+  if (Etc2FeatureAdvertised(physical_device)) {
     features->textureCompressionETC2 = VK_TRUE;
   }
 }
@@ -2376,8 +2405,7 @@ VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(
     return;
   }
   host(physical_device, features);
-  if (Etc2EmulatedPhysicalDevice(physical_device) &&
-      mocktail::graphics::Etc2SupportAdvertised()) {
+  if (Etc2FeatureAdvertised(physical_device)) {
     features->features.textureCompressionETC2 = VK_TRUE;
   }
 }
@@ -2393,7 +2421,7 @@ VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFormatProperties(
   }
   mocktail::graphics::Etc2EmulatedFormat mapped;
   if (!mocktail::graphics::LookupEmulatedEtc2Format(format, &mapped) ||
-      !Etc2EmulatedPhysicalDevice(physical_device)) {
+      !Etc2FormatsAdvertised(physical_device)) {
     host(physical_device, format, properties);
     return;
   }
@@ -2417,7 +2445,7 @@ VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFormatProperties2(
   }
   mocktail::graphics::Etc2EmulatedFormat mapped;
   if (!mocktail::graphics::LookupEmulatedEtc2Format(format, &mapped) ||
-      !Etc2EmulatedPhysicalDevice(physical_device)) {
+      !Etc2FormatsAdvertised(physical_device)) {
     host(physical_device, format, properties);
     return;
   }
@@ -2452,7 +2480,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceImageFormatProperties(
   }
   mocktail::graphics::Etc2EmulatedFormat mapped;
   if (!mocktail::graphics::LookupEmulatedEtc2Format(format, &mapped) ||
-      !Etc2EmulatedPhysicalDevice(physical_device)) {
+      !Etc2FormatsAdvertised(physical_device)) {
     return host(physical_device, format, type, tiling, usage, flags,
                 properties);
   }
@@ -2478,7 +2506,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceImageFormatProperties2(
   }
   mocktail::graphics::Etc2EmulatedFormat mapped;
   if (!mocktail::graphics::LookupEmulatedEtc2Format(info->format, &mapped) ||
-      !Etc2EmulatedPhysicalDevice(physical_device)) {
+      !Etc2FormatsAdvertised(physical_device)) {
     return host(physical_device, info, properties);
   }
   if (info->tiling != VK_IMAGE_TILING_OPTIMAL ||
