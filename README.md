@@ -155,11 +155,11 @@ Requirements:
 - A Vulkan driver for the default `direct-vulkan` graphics backend, or
   OpenGL ES 3.0 for `graphics.backend: opengl`.
 
-Download `mocktail-plus-1.0.4.plus.1-1-x86_64.pkg.tar.zst` from the
-`v1.0.4-plus.1` release and install it:
+Download `mocktail-plus-1.0.4.plus.2-1-x86_64.pkg.tar.zst` from the
+`v1.0.4-plus.2` release and install it:
 
 ```bash
-sudo pacman -U ./mocktail-plus-1.0.4.plus.1-1-x86_64.pkg.tar.zst
+sudo pacman -U ./mocktail-plus-1.0.4.plus.2-1-x86_64.pkg.tar.zst
 ```
 
 The package conflicts with `mocktail`, `mocktail-bin`, `mocktail-git` and

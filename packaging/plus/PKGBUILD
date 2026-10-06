@@ -7,9 +7,9 @@
 # file and published only as GitHub Release assets.
 
 pkgname=mocktail-plus
-pkgver=1.0.4.plus.1
+pkgver=1.0.4.plus.2
 pkgrel=1
-_tag="v${pkgver/.plus./-plus.}" # 1.0.4.plus.1 -> v1.0.4-plus.1
+_tag="v${pkgver/.plus./-plus.}" # 1.0.4.plus.2 -> v1.0.4-plus.2
 _vkh_commit=8d6039a455a7ecc7d2a592ff97f62db4e59b70bf # third_party/Vulkan-Headers gitlink (v1.4.356)
 pkgdesc='Android x86-64 Roblox compatibility runtime for Linux (unofficial Mocktail fork with a settings window and fixes)'
 arch=('x86_64')
