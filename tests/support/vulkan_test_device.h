@@ -16,7 +16,8 @@ namespace mocktail::graphics::testing {
 
 // [CR-25] A GPU test running while the main session measures a live game
 // skews its fps, GPU time and VRAM. Like plus2-design/guard.sh (pgrep -x
-// mocktail, pgrep -x sober), this finds such a process by its exact name.
+// mocktail, pgrep -x sober), this finds such a process by its exact name,
+// leaving out the ones another test of the same ctest run started.
 bool LiveGameRunning(std::string* description);
 
 #define MOCKTAIL_VULKAN_TEST_INSTANCE_FUNCTIONS(X) \
