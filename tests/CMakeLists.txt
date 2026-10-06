@@ -693,6 +693,7 @@ add_executable(vulkan_etc2_diagnostics_test
   ${PROJECT_SOURCE_DIR}/src/graphics/texture_override.cc
   ${PROJECT_SOURCE_DIR}/src/graphics/worker_pool.cc
   ${PROJECT_SOURCE_DIR}/src/graphics/mapped_memory_copy.cc
+  ${PROJECT_SOURCE_DIR}/src/graphics/bc_encoder.cc
 )
 target_include_directories(vulkan_etc2_diagnostics_test PRIVATE
   ${PROJECT_SOURCE_DIR}/include
@@ -720,6 +721,10 @@ add_library(mocktail_etc2_emulation_for_tests STATIC
   ${PROJECT_SOURCE_DIR}/src/graphics/texture_override.cc
   ${PROJECT_SOURCE_DIR}/src/graphics/worker_pool.cc
   ${PROJECT_SOURCE_DIR}/src/graphics/mapped_memory_copy.cc
+)
+# ETC2->BC mode (plus.2 WP3).
+target_sources(mocktail_etc2_emulation_for_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/graphics/bc_encoder.cc
 )
 target_include_directories(mocktail_etc2_emulation_for_tests PUBLIC
   ${PROJECT_SOURCE_DIR}/include
@@ -849,6 +854,16 @@ target_link_libraries(etc2_gpu_route_test PRIVATE
   GTest::gtest_main
 )
 mocktail_apply_compile_options(etc2_gpu_route_test)
+
+# ETC2->BC mode (plus.2 WP3): the CPU BC encoder against the frozen
+# reference, and the emulation's BC images, views and capabilities on the
+# fake device.
+add_executable(bc_encoder_test bc_encoder_test.cc)
+target_link_libraries(bc_encoder_test PRIVATE
+  mocktail_etc2_test_support
+  GTest::gtest_main
+)
+mocktail_apply_compile_options(bc_encoder_test)
 
 add_executable(video_driver_policy_test
   video_driver_policy_test.cc
@@ -1406,6 +1421,8 @@ gtest_discover_tests(vulkan_etc2_gpu_route_test)
 add_test(NAME etc2_shader_header_test
   COMMAND ${PROJECT_SOURCE_DIR}/scripts/gen-etc2-shaders.sh --check
 )
+
+gtest_discover_tests(bc_encoder_test)
 # Real GPU: skipped without a loader, driver or device, and while a live game
 # runs (CR-25). Hold these back with -LE gpu while a live measurement runs.
 gtest_discover_tests(etc2_emulation_gpu_test PROPERTIES LABELS gpu)
