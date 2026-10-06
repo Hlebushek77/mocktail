@@ -116,6 +116,10 @@ add_library(stub_vulkan SHARED
 )
 configure_stub(stub_vulkan "libvulkan.so")
 target_include_directories(stub_vulkan PRIVATE ${CMAKE_SOURCE_DIR}/include)
+# MOCKTAIL_VK_CALL_STATS counting wrappers (plus.2 DXT probe).
+target_sources(stub_vulkan PRIVATE
+  ${CMAKE_SOURCE_DIR}/src/graphics/vulkan_call_stats.cc
+)
 pkg_check_modules(LIBPLACEBO REQUIRED IMPORTED_TARGET libplacebo)
 pkg_check_modules(LIBPNG REQUIRED IMPORTED_TARGET libpng)
 target_link_libraries(stub_vulkan PRIVATE

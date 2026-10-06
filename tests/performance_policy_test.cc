@@ -2,6 +2,14 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdlib>
+#include <initializer_list>
+#include <iterator>
+#include <map>
+#include <optional>
+#include <tuple>
+#include <utility>
+
 #define JSON_NOEXCEPTION 1
 #include <nlohmann/json.hpp>
 #include <string>
@@ -9,6 +17,492 @@
 namespace mocktail {
 namespace runtime {
 namespace {
+
+// Sets (or, with nullptr, unsets) one variable for the scope of a test and
+// restores the previous value afterwards.
+class ScopedEnvironmentVariable final {
+ public:
+  ScopedEnvironmentVariable(const char* name, const char* value)
+      : name_(name) {
+    if (const char* previous = std::getenv(name); previous != nullptr) {
+      previous_ = previous;
+    }
+    if (value != nullptr) {
+      setenv(name, value, 1);
+    } else {
+      unsetenv(name);
+    }
+  }
+  ~ScopedEnvironmentVariable() {
+    if (previous_.has_value()) {
+      setenv(name_, previous_->c_str(), 1);
+    } else {
+      unsetenv(name_);
+    }
+  }
+  ScopedEnvironmentVariable(const ScopedEnvironmentVariable&) = delete;
+  ScopedEnvironmentVariable& operator=(const ScopedEnvironmentVariable&) =
+      delete;
+
+ private:
+  const char* name_;
+  std::optional<std::string> previous_;
+};
+
+// The default startup configuration: throughput physics workers (the
+// runtime-config default), multithreaded rendering off, quality unset.
+PerformancePolicy DefaultThroughputPolicy() {
+  PerformancePolicy policy;
+  policy.physical_core_count = 8;
+  policy.physics_worker_mode = PhysicsWorkerMode::kThroughput;
+  return policy;
+}
+
+// Every key and value the default configuration sends, frozen from
+// v1.0.4-plus.1, so a change to the preset is always a deliberate one.
+nlohmann::json Plus1DefaultPreset() {
+  return {
+      {"FIntTaskSchedulerThreadMin", "0"},
+      {"FIntTaskSchedulerAsyncTasksMinimumThreadCount", "3"},
+      {"FIntTaskSchedulerAutoThreadLimit", "8"},
+      {"DFIntSimMidPhaseContactPipelineBatchSize", "128"},
+      {"FIntSmoothClusterTaskQueueMaxParallelTasks", "8"},
+      {"FIntOcclusionWorkerThreadCount", "4"},
+      {"FFlagMovePrerenderV2", "True"},
+      {"FFlagGcInParallelWithRenderPrepare3", "True"},
+      {"FIntRenderTextureMipBias", "1"},
+      {"FFlagSimRuntimeContentTranscodeBlockingCall", "False"},
+      {"FFlagRenderEnableLowEndLOD", "True"},
+      {"FIntTerrainArraySliceSize", "4"},
+      {"FFlagFastGPULightGrid", "True"},
+      {"FFlagRenderOptimizeLightGrid", "True"},
+      {"FFlagRenderFixParticlesCulling", "True"},
+      {"FFlagLuauIncrementalGC", "True"},
+      {"FIntLuauGcStepMultiplier", "100"},
+      {"FIntLuauGcGoalRatio", "200"},
+      {"FIntAssetProviderThreads", "2"},
+      {"FFlagUITextureCompressionDesktop", "True"},
+      {"FFlagTCTextureCompressionDesktop", "True"},
+      {"FFlagUITextureUncompressed", "False"},
+      {"FFlagGpuVoxelCompression", "True"},
+      {"FFlagMeshCompression", "True"},
+      {"FFlagPhysicsMeshCompression", "True"},
+      {"FFlagSupportMeshLOD", "True"},
+      {"FFlagMeshLOD", "True"},
+      {"FFlagMeshLodApplyGeomMeshOptimizer", "False"},
+      {"FFlagAdaptiveMeshCacheSizeForAndroid", "True"},
+      {"FIntDefaultMeshCacheSizeMB", "64"},
+      {"FIntRenderMeshOrphanBudgetMB", "8"},
+      {"FIntTerrainGpuMeshMemoryTargetMib", "32"},
+      {"FIntAvatarMeshMemoryMax", "33554432"},
+      {"FIntSmoothTerrainPhysicsCacheSize", "32"},
+      {"FIntRenderTextureTotalBudgetMB", "128"},
+      {"FIntRenderTextureOrphanBudgetMB", "8"},
+      {"FFlagDebugTerrainVTCompressedTextures", "True"},
+      {"FFlagStreamingObserverMemoryOptimization", "True"},
+      {"FIntNetworkStreamingGCMaxMicroSecondLimit", "5000"},
+      {"FFlagfeatureFastClusterCacheEnabled", "True"},
+      {"FFlagEnableMultiVETextureManagerSharing", "True"},
+      {"FFlagVulkanCompressedTextureAliasing", "True"},
+      {"FFlagCSGPublishDedupSolidMesh", "True"},
+      {"FFlagDeduplicateLodRemovalRegions", "True"},
+      {"FFlagCurlUsePools", "True"},
+      {"FIntRenderTextureCompositorBudget", "32"},
+      {"FIntTextureCompositorActiveJobs", "1"},
+      {"FIntTextureCompositorLowResFactor", "2"},
+      {"FIntTextureCompositorMeshCache", "16"},
+      {"FFlagContentProviderMmapAssets", "True"},
+      {"FIntAssetProviderAssetCacheReadThreadCount", "1"},
+      {"FIntAssetProviderAssetCacheWriteThreadCount", "1"},
+      {"FIntInitialAudioAssetCacheSize", "32"},
+      {"FIntAvatarTextureMemoryMax", "33554432"},
+      {"FFlagEnableSLIMAvatars", "True"},
+      {"FFlagEnableSlimAvatarsDefaultEnabled", "True"},
+      {"FFlagLayeredClothingCacheOptimizations", "True"},
+      {"FFlagRenderAllocateShadowMapResourcesOnDemand", "True"},
+      {"FIntRenderShadowMapDepthCacheMemLimit", "16"},
+      {"FIntTM2ShadowMapMaxMips", "1"},
+      {"FIntDebugForceMSAASamples", "1"},
+      {"FFlagLuauStartupGcSuppression", "False"},
+      {"FIntLuauGcStepMul", "300"},
+      {"FIntLuauGcGoalCore", "120"},
+      {"FIntLuauGcStartupWorkingSetMb", "64"},
+      {"FIntLuaGcMaxKb", "262144"},
+      {"FIntTaskSchedulerMaxTempArenaSizeBytes", "16777216"},
+      {"FFlagLocalStorageArenaOptimization", "True"},
+      {"FIntProjectedMaxBytesUsedForSoundsMB", "32"},
+      {"FIntAudioMetadataCacheSizeKB", "2048"},
+      {"FIntDefaultAudioDecodeBufferSizeMs", "50"},
+      {"FIntMaxAudibleSoundChannels", "32"},
+      {"FIntDebugFRMQualityLevelOverride", "3"},
+  };
+}
+
+nlohmann::json MergeDefault(const PerformancePolicy& policy) {
+  std::string merged;
+  std::string error;
+  EXPECT_TRUE(
+      MergePerformanceClientSettingsOverrides(policy, "{}", &merged, &error))
+      << error;
+  return nlohmann::json::parse(merged, nullptr, false, true);
+}
+
+// Unsets the quality level and both rendering-preset knobs, or sets the
+// knobs to the given spellings.
+class PresetEnvironment final {
+ public:
+  explicit PresetEnvironment(const char* texture_budget_mb = nullptr,
+                             const char* texture_compression = nullptr)
+      : quality_("MOCKTAIL_GRAPHICS_QUALITY", nullptr),
+        budget_("MOCKTAIL_TEXTURE_BUDGET_MB", texture_budget_mb),
+        compression_("MOCKTAIL_PRESET_TEXTURE_COMPRESSION",
+                     texture_compression) {}
+
+ private:
+  ScopedEnvironmentVariable quality_;
+  ScopedEnvironmentVariable budget_;
+  ScopedEnvironmentVariable compression_;
+};
+
+nlohmann::json Without(nlohmann::json object,
+                       std::initializer_list<const char*> names) {
+  for (const char* name : names) {
+    EXPECT_EQ(object.erase(name), 1U) << name;
+  }
+  return object;
+}
+
+TEST(PerformancePolicyTest, DefaultPresetIsUnchangedFromPlus1) {
+  const PresetEnvironment environment;
+  const nlohmann::json merged = MergeDefault(DefaultThroughputPolicy());
+  const nlohmann::json expected = Plus1DefaultPreset();
+  EXPECT_EQ(merged, expected);
+  EXPECT_EQ(merged.size(), 73U);
+  for (const auto& [name, value] : expected.items()) {
+    EXPECT_EQ(merged.value(name, nlohmann::json()), value) << name;
+  }
+}
+
+TEST(PerformancePolicyTest, KnobsAtTheirDefaultsKeepEveryModeIdentical) {
+  PerformancePolicy multithreaded;
+  multithreaded.multithreaded_rendering = true;
+  multithreaded.physical_core_count = 14;
+  PerformancePolicy latency = multithreaded;
+  latency.physics_worker_mode = PhysicsWorkerMode::kLatency;
+  const PerformancePolicy disabled;
+  for (const PerformancePolicy& policy :
+       {DefaultThroughputPolicy(), multithreaded, latency, disabled}) {
+    std::string unset_json;
+    std::string error;
+    {
+      const PresetEnvironment environment;
+      ASSERT_TRUE(MergePerformanceClientSettingsOverrides(
+          policy, R"({"FFlagDebugDisplayFPS":"True"})", &unset_json, &error))
+          << error;
+    }
+    for (const auto& [budget, compression] :
+         std::initializer_list<std::pair<const char*, const char*>>{
+             {"", ""}, {nullptr, "on"}, {"", "on"}}) {
+      const PresetEnvironment environment(budget, compression);
+      std::string spelled_json;
+      ASSERT_TRUE(MergePerformanceClientSettingsOverrides(
+          policy, R"({"FFlagDebugDisplayFPS":"True"})", &spelled_json,
+          &error))
+          << error;
+      EXPECT_EQ(spelled_json, unset_json);
+    }
+  }
+}
+
+TEST(PerformancePolicyTest, ParsesRenderingPresetKnobs) {
+  RenderingPresetKnobs knobs;
+  std::string error;
+  ASSERT_TRUE(ParseRenderingPresetKnobs(nullptr, nullptr, &knobs, &error));
+  EXPECT_TRUE(knobs.is_default());
+  ASSERT_TRUE(ParseRenderingPresetKnobs("", "", &knobs, &error));
+  EXPECT_TRUE(knobs.is_default());
+  ASSERT_TRUE(ParseRenderingPresetKnobs(nullptr, "on", &knobs, &error));
+  EXPECT_TRUE(knobs.is_default());
+
+  for (const auto& [text, value] :
+       std::initializer_list<std::pair<const char*, int>>{
+           {"16", 16}, {"128", 128}, {"512", 512}, {"0320", 320},
+           {"4095", 4095}}) {
+    ASSERT_TRUE(ParseRenderingPresetKnobs(text, nullptr, &knobs, &error))
+        << text;
+    EXPECT_EQ(knobs.texture_budget_mb, value) << text;
+    EXPECT_FALSE(knobs.roblox_texture_budget);
+    EXPECT_TRUE(knobs.texture_compression_flags);
+    EXPECT_FALSE(knobs.is_default());
+  }
+
+  ASSERT_TRUE(ParseRenderingPresetKnobs("roblox", "off", &knobs, &error));
+  EXPECT_EQ(knobs.texture_budget_mb, 0);
+  EXPECT_TRUE(knobs.roblox_texture_budget);
+  EXPECT_FALSE(knobs.texture_compression_flags);
+
+  for (const char* invalid : {"0", "15", "4096", "-1", "+512", " 512",
+                              "512MB", "1e3", "Roblox", "auto",
+                              "99999999999"}) {
+    RenderingPresetKnobs untouched;
+    untouched.texture_budget_mb = 77;
+    error.clear();
+    EXPECT_FALSE(
+        ParseRenderingPresetKnobs(invalid, nullptr, &untouched, &error))
+        << invalid;
+    EXPECT_EQ(untouched.texture_budget_mb, 77) << invalid;
+    EXPECT_NE(error.find("MOCKTAIL_TEXTURE_BUDGET_MB"), std::string::npos)
+        << invalid;
+  }
+  for (const char* invalid : {"0", "1", "false", "true", "OFF", "no"}) {
+    error.clear();
+    EXPECT_FALSE(ParseRenderingPresetKnobs(nullptr, invalid, &knobs, &error))
+        << invalid;
+    EXPECT_NE(error.find("MOCKTAIL_PRESET_TEXTURE_COMPRESSION"),
+              std::string::npos)
+        << invalid;
+  }
+  EXPECT_FALSE(ParseRenderingPresetKnobs(nullptr, nullptr, nullptr, &error));
+}
+
+TEST(PerformancePolicyTest, TextureBudgetKnobReplacesOnlyTheTotalBudget) {
+  const PresetEnvironment environment("512");
+  nlohmann::json expected = Plus1DefaultPreset();
+  expected["FIntRenderTextureTotalBudgetMB"] = "512";
+  EXPECT_EQ(MergeDefault(DefaultThroughputPolicy()), expected);
+}
+
+TEST(PerformancePolicyTest, RobloxTextureBudgetLeavesBothBudgetsToRoblox) {
+  {
+    const PresetEnvironment environment("roblox");
+    EXPECT_EQ(MergeDefault(DefaultThroughputPolicy()),
+              Without(Plus1DefaultPreset(),
+                      {"FIntRenderTextureTotalBudgetMB",
+                       "FIntRenderTextureOrphanBudgetMB"}));
+
+    // The budgets are no longer the preset's, so fflags.json may set them.
+    std::string merged;
+    std::string error;
+    ASSERT_TRUE(MergePerformanceClientSettingsOverrides(
+        DefaultThroughputPolicy(),
+        R"({"FIntRenderTextureTotalBudgetMB":"1024"})", &merged, &error))
+        << error;
+    EXPECT_EQ(nlohmann::json::parse(merged).at(
+                  "FIntRenderTextureTotalBudgetMB"),
+              "1024");
+  }
+  const PresetEnvironment environment;
+  std::string merged;
+  std::string error;
+  EXPECT_FALSE(MergePerformanceClientSettingsOverrides(
+      DefaultThroughputPolicy(),
+      R"({"FIntRenderTextureTotalBudgetMB":"1024"})", &merged, &error));
+  EXPECT_NE(error.find("FIntRenderTextureTotalBudgetMB"), std::string::npos);
+}
+
+TEST(PerformancePolicyTest, TextureCompressionOffLeavesOutOnlyItsFiveFlags) {
+  const PresetEnvironment environment(nullptr, "off");
+  EXPECT_EQ(MergeDefault(DefaultThroughputPolicy()),
+            Without(Plus1DefaultPreset(),
+                    {"FFlagUITextureCompressionDesktop",
+                     "FFlagTCTextureCompressionDesktop",
+                     "FFlagUITextureUncompressed",
+                     "FFlagDebugTerrainVTCompressedTextures",
+                     "FFlagVulkanCompressedTextureAliasing"}));
+}
+
+TEST(PerformancePolicyTest, CombinesBothKnobs) {
+  const PresetEnvironment environment("320", "off");
+  nlohmann::json expected =
+      Without(Plus1DefaultPreset(),
+              {"FFlagUITextureCompressionDesktop",
+               "FFlagTCTextureCompressionDesktop", "FFlagUITextureUncompressed",
+               "FFlagDebugTerrainVTCompressedTextures",
+               "FFlagVulkanCompressedTextureAliasing"});
+  expected["FIntRenderTextureTotalBudgetMB"] = "320";
+  EXPECT_EQ(MergeDefault(DefaultThroughputPolicy()), expected);
+}
+
+TEST(PerformancePolicyTest, InvalidKnobFailsTheStartAndNamesTheVariable) {
+  for (const auto& [budget, compression, variable] :
+       std::initializer_list<std::tuple<const char*, const char*, const char*>>{
+           {"lots", nullptr, "MOCKTAIL_TEXTURE_BUDGET_MB"},
+           {nullptr, "disabled", "MOCKTAIL_PRESET_TEXTURE_COMPRESSION"}}) {
+    const PresetEnvironment environment(budget, compression);
+    // Invalid even where the preset is not applied, so a typo never passes
+    // silently.
+    for (const PerformancePolicy& policy :
+         {DefaultThroughputPolicy(), PerformancePolicy{}}) {
+      std::string merged = "unchanged";
+      std::string error;
+      EXPECT_FALSE(
+          MergePerformanceClientSettingsOverrides(policy, "{}", &merged,
+                                                  &error));
+      EXPECT_EQ(merged, "unchanged");
+      EXPECT_NE(error.find(variable), std::string::npos) << error;
+    }
+    std::string merged = "unchanged";
+    std::string error;
+    EXPECT_FALSE(MergeRuntimeClientSettingsOverrides(
+        ParseFrameRatePolicy("60"), DefaultThroughputPolicy(), "{}", &merged,
+        &error));
+    EXPECT_EQ(merged, "unchanged");
+    EXPECT_NE(error.find(variable), std::string::npos) << error;
+  }
+}
+
+TEST(PerformancePolicyTest, DescribesActiveKnobsForTheStartupLog) {
+  RenderingPresetKnobs knobs;
+  EXPECT_EQ(DescribeRenderingPresetKnobs(knobs), "");
+  knobs.texture_budget_mb = 512;
+  EXPECT_EQ(DescribeRenderingPresetKnobs(knobs),
+            "FIntRenderTextureTotalBudgetMB=512 (MOCKTAIL_TEXTURE_BUDGET_MB)");
+  knobs.texture_budget_mb = 0;
+  knobs.roblox_texture_budget = true;
+  knobs.texture_compression_flags = false;
+  EXPECT_EQ(DescribeRenderingPresetKnobs(knobs),
+            "texture budgets left to Roblox "
+            "(MOCKTAIL_TEXTURE_BUDGET_MB=roblox), texture-compression flags "
+            "left out (MOCKTAIL_PRESET_TEXTURE_COMPRESSION=off)");
+}
+
+// What Roblox does with each key of the default preset, from a scan of the
+// flag registrations in libroblox.so of Roblox 3092 (plus.2 research,
+// roblox-churn section 3). Roblox looks a client-settings key up only under
+// the prefix it registered the variable with, so FInt/FFlag spellings of a
+// DFInt/DFFlag variable are ignored, and so is a name the build does not
+// contain. The preset still sends every key: these lists only document the
+// finding so a later release can drop, respell or keep each key on purpose.
+// A key added to or removed from the preset must be classified here.
+
+// Registered with the prefix the preset uses: Roblox reads these.
+constexpr const char* kPresetKeysRobloxReads[] = {
+    "FIntTaskSchedulerThreadMin",
+    "FIntTaskSchedulerAsyncTasksMinimumThreadCount",
+    "FIntTaskSchedulerAutoThreadLimit",
+    "DFIntSimMidPhaseContactPipelineBatchSize",
+    "FIntSmoothClusterTaskQueueMaxParallelTasks",
+    "FIntOcclusionWorkerThreadCount",
+    "FFlagMovePrerenderV2",
+    "FIntTerrainArraySliceSize",
+    "FFlagGpuVoxelCompression",
+    "FFlagMeshLodApplyGeomMeshOptimizer",
+    "FIntDefaultMeshCacheSizeMB",
+    "FIntRenderMeshOrphanBudgetMB",
+    "FIntSmoothTerrainPhysicsCacheSize",
+    "FIntRenderTextureTotalBudgetMB",
+    "FIntRenderTextureOrphanBudgetMB",
+    "FFlagDebugTerrainVTCompressedTextures",
+    "FFlagStreamingObserverMemoryOptimization",
+    "FFlagEnableMultiVETextureManagerSharing",
+    "FFlagDeduplicateLodRemovalRegions",
+    "FFlagCurlUsePools",
+    "FIntTextureCompositorLowResFactor",
+    "FFlagContentProviderMmapAssets",
+    "FFlagEnableSlimAvatarsDefaultEnabled",
+    "FIntRenderShadowMapDepthCacheMemLimit",
+    "FIntDebugForceMSAASamples",
+    "FFlagLuauStartupGcSuppression",
+    "FIntLuauGcGoalCore",
+    "FIntLuauGcStartupWorkingSetMb",
+    "FIntTaskSchedulerMaxTempArenaSizeBytes",
+    "FIntAudioMetadataCacheSizeKB",
+    "FIntDefaultAudioDecodeBufferSizeMs",
+};
+
+// No-ops: registered as DFInt/DFFlag, sent without the D. Among them the
+// FRM quality level that engine.graphics_quality sets, and the mip bias.
+constexpr const char* kPresetKeysRegisteredWithDf[] = {
+    "FIntRenderTextureMipBias",
+    "FFlagUITextureCompressionDesktop",
+    "FFlagTCTextureCompressionDesktop",
+    "FFlagUITextureUncompressed",
+    "FFlagMeshCompression",
+    "FIntTerrainGpuMeshMemoryTargetMib",
+    "FIntNetworkStreamingGCMaxMicroSecondLimit",
+    "FFlagCSGPublishDedupSolidMesh",
+    "FIntTextureCompositorActiveJobs",
+    "FIntAssetProviderAssetCacheReadThreadCount",
+    "FIntAssetProviderAssetCacheWriteThreadCount",
+    "FIntInitialAudioAssetCacheSize",
+    "FIntLuauGcStepMul",
+    "FIntLuaGcMaxKb",
+    "FFlagLocalStorageArenaOptimization",
+    "FIntProjectedMaxBytesUsedForSoundsMB",
+    "FIntMaxAudibleSoundChannels",
+    "FIntDebugFRMQualityLevelOverride",
+};
+
+// No-ops: the name exists, but not as an integer variable.
+// RenderTextureCompositorBudget is an FLog channel and AvatarTextureMemoryMax
+// a telemetry key.
+constexpr const char* kPresetKeysThatAreNotVariables[] = {
+    "FIntRenderTextureCompositorBudget",
+    "FIntAvatarTextureMemoryMax",
+};
+
+// No-ops: the name does not occur anywhere in libroblox.so of Roblox 3092.
+constexpr const char* kPresetKeysUnknownToRoblox[] = {
+    "FFlagGcInParallelWithRenderPrepare3",
+    "FFlagSimRuntimeContentTranscodeBlockingCall",
+    "FFlagRenderEnableLowEndLOD",
+    "FFlagFastGPULightGrid",
+    "FFlagRenderOptimizeLightGrid",
+    "FFlagRenderFixParticlesCulling",
+    "FFlagLuauIncrementalGC",
+    "FIntLuauGcStepMultiplier",
+    "FIntLuauGcGoalRatio",
+    "FIntAssetProviderThreads",
+    "FFlagMeshLOD",
+    "FFlagAdaptiveMeshCacheSizeForAndroid",
+    "FIntTextureCompositorMeshCache",
+};
+
+// Registered, but the scan could not tell with which prefix.
+constexpr const char* kPresetKeysWithUnknownScope[] = {
+    "FFlagPhysicsMeshCompression",
+    "FFlagSupportMeshLOD",
+    "FIntAvatarMeshMemoryMax",
+    "FFlagfeatureFastClusterCacheEnabled",
+    "FFlagVulkanCompressedTextureAliasing",
+    "FFlagEnableSLIMAvatars",
+    "FFlagLayeredClothingCacheOptimizations",
+    "FFlagRenderAllocateShadowMapResourcesOnDemand",
+    "FIntTM2ShadowMapMaxMips",
+};
+
+TEST(PerformancePolicyTest, ClassifiesEveryPresetKeyByWhetherRobloxReadsIt) {
+  const PresetEnvironment environment;
+  const nlohmann::json preset = MergeDefault(DefaultThroughputPolicy());
+  std::map<std::string, int> classified;
+  const auto classify = [&](const auto& keys) {
+    for (const char* key : keys) {
+      EXPECT_TRUE(preset.contains(key)) << key << " is no longer sent";
+      ++classified[key];
+    }
+  };
+  classify(kPresetKeysRobloxReads);
+  classify(kPresetKeysRegisteredWithDf);
+  classify(kPresetKeysThatAreNotVariables);
+  classify(kPresetKeysUnknownToRoblox);
+  classify(kPresetKeysWithUnknownScope);
+  for (const auto& [key, value] : preset.items()) {
+    (void)value;
+    EXPECT_EQ(classified[key], 1) << key;
+  }
+  EXPECT_EQ(classified.size(), preset.size());
+  // 33 of the 73 keys do nothing today.
+  EXPECT_EQ(std::size(kPresetKeysRegisteredWithDf) +
+                std::size(kPresetKeysThatAreNotVariables) +
+                std::size(kPresetKeysUnknownToRoblox),
+            33U);
+
+  // The DF spelling Roblox would read is not sent, so these stay no-ops
+  // until a release changes them on purpose.
+  for (const char* key : kPresetKeysRegisteredWithDf) {
+    EXPECT_FALSE(preset.contains(std::string("D") + key)) << key;
+  }
+}
 
 TEST(PerformancePolicyTest, ParsesDisabledByDefaultAndExplicitTrueValues) {
   EXPECT_FALSE(ParsePerformancePolicy("").multithreaded_rendering);

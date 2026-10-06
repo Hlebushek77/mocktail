@@ -1001,6 +1001,14 @@ int main(int argc, char* argv[]) {
                 << engine_worker_count << " scheduler workers, "
                 << std::max(1, engine_worker_count / 2)
                 << " occlusion workers\n";
+      mocktail::runtime::RenderingPresetKnobs knobs;
+      if (mocktail::runtime::RenderingPresetKnobsFromEnvironment(&knobs,
+                                                                 nullptr) &&
+          !knobs.is_default()) {
+        std::cout << "  [runtime] rendering preset development knobs: "
+                  << mocktail::runtime::DescribeRenderingPresetKnobs(knobs)
+                  << '\n';
+      }
     } else if (runtime_config.config.performance().multithreaded_rendering &&
                physics_worker_mode ==
                    mocktail::runtime::PhysicsWorkerMode::kLatency) {

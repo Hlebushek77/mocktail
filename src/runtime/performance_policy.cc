@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <cstdlib>
 #include <fstream>
 #include <limits>
 #include <nlohmann/json.hpp>
@@ -13,6 +14,7 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include "runtime/crash_report_policy.h"
 #include "runtime/http_client_policy.h"
@@ -51,6 +53,23 @@ bool ReadTopologyValue(int logical_cpu, std::string_view name, int* value) {
                            std::string(name);
   std::ifstream input(path);
   return static_cast<bool>(input >> *value);
+}
+
+// The preset's texture-compression flags, which
+// MOCKTAIL_PRESET_TEXTURE_COMPRESSION=off leaves out. Only the terrain flag is
+// known to take effect: Roblox registers the UI and TC ones as DFFlag and
+// ignores their FFlag spelling, and the aliasing flag's scope is unknown.
+bool IsPresetTextureCompressionFlag(std::string_view name) {
+  return name == "FFlagUITextureCompressionDesktop" ||
+         name == "FFlagTCTextureCompressionDesktop" ||
+         name == "FFlagUITextureUncompressed" ||
+         name == "FFlagDebugTerrainVTCompressedTextures" ||
+         name == "FFlagVulkanCompressedTextureAliasing";
+}
+
+bool IsPresetTextureBudget(std::string_view name) {
+  return name == "FIntRenderTextureTotalBudgetMB" ||
+         name == "FIntRenderTextureOrphanBudgetMB";
 }
 
 int LogicalCpuFallback(const cpu_set_t* allowed) {
@@ -130,6 +149,80 @@ PerformancePolicy ParsePerformancePolicy(
   return policy;
 }
 
+bool ParseRenderingPresetKnobs(const char* texture_budget_mb,
+                               const char* texture_compression,
+                               RenderingPresetKnobs* knobs,
+                               std::string* error) {
+  if (knobs == nullptr) {
+    if (error != nullptr) {
+      *error = "rendering preset knobs output is required";
+    }
+    return false;
+  }
+  RenderingPresetKnobs parsed;
+  const std::string_view budget =
+      texture_budget_mb != nullptr ? texture_budget_mb : "";
+  if (budget == "roblox") {
+    parsed.roblox_texture_budget = true;
+  } else if (!budget.empty()) {
+    const char* budget_end = budget.data() + budget.size();
+    const std::from_chars_result budget_parsed =
+        std::from_chars(budget.data(), budget_end, parsed.texture_budget_mb);
+    if (budget_parsed.ec != std::errc() || budget_parsed.ptr != budget_end ||
+        parsed.texture_budget_mb < kMinimumTextureBudgetKnobMb ||
+        parsed.texture_budget_mb > kMaximumTextureBudgetKnobMb) {
+      if (error != nullptr) {
+        *error =
+            "MOCKTAIL_TEXTURE_BUDGET_MB must be a whole number of MiB from " +
+            std::to_string(kMinimumTextureBudgetKnobMb) + " to " +
+            std::to_string(kMaximumTextureBudgetKnobMb) + ", or roblox";
+      }
+      return false;
+    }
+  }
+  const std::string_view compression =
+      texture_compression != nullptr ? texture_compression : "";
+  if (compression == "off") {
+    parsed.texture_compression_flags = false;
+  } else if (!compression.empty() && compression != "on") {
+    if (error != nullptr) {
+      *error = "MOCKTAIL_PRESET_TEXTURE_COMPRESSION must be on or off";
+    }
+    return false;
+  }
+  *knobs = parsed;
+  return true;
+}
+
+bool RenderingPresetKnobsFromEnvironment(RenderingPresetKnobs* knobs,
+                                         std::string* error) {
+  return ParseRenderingPresetKnobs(
+      std::getenv("MOCKTAIL_TEXTURE_BUDGET_MB"),
+      std::getenv("MOCKTAIL_PRESET_TEXTURE_COMPRESSION"), knobs, error);
+}
+
+std::string DescribeRenderingPresetKnobs(const RenderingPresetKnobs& knobs) {
+  std::string description;
+  const auto add = [&description](const std::string& part) {
+    if (!description.empty()) {
+      description += ", ";
+    }
+    description += part;
+  };
+  if (knobs.roblox_texture_budget) {
+    add("texture budgets left to Roblox (MOCKTAIL_TEXTURE_BUDGET_MB=roblox)");
+  } else if (knobs.texture_budget_mb != 0) {
+    add("FIntRenderTextureTotalBudgetMB=" +
+        std::to_string(knobs.texture_budget_mb) +
+        " (MOCKTAIL_TEXTURE_BUDGET_MB)");
+  }
+  if (!knobs.texture_compression_flags) {
+    add("texture-compression flags left out "
+        "(MOCKTAIL_PRESET_TEXTURE_COMPRESSION=off)");
+  }
+  return description;
+}
+
 int DetectAvailablePhysicalCoreCount() {
   cpu_set_t allowed;
   CPU_ZERO(&allowed);
@@ -176,6 +269,10 @@ bool MergePerformanceClientSettingsOverrides(const PerformancePolicy& policy,
     if (error != nullptr) {
       *error = "physics worker mode is invalid";
     }
+    return false;
+  }
+  RenderingPresetKnobs knobs;
+  if (!RenderingPresetKnobsFromEnvironment(&knobs, error)) {
     return false;
   }
   if (!policy.multithreaded_rendering &&
@@ -322,7 +419,23 @@ bool MergePerformanceClientSettingsOverrides(const PerformancePolicy& policy,
         {"FIntDefaultAudioDecodeBufferSizeMs", "50"},
         {"FIntMaxAudibleSoundChannels", "32"},
     }};
-    if (!apply_settings(rendering_settings)) {
+    const std::string texture_budget = std::to_string(knobs.texture_budget_mb);
+    std::vector<ClientSetting> preset;
+    preset.reserve(rendering_settings.size());
+    for (const ClientSetting& setting : rendering_settings) {
+      if ((!knobs.texture_compression_flags &&
+           IsPresetTextureCompressionFlag(setting.name)) ||
+          (knobs.roblox_texture_budget && IsPresetTextureBudget(setting.name))) {
+        continue;
+      }
+      if (knobs.texture_budget_mb != 0 &&
+          setting.name == "FIntRenderTextureTotalBudgetMB") {
+        preset.push_back({setting.name, texture_budget});
+        continue;
+      }
+      preset.push_back(setting);
+    }
+    if (!apply_settings(preset)) {
       return false;
     }
     if (!manual_quality) {
