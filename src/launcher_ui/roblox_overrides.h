@@ -30,20 +30,19 @@ struct GameSettings {
   std::string input_device;             // audio.input_device
   // device, or device.type of a detailed device: block.
   std::string device;
-  // Direct Vulkan renders on Intel integrated graphics, which get level 1
-  // by default (MachineProfile::RendersOnIntelIntegratedGraphics).
-  bool intel_integrated_vulkan = false;
 };
 
 enum class RobloxOverrideKind {
-  // performance_policy.cc FIntDebugFRMQualityLevelOverride: Roblox's
-  // Graphics Quality slider has no effect.
+  // performance_policy.cc DFIntDebugFRMQualityLevelOverride, for a level
+  // in engine.graphics_quality: Roblox's Graphics Quality slider has no
+  // effect.
   kGraphicsQuality,
-  // The rest of the rendering preset (performance_policy.cc
-  // rendering_settings): MSAA off (FIntDebugForceMSAASamples=1), a 128 MB
-  // texture budget (FIntRenderTextureTotalBudgetMB), a texture mip bias,
-  // low-end level of detail, one shadow-map mip and at most 32 sounds at
-  // once, whatever Roblox's graphics settings would choose.
+  // The rendering preset (performance_policy.cc rendering_settings), of
+  // which only keys Roblox reads are named: MSAA off
+  // (FIntDebugForceMSAASamples=1), a 128 MB texture budget
+  // (FIntRenderTextureTotalBudgetMB) and compressed terrain textures
+  // (FFlagDebugTerrainVTCompressedTextures), whatever Roblox's graphics
+  // settings would choose.
   kRenderingLimits,
   // frame_rate_policy.cc DFIntTaskSchedulerTargetFps: a target Roblox's
   // Maximum Frame Rate menu otherwise sets.
@@ -73,7 +72,6 @@ struct RobloxOverride {
   std::string key;
   // kGraphicsQuality: the forced level. kFrameRateTarget: the target.
   int number = 0;
-  // kGraphicsQuality: "default" or "level" (a level from config.yaml).
   // kFrameRateTarget: "unlimited" or "fixed". kTheme: system, light or
   // dark. kStartMode: windowed, maximized or fullscreen. kDevice: the
   // preset's canonical name (pc-windows-11, console-ps5).
@@ -114,10 +112,10 @@ std::vector<RobloxOwnedSetting> RobloxOwnedSettings(
 
 // Settings that work against each other in Roblox.
 enum class OverrideConflict {
-  // A level above Mocktail's default 3 while the preset keeps MSAA off and
-  // textures at 128 MB: the level gains less than it would.
+  // A level above 3 (of 21) is forced, while the preset keeps MSAA off and
+  // the texture budget at 128 MB.
   kHighLevelUnderPresetLimits,
-  // Roblox's slider picks the level, but the preset's other limits stay.
+  // Roblox's slider picks the level, but the preset's limits stay.
   kRobloxSliderUnderPresetLimits,
 };
 

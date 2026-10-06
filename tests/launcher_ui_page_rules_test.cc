@@ -274,10 +274,12 @@ const launcher::FastFlagConflict* FindConflict(
 TEST(LauncherUiPageRulesTest, FastFlagConflictsFollowTheQualitySetting) {
   const FastFlagsDocument document = FlagsDocument(
       R"({"DFIntTaskSchedulerTargetFps": 60,
-          "FIntDebugFRMQualityLevelOverride": 5,
+          "DFIntDebugFRMQualityLevelOverride": 5,
+          "FIntDebugFRMQualityLevelOverride": 3,
           "FFlagDebugDisplayFPS": true})");
   FastFlagSettings settings;
   settings.frame_rate_limit = "165";
+  settings.graphics_quality = "12";
   std::vector<launcher::FastFlagConflict> conflicts =
       FindFastFlagConflicts(document, settings);
   const launcher::FastFlagConflict* target =
@@ -285,29 +287,32 @@ TEST(LauncherUiPageRulesTest, FastFlagConflictsFollowTheQualitySetting) {
   ASSERT_NE(target, nullptr);
   EXPECT_EQ(target->managed_value, "165");
   EXPECT_EQ(target->effect, FastFlagConflictEffect::kBlocksStart);
-  // The preset (throughput) forces level 3 by default.
+  // A configured level is sent as DFIntDebugFRMQualityLevelOverride.
   const launcher::FastFlagConflict* quality =
-      FindConflict(conflicts, "FIntDebugFRMQualityLevelOverride");
+      FindConflict(conflicts, "DFIntDebugFRMQualityLevelOverride");
   ASSERT_NE(quality, nullptr);
-  EXPECT_EQ(quality->managed_value, "3");
+  EXPECT_EQ(quality->managed_value, "12");
   EXPECT_EQ(quality->effect, FastFlagConflictEffect::kBlocksStart);
+  // The FInt spelling, which Roblox ignores, is the user's own.
+  EXPECT_EQ(FindConflict(conflicts, "FIntDebugFRMQualityLevelOverride"),
+            nullptr);
   EXPECT_EQ(FindConflict(conflicts, "FFlagDebugDisplayFPS"), nullptr);
 
-  // A configured level that agrees, manual quality, or no preset: no
-  // quality conflict.
-  settings.graphics_quality = "5";
-  EXPECT_EQ(FindConflict(FindFastFlagConflicts(document, settings),
-                         "FIntDebugFRMQualityLevelOverride"),
-            nullptr);
-  settings.graphics_quality = "manual";
-  EXPECT_EQ(FindConflict(FindFastFlagConflicts(document, settings),
-                         "FIntDebugFRMQualityLevelOverride"),
-            nullptr);
-  settings.graphics_quality = "default";
+  // Without the preset the level is forced all the same.
   settings.physics_worker_mode = "latency";
-  EXPECT_EQ(FindConflict(FindFastFlagConflicts(document, settings),
-                         "FIntDebugFRMQualityLevelOverride"),
+  EXPECT_NE(FindConflict(FindFastFlagConflicts(document, settings),
+                         "DFIntDebugFRMQualityLevelOverride"),
             nullptr);
+  // A configured level that agrees, or the default and manual, which force
+  // none: no quality conflict.
+  settings.physics_worker_mode = "throughput";
+  for (const char* value : {"5", "default", "manual"}) {
+    settings.graphics_quality = value;
+    EXPECT_EQ(FindConflict(FindFastFlagConflicts(document, settings),
+                           "DFIntDebugFRMQualityLevelOverride"),
+              nullptr)
+        << value;
+  }
   // Roblox owning the frame rate: no target conflict.
   settings.frame_rate_limit = "-1";
   EXPECT_EQ(FindConflict(FindFastFlagConflicts(document, settings),
@@ -316,15 +321,19 @@ TEST(LauncherUiPageRulesTest, FastFlagConflictsFollowTheQualitySetting) {
 }
 
 TEST(LauncherUiPageRulesTest, ManagedQualityLevel) {
+  // performance_policy.cc: a level whatever the preset does, nothing for
+  // the default, manual and the variable's auto and 0.
   FastFlagSettings settings;
-  EXPECT_EQ(ManagedQualityLevel(settings), std::optional<std::string>("3"));
-  settings.intel_integrated_vulkan = true;
-  EXPECT_EQ(ManagedQualityLevel(settings), std::optional<std::string>("1"));
+  EXPECT_EQ(ManagedQualityLevel(settings), std::nullopt);
+  for (const char* none : {"manual", "auto", "0", "", "22"}) {
+    settings.graphics_quality = none;
+    EXPECT_EQ(ManagedQualityLevel(settings), std::nullopt) << none;
+  }
   settings.graphics_quality = "12";
   EXPECT_EQ(ManagedQualityLevel(settings), std::optional<std::string>("12"));
   settings.physics_worker_mode = "auto";
-  EXPECT_EQ(ManagedQualityLevel(settings), std::nullopt);
-  settings.multithreaded_rendering = "true";
+  EXPECT_EQ(ManagedQualityLevel(settings), std::optional<std::string>("12"));
+  settings.physics_worker_mode = "latency";
   EXPECT_EQ(ManagedQualityLevel(settings), std::optional<std::string>("12"));
 }
 

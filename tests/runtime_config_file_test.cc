@@ -192,9 +192,11 @@ TEST(RuntimeConfigBootstrapTest,
            "# String (default: native): sign in on Roblox's own welcome screen "
            "(native)\n  # or in Mocktail's browser sign-in window (browser).\n  "
            "sign_in: native",
-           "# Vulkan on Intel integrated graphics), manual leaves Roblox's "
-           "in-game\n  # graphics slider in control, and an integer from 1 to "
-           "21 forces that level.\n  graphics_quality: default",
+           "# String (default: default): Roblox's graphics quality level. "
+           "default\n  # leaves it to Roblox's own Graphics Quality setting "
+           "(manual means the\n  # same), and an integer from 1 to 21 forces "
+           "that level, whatever the\n  # performance settings; Roblox's "
+           "in-game slider then has no effect.\n  graphics_quality: default",
            "# String (default: auto): graphics card for direct Vulkan when the "
            "computer\n  # has more than one: auto, discrete, or integrated. "
            "auto prefers the\n  # discrete card unless DRI_PRIME or "
@@ -1552,35 +1554,38 @@ launcher:
   EXPECT_EQ(GetVariable("MOCKTAIL_LAUNCHER_SHOW_ON_START"), "1");
 }
 
-TEST(RuntimeConfigFileTest, DefaultGraphicsQualityLeavesThePresetInCharge) {
+TEST(RuntimeConfigFileTest, DefaultGraphicsQualityExportsNoLevel) {
   const ScopedEnvironment scoped({"MOCKTAIL_GRAPHICS_QUALITY"});
   TemporaryDirectory temporary;
   const std::filesystem::path file =
       temporary.Write("version: 1\nengine:\n  graphics_quality: default\n");
   std::string error;
 
-  // Unset stays unset, so the preset keeps its level 3.
+  // Unset stays unset: no level is forced.
   RuntimeConfigLoadResult loaded =
       LoadRuntimeConfig(ProcessEnvironment(), file);
   ASSERT_TRUE(loaded) << loaded.error;
   ASSERT_TRUE(ExportRuntimeConfigEnvironment(loaded.config, &error)) << error;
   EXPECT_EQ(GetVariable("MOCKTAIL_GRAPHICS_QUALITY"), std::nullopt);
 
-  // The Intel integrated graphics level the graphics launch policy
-  // publishes survives.
+  // A level in the variable wins over the YAML default and is kept.
   ASSERT_EQ(setenv("MOCKTAIL_GRAPHICS_QUALITY", "1", 1), 0);
   loaded = LoadRuntimeConfig(ProcessEnvironment(), file);
   ASSERT_TRUE(loaded) << loaded.error;
   ASSERT_TRUE(ExportRuntimeConfigEnvironment(loaded.config, &error)) << error;
   EXPECT_EQ(GetVariable("MOCKTAIL_GRAPHICS_QUALITY"), "1");
 
-  // The preset does not know the word "default"; it must never see it.
-  ASSERT_EQ(setenv("MOCKTAIL_GRAPHICS_QUALITY", "default", 1), 0);
-  loaded = LoadRuntimeConfig(ProcessEnvironment(), file);
-  ASSERT_TRUE(loaded) << loaded.error;
-  EXPECT_EQ(loaded.config.engine().graphics_quality, GraphicsQuality{});
-  ASSERT_TRUE(ExportRuntimeConfigEnvironment(loaded.config, &error)) << error;
-  EXPECT_EQ(GetVariable("MOCKTAIL_GRAPHICS_QUALITY"), std::nullopt);
+  // The words for the default, and an empty variable, leave it unset.
+  for (const char* value : {"default", ""}) {
+    ASSERT_EQ(setenv("MOCKTAIL_GRAPHICS_QUALITY", value, 1), 0);
+    loaded = LoadRuntimeConfig(ProcessEnvironment(), file);
+    ASSERT_TRUE(loaded) << loaded.error;
+    EXPECT_EQ(loaded.config.engine().graphics_quality, GraphicsQuality{});
+    ASSERT_TRUE(ExportRuntimeConfigEnvironment(loaded.config, &error))
+        << error;
+    EXPECT_EQ(GetVariable("MOCKTAIL_GRAPHICS_QUALITY"), std::nullopt)
+        << '"' << value << '"';
+  }
 }
 
 // ApplyGraphicsLaunchPolicy with a system backend, which publishes only the

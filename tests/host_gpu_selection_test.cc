@@ -381,20 +381,6 @@ TEST(HostGpuSelectionTest, PinsBothNvidiaDriversWhenBothAreInstalled) {
                                icds.Path(Native("nouveau_icd")));
 }
 
-TEST(HostGpuSelectionTest, LowersQualityOnlyOnIntelIntegratedGraphics) {
-  EXPECT_TRUE(RendersOnIntelIntegratedGraphics({kIntelGraphics, kNvidiaDgpu},
-                                               kIntelGraphics));
-  EXPECT_FALSE(RendersOnIntelIntegratedGraphics({kIntelGraphics, kNvidiaDgpu},
-                                                kNvidiaDgpu));
-  EXPECT_FALSE(RendersOnIntelIntegratedGraphics({kIntelGraphics, kArc}, kArc));
-  EXPECT_FALSE(RendersOnIntelIntegratedGraphics({kApu}, kApu));
-  // Without a selected card, only an Intel-only computer counts.
-  EXPECT_TRUE(RendersOnIntelIntegratedGraphics({kIntelGraphics}, std::nullopt));
-  EXPECT_FALSE(RendersOnIntelIntegratedGraphics({kIntelGraphics, kNvidiaDgpu},
-                                                std::nullopt));
-  EXPECT_FALSE(RendersOnIntelIntegratedGraphics({}, std::nullopt));
-}
-
 // The session log names the card and its drivers; the caller decides when
 // the lines are written (ApplyGraphicsLaunchPolicy runs before the log).
 TEST(HostGpuSelectionTest, DescribesTheSelectionForTheSessionLog) {

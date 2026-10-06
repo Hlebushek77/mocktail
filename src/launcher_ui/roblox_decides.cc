@@ -44,12 +44,6 @@ constexpr RobloxOwnedSetting kOwnedSettings[] = {
     RobloxOwnedSetting::kChat,
 };
 
-// runtime_config.cc ParseGraphicsBackend: three spellings of direct Vulkan.
-bool IsVulkanSpelling(std::string_view value) {
-  return value == "direct-vulkan" || value == "vulkan" ||
-         value == "native-vulkan";
-}
-
 // A detailed device: block, which the loader reads through device.type
 // (runtime_config_file.cc). A scalar device: is never one.
 bool DeviceIsMapping(const LauncherContext& context) {
@@ -71,7 +65,7 @@ std::string RobloxSideTitle(RobloxOverrideKind kind) {
     case RobloxOverrideKind::kGraphicsQuality:
       return _("Graphics Quality slider");
     case RobloxOverrideKind::kRenderingLimits:
-      return _("Anti-aliasing, textures and level of detail");
+      return _("Anti-aliasing and texture memory");
     case RobloxOverrideKind::kFrameRateTarget:
       return _("Maximum Frame Rate");
     case RobloxOverrideKind::kTheme:
@@ -95,8 +89,7 @@ std::string Summary(const RobloxOverride& entry) {
     case RobloxOverrideKind::kRenderingLimits:
       return _(
           "Mocktail's performance preset replaces Roblox's own choices "
-          "for anti-aliasing, texture memory, level of detail, shadows "
-          "and sound channels");
+          "for anti-aliasing and texture memory");
     case RobloxOverrideKind::kFrameRateTarget:
       // frame_rate_policy.cc: unlimited targets
       // kMaximumSupportedRobloxSchedulerFps.
@@ -146,26 +139,22 @@ std::string Summary(const RobloxOverride& entry) {
 std::string Details(const RobloxOverride& entry) {
   switch (entry.kind) {
     case RobloxOverrideKind::kGraphicsQuality:
-      // performance_policy.cc MergePerformanceClientSettingsOverrides.
+      // performance_policy.cc MergeGraphicsQuality, for a level in
+      // engine.graphics_quality, whatever the preset does.
       return _(
-          "Mocktail's performance preset sets "
-          "FIntDebugFRMQualityLevelOverride, which replaces the level "
-          "the Graphics Quality option in Roblox's settings would "
-          "choose.");
+          "Mocktail sets DFIntDebugFRMQualityLevelOverride, which replaces "
+          "the level the Graphics Quality option in Roblox's settings "
+          "would choose.");
     case RobloxOverrideKind::kRenderingLimits:
-      // performance_policy.cc rendering_settings; the level is left out
-      // only for manual.
+      // performance_policy.cc rendering_settings: the keys Roblox reads
+      // that decide what it draws; the rest size worker threads and caches.
       return _(
           "While the preset is on, Mocktail sets these Roblox client "
           "settings at every start, in place of what Roblox would choose "
           "itself: MSAA off (FIntDebugForceMSAASamples=1), a 128 MB "
-          "texture budget (FIntRenderTextureTotalBudgetMB), a texture mip "
-          "bias (FIntRenderTextureMipBias), low-end level of detail "
-          "(FFlagRenderEnableLowEndLOD), one shadow-map mip "
-          "(FIntTM2ShadowMapMaxMips) and at most 32 sounds at once "
-          "(FIntMaxAudibleSoundChannels). Unless Graphics quality is set "
-          "to “Roblox in-game slider”, it also forces the quality "
-          "level.");
+          "texture budget (FIntRenderTextureTotalBudgetMB) and compressed "
+          "terrain textures (FFlagDebugTerrainVTCompressedTextures), along "
+          "with settings for Roblox's worker threads and caches.");
     case RobloxOverrideKind::kFrameRateTarget:
       // frame_rate_policy.cc sets DFIntTaskSchedulerTargetFps and
       // FFlagGameBasicSettingsFramerateCap5; which of the target and the
@@ -223,13 +212,6 @@ std::string Details(const RobloxOverride& entry) {
 // What this computer and the other settings add to the details.
 std::string ExtraDetails(const RobloxOverride& entry,
                          const GameSettings& settings) {
-  if (entry.kind == RobloxOverrideKind::kGraphicsQuality &&
-      entry.value == "default" && settings.intel_integrated_vulkan) {
-    // graphics_launch_policy.cc publishes MOCKTAIL_GRAPHICS_QUALITY=1.
-    return _(
-        "Level 1 is Mocktail's choice for Intel integrated graphics with "
-        "Vulkan; other graphics get level 3.");
-  }
   if (entry.kind == RobloxOverrideKind::kTheme && entry.value != "system") {
     // roblox_desktop_app_policy.cc ApplyDesktopAppPolicy (PC class only):
     // ForceTheme is light or dark for those modes.
@@ -249,7 +231,7 @@ std::string ExtraDetails(const RobloxOverride& entry,
 std::string GiveBack(const RobloxOverride& entry) {
   switch (entry.kind) {
     case RobloxOverrideKind::kGraphicsQuality:
-      return _("choose “Roblox in-game slider” under Graphics quality.");
+      return _("choose “Set in Roblox” under Graphics quality.");
     case RobloxOverrideKind::kRenderingLimits:
       // performance_policy.cc: latency never merges the preset; auto only
       // with multithreaded rendering.
@@ -359,7 +341,8 @@ std::string OwnedSubtitle(RobloxOwnedSetting setting,
       return RenderingPresetActive(settings.physics_worker_mode,
                                    settings.multithreaded_rendering)
                  ? std::string(_("Roblox's slider picks the level; the "
-                                 "performance preset's other limits stay"))
+                                 "performance preset still keeps MSAA off "
+                                 "and the texture budget at 128 MB"))
                  : std::string(_("Roblox's slider picks the level"));
     case RobloxOwnedSetting::kFrameRate:
       return _("Roblox's menu sets the cap; Mocktail sets no target");
@@ -538,10 +521,10 @@ GtkWidget* BuildNothingRow(LauncherContext* context) {
       _("Roblox's own settings decide everything Mocktail could take over");
   spec.hint.details =
       _("With the current settings no row in this window replaces one of "
-        "Roblox's own settings: the performance preset is off, Roblox owns "
-        "the frame rate, the fullscreen setting and the theme, the "
-        "microphone is enabled, and the Phone profile leaves the interface "
-        "to Roblox for Android.");
+        "Roblox's own settings: Roblox picks the graphics quality level, the "
+        "performance preset is off, Roblox owns the frame rate, the "
+        "fullscreen setting and the theme, the microphone is enabled, and "
+        "the Phone profile leaves the interface to Roblox for Android.");
   DecorateRow(context, row, std::move(spec));
   FollowVisibility(context, row, [context] {
     return ResolveRobloxOverrides(CurrentGameSettings(*context)).empty();
@@ -569,13 +552,11 @@ GtkWidget* BuildConflictRow(LauncherContext* context,
     return DescribeOverrideConflict(conflict, CurrentGameSettings(ctx));
   };
   spec.hint.details =
-      // performance_policy.cc: the level and the rest of the preset are
-      // separate; manual leaves out only the level.
-      _("Graphics quality only sets the level. The rest of the performance "
-        "preset (MSAA off, a 128 MB texture budget, low-end level of detail, "
-        "simpler shadows) stays while Physics workers is on Throughput, or on "
-        "Automatic with Multithreaded rendering, whatever level Roblox "
-        "runs at.");
+      // performance_policy.cc: the level and the preset are separate.
+      _("Graphics quality only sets the level. The performance preset's "
+        "limits (MSAA off, a 128 MB texture budget) stay while Physics "
+        "workers is on Throughput, or on Automatic with Multithreaded "
+        "rendering, whatever level Roblox runs at.");
   DecorateRow(context, row, std::move(spec));
   FollowVisibility(context, row, [context, conflict] {
     const std::vector<OverrideConflict> conflicts =
@@ -721,13 +702,6 @@ GameSettings CurrentGameSettings(const LauncherContext& context) {
       DeviceIsMapping(context)) {
     settings.device = context.EffectiveValue("device.type");
   }
-  const MachineProfile& machine = context.machine();
-  settings.intel_integrated_vulkan =
-      machine.detected &&
-      IsVulkanSpelling(
-          context.GameValue("graphics.backend", "direct-vulkan")) &&
-      machine.RendersOnIntelIntegratedGraphics(
-          context.GameValue("engine.gpu", "auto"));
   return settings;
 }
 
@@ -749,18 +723,16 @@ std::string DescribeOverrideConflict(OverrideConflict conflict,
       const std::optional<RobloxOverride> quality =
           RobloxOverrideOf(settings, "engine.graphics_quality");
       return Format(_("Level %d is forced, but the performance preset still "
-                      "keeps MSAA off, textures at 128 MB and low-end level "
-                      "of detail, so the higher level gains less than it "
-                      "would. Set Physics workers to Low latency to lift "
-                      "those limits."),
+                      "keeps MSAA off and the texture budget at 128 MB, "
+                      "whatever the level. Set Physics workers to Low "
+                      "latency to lift those limits."),
                     quality.has_value() ? quality->number : 0);
     }
     case OverrideConflict::kRobloxSliderUnderPresetLimits:
       return _(
           "Roblox's slider picks the level, but the performance preset "
-          "still keeps MSAA off, textures at 128 MB and low-end level of "
-          "detail. Set Physics workers to Low latency to lift those "
-          "limits.");
+          "still keeps MSAA off and the texture budget at 128 MB. Set "
+          "Physics workers to Low latency to lift those limits.");
   }
   return {};
 }
@@ -833,8 +805,7 @@ GtkWidget* BuildRobloxDecidesLinkRow(LauncherContext* context) {
       // performance_policy.cc: the preset follows these two rows.
       _("On this page, Physics workers and Multithreaded rendering decide "
         "whether the performance preset replaces Roblox's choices for "
-        "anti-aliasing, textures, level of detail and the graphics quality "
-        "level.");
+        "anti-aliasing and texture memory.");
   return DecorateRow(context, row, std::move(spec));
 }
 

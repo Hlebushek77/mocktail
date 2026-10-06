@@ -90,12 +90,15 @@ enum class SignInMethod {
   kBrowser,
 };
 
+// engine.graphics_quality. Default and manual both force no level, so
+// Roblox's own Graphics Quality setting decides; manual is the older
+// spelling of that choice (the key Mocktail sent for the default until
+// 1.0.4-plus.2 never took effect, see kGraphicsQualityClientSetting).
 enum class GraphicsQualityMode {
-  // Mocktail's rendering preset level when that preset is active.
   kDefault,
-  // No FRM override: Roblox's in-game graphics slider stays in control.
   kManual,
-  // Force FIntDebugFRMQualityLevelOverride to `level`.
+  // Force DFIntDebugFRMQualityLevelOverride to `level`, whatever the
+  // rendering preset does.
   kLevel,
 };
 

@@ -21,9 +21,8 @@ namespace mocktail::launcher_ui {
 
 // The settings roblox_overrides.h works from, as the game will read them
 // this launch: LauncherContext::GameValue (the draft, the template's
-// defaults and the managed variables that override them), device.type of a
-// detailed device: block, and whether direct Vulkan renders on Intel
-// integrated graphics (graphics quality level 1 by default).
+// defaults and the managed variables that override them) and device.type of
+// a detailed device: block.
 GameSettings CurrentGameSettings(const LauncherContext& context);
 
 // Hint::overrides_roblox for a row bound to `key`: what the key's current

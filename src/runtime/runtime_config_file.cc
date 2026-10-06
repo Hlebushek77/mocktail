@@ -809,18 +809,16 @@ bool UnsetEnvironmentValue(const char* name, std::string* error) {
   return false;
 }
 
-// The default leaves MOCKTAIL_GRAPHICS_QUALITY to the rendering preset, which
-// uses level 3 while the variable is unset and keeps the level 1 for Intel
-// integrated graphics that ApplyGraphicsLaunchPolicy may already have
-// published. Only the literal "default", which the preset does not
-// understand, is removed.
+// The default forces no level (performance_policy.cc), which an unset
+// MOCKTAIL_GRAPHICS_QUALITY says to every later reader; the variable can
+// only be unset, empty or "default" then, since a set one wins over the
+// YAML value.
 bool ExportGraphicsQuality(const GraphicsQuality& quality, std::string* error) {
   if (quality.mode != GraphicsQualityMode::kDefault) {
     return SetEnvironmentValue("MOCKTAIL_GRAPHICS_QUALITY",
                                GraphicsQualityName(quality), error);
   }
-  const char* current = std::getenv("MOCKTAIL_GRAPHICS_QUALITY");
-  if (current != nullptr && std::string_view(current) == "default") {
+  if (std::getenv("MOCKTAIL_GRAPHICS_QUALITY") != nullptr) {
     return UnsetEnvironmentValue("MOCKTAIL_GRAPHICS_QUALITY", error);
   }
   return true;

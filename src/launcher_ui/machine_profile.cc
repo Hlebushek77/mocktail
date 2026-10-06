@@ -143,8 +143,8 @@ std::uint64_t DetectMemory(const std::filesystem::path& root) {
   return 0;
 }
 
-// graphics_launch_policy.cc FindLoaderSelectedGpu: the detected card
-// VK_LOADER_DEVICE_SELECT ("0xVVVV:0xDDDD") names, if any.
+// The detected card VK_LOADER_DEVICE_SELECT ("0xVVVV:0xDDDD", as the
+// loader reads it) names, if any.
 std::optional<runtime::HostGpu> FindLoaderSelectedGpu(
     const std::vector<runtime::HostGpu>& cards, std::string_view select) {
   const std::size_t colon = select.find(':');
@@ -414,12 +414,6 @@ VulkanDriverSelection MachineProfile::VulkanDriver(
       break;
   }
   return driver;
-}
-
-bool MachineProfile::RendersOnIntelIntegratedGraphics(
-    std::string_view gpu_preference) const {
-  return runtime::RendersOnIntelIntegratedGraphics(
-      gpu.cards, VulkanDriver(gpu_preference).gpu);
 }
 
 std::string GpuCardName(const runtime::HostGpu& card) {

@@ -673,9 +673,8 @@ TEST_F(MachineProfileTest, DetectsAMachineWithoutVulkan) {
       Probe());
   EXPECT_TRUE(profile.gpu.intel);
   EXPECT_TRUE(profile.gpu.integrated_only());
-  // Without a Vulkan driver no card is picked, and an Intel-only computer
-  // counts as Intel integrated graphics.
-  EXPECT_TRUE(profile.RendersOnIntelIntegratedGraphics("auto"));
+  // Without a Vulkan driver no card is picked.
+  EXPECT_FALSE(profile.VulkanDriver("auto").gpu.has_value());
   EXPECT_FALSE(profile.gpu.nvidia_kernel_driver);
   EXPECT_EQ(profile.session, SessionType::kX11);
   EXPECT_FALSE(profile.wayland_available);
@@ -950,23 +949,23 @@ TEST_F(MachineProfileTest, FollowsEngineGpuOnAHybridLaptop) {
   ASSERT_TRUE(driver.gpu.has_value());
   EXPECT_EQ(driver.gpu->vendor, kNvidiaPciVendor);
   EXPECT_TRUE(driver.preferred);
-  EXPECT_FALSE(profile.RendersOnIntelIntegratedGraphics("auto"));
-  EXPECT_FALSE(profile.RendersOnIntelIntegratedGraphics("discrete"));
+  EXPECT_EQ(profile.VulkanDriver("discrete").gpu->vendor, kNvidiaPciVendor);
 
   driver = profile.VulkanDriver("integrated");
   ASSERT_TRUE(driver.gpu.has_value());
   EXPECT_EQ(driver.gpu->vendor, kIntelPciVendor);
   EXPECT_EQ(driver.FileNames(), "intel_icd.x86_64.json");
-  EXPECT_TRUE(profile.RendersOnIntelIntegratedGraphics("integrated"));
   // A value the loader would refuse reads as auto.
-  EXPECT_FALSE(profile.RendersOnIntelIntegratedGraphics("igpu"));
+  ASSERT_TRUE(profile.VulkanDriver("igpu").gpu.has_value());
+  EXPECT_EQ(profile.VulkanDriver("igpu").gpu->vendor, kNvidiaPciVendor);
 
   profile = DetectMachineProfile(
       MapEnvironment({{"__NV_PRIME_RENDER_OFFLOAD", "0"}}), Probe());
   EXPECT_EQ(profile.ResolvedGpuPreference("auto"),
             runtime::GpuPreference::kIntegrated);
-  EXPECT_TRUE(profile.RendersOnIntelIntegratedGraphics("auto"));
-  EXPECT_FALSE(profile.RendersOnIntelIntegratedGraphics("discrete"));
+  ASSERT_TRUE(profile.VulkanDriver("auto").gpu.has_value());
+  EXPECT_EQ(profile.VulkanDriver("auto").gpu->vendor, kIntelPciVendor);
+  EXPECT_EQ(profile.VulkanDriver("discrete").gpu->vendor, kNvidiaPciVendor);
 
   // Drivers the user pinned stay; VK_LOADER_DEVICE_SELECT names the card.
   profile = DetectMachineProfile(
@@ -975,7 +974,7 @@ TEST_F(MachineProfileTest, FollowsEngineGpuOnAHybridLaptop) {
       Probe());
   EXPECT_EQ(profile.vulkan_source, VulkanDriverSource::kUser);
   ASSERT_TRUE(profile.VulkanDriver("discrete").gpu.has_value());
-  EXPECT_TRUE(profile.RendersOnIntelIntegratedGraphics("discrete"));
+  EXPECT_EQ(profile.VulkanDriver("discrete").gpu->vendor, kIntelPciVendor);
 
   // No integrated card with a driver: the NVIDIA card stands in.
   std::filesystem::remove(root_.path() /
@@ -1139,41 +1138,40 @@ TEST(GamePagesTest, RenderingPresetFollowsPhysicsWorkers) {
 }
 
 TEST(GamePagesTest, ResolvesTheGraphicsQualityLevel) {
-  QualityEffect effect = ResolveGraphicsQuality("default", true, false);
-  EXPECT_EQ(effect.source, QualitySource::kMocktailDefault);
-  EXPECT_EQ(effect.level, 3);
-  EXPECT_FALSE(effect.ignored);
-  EXPECT_EQ(ResolveGraphicsQuality("", true, true).level, 1);
-  effect = ResolveGraphicsQuality("12", true, true);
-  EXPECT_EQ(effect.source, QualitySource::kConfiguredLevel);
-  EXPECT_EQ(effect.level, 12);
-  effect = ResolveGraphicsQuality("manual", true, false);
-  EXPECT_EQ(effect.source, QualitySource::kRobloxSetting);
-  EXPECT_FALSE(effect.ignored);
-  effect = ResolveGraphicsQuality("12", false, false);
-  EXPECT_EQ(effect.source, QualitySource::kRobloxSetting);
-  EXPECT_TRUE(effect.ignored);
+  // performance_policy.cc: only a level is sent, whatever the preset does;
+  // default and manual (and the variable's auto and 0) leave it to Roblox.
+  for (const char* value : {"default", "", "manual", "auto", "0", "22"}) {
+    const QualityEffect effect = ResolveGraphicsQuality(value);
+    EXPECT_EQ(effect.source, QualitySource::kRobloxSetting) << value;
+    EXPECT_EQ(effect.level, 0) << value;
+  }
+  for (const int level : {1, 3, 12, 21}) {
+    const QualityEffect effect =
+        ResolveGraphicsQuality(std::to_string(level));
+    EXPECT_EQ(effect.source, QualitySource::kConfiguredLevel);
+    EXPECT_EQ(effect.level, level);
+  }
   EXPECT_EQ(ParseQualityLevel("21"), 21);
   EXPECT_FALSE(ParseQualityLevel("22").has_value());
   EXPECT_FALSE(ParseQualityLevel("0").has_value());
   EXPECT_FALSE(ParseQualityLevel("default").has_value());
 
+  // Roblox's own setting on every known card, discrete or integrated.
   MachineProfile machine = DetectedMachine();
   machine.gpu.nvidia = true;
-  EXPECT_EQ(RecommendGraphicsQuality(machine).value, "manual");
+  EXPECT_EQ(RecommendGraphicsQuality(machine).value, "default");
+  EXPECT_EQ(RecommendGraphicsQuality(machine).reason,
+            QualityRecommendationReason::kRobloxSetting);
   machine.gpu = {};
   machine.gpu.intel = true;
   EXPECT_EQ(RecommendGraphicsQuality(machine).value, "default");
-  EXPECT_EQ(RecommendGraphicsQuality(machine).reason,
-            QualityRecommendationReason::kModestGraphics);
-  // An Arc card is discrete; an APU is not.
   machine.gpu.intel_discrete = true;
-  EXPECT_EQ(RecommendGraphicsQuality(machine).value, "manual");
+  EXPECT_EQ(RecommendGraphicsQuality(machine).value, "default");
   machine.gpu = {};
   machine.gpu.amd = true;
   EXPECT_EQ(RecommendGraphicsQuality(machine).value, "default");
   machine.gpu.amd_discrete = true;
-  EXPECT_EQ(RecommendGraphicsQuality(machine).value, "manual");
+  EXPECT_EQ(RecommendGraphicsQuality(machine).value, "default");
   // No known GPU, or detection not finished: no recommendation.
   machine.gpu = {};
   machine.gpu.other = true;
@@ -1228,7 +1226,8 @@ TEST(GamePagesTest, FindsFastFlagsThatBlockTheStart) {
   std::string error;
   ASSERT_TRUE(launcher::FastFlagsDocument::FromBytes(
       R"({"DFIntTaskSchedulerTargetFps": 144,
-          "FIntDebugFRMQualityLevelOverride": "5"})",
+          "DFIntDebugFRMQualityLevelOverride": "5",
+          "FIntDebugFRMQualityLevelOverride": "1"})",
       &flags, &error))
       << error;
   // Roblox owns the cap: the target flag is the user's own.
@@ -1237,14 +1236,13 @@ TEST(GamePagesTest, FindsFastFlagsThatBlockTheStart) {
   EXPECT_EQ(FrameRateFlagConflict(flags, "165"), "DFIntTaskSchedulerTargetFps");
   EXPECT_EQ(FrameRateFlagConflict(flags, "unlimited"),
             "DFIntTaskSchedulerTargetFps");
-  EXPECT_EQ(QualityFlagConflict(flags,
-                                ResolveGraphicsQuality("default", true, false)),
-            "FIntDebugFRMQualityLevelOverride");
-  EXPECT_EQ(
-      QualityFlagConflict(flags, ResolveGraphicsQuality("5", true, false)), "");
-  EXPECT_EQ(
-      QualityFlagConflict(flags, ResolveGraphicsQuality("manual", true, false)),
-      "");
+  // Only a level sets DFIntDebugFRMQualityLevelOverride; the FInt spelling,
+  // which Roblox ignores, is no longer Mocktail's.
+  EXPECT_EQ(QualityFlagConflict(flags, ResolveGraphicsQuality("12")),
+            "DFIntDebugFRMQualityLevelOverride");
+  EXPECT_EQ(QualityFlagConflict(flags, ResolveGraphicsQuality("5")), "");
+  EXPECT_EQ(QualityFlagConflict(flags, ResolveGraphicsQuality("default")), "");
+  EXPECT_EQ(QualityFlagConflict(flags, ResolveGraphicsQuality("manual")), "");
 }
 
 TEST(GamePagesTest, DerivesWindowSizesFromTheMonitor) {
@@ -1466,39 +1464,34 @@ bool Owns(const GameSettings& settings, RobloxOwnedSetting setting) {
   return std::find(owned.begin(), owned.end(), setting) != owned.end();
 }
 
-TEST(RobloxOverridesTest, DefaultsForceTheQualityPresetAndDesktopLayout) {
+TEST(RobloxOverridesTest, DefaultsKeepThePresetAndDesktopLayout) {
   // An empty config: physics workers on throughput turn the preset on
-  // (performance_policy.cc), which forces level 3, and the PC profile gives
-  // Roblox the desktop layout (main.cc ApplyDesktopAppPolicy).
+  // (performance_policy.cc), and the PC profile gives Roblox the desktop
+  // layout (main.cc ApplyDesktopAppPolicy). The default quality forces no
+  // level, so Roblox's slider decides under the preset's limits.
   const GameSettings settings;
   EXPECT_EQ(OverrideKinds(settings),
             (std::vector<RobloxOverrideKind>{
-                RobloxOverrideKind::kGraphicsQuality,
                 RobloxOverrideKind::kRenderingLimits,
                 RobloxOverrideKind::kDevice}));
   const std::vector<RobloxOverride> overrides =
       ResolveRobloxOverrides(settings);
-  EXPECT_EQ(overrides[0].key, "engine.graphics_quality");
-  EXPECT_EQ(overrides[0].number, 3);
-  EXPECT_EQ(overrides[0].value, "default");
-  EXPECT_EQ(overrides[1].key, "performance.physics_worker_mode");
-  EXPECT_EQ(overrides[2].key, "device");
-  EXPECT_EQ(overrides[2].value, "pc-windows-11");
-  EXPECT_FALSE(Owns(settings, RobloxOwnedSetting::kGraphicsQuality));
+  EXPECT_EQ(overrides[0].key, "performance.physics_worker_mode");
+  EXPECT_EQ(overrides[1].key, "device");
+  EXPECT_EQ(overrides[1].value, "pc-windows-11");
+  EXPECT_FALSE(RobloxOverrideOf(settings, "engine.graphics_quality"));
   for (const RobloxOwnedSetting owned :
-       {RobloxOwnedSetting::kFrameRate, RobloxOwnedSetting::kFullscreen,
-        RobloxOwnedSetting::kTheme, RobloxOwnedSetting::kVolume,
-        RobloxOwnedSetting::kOutputSwitch, RobloxOwnedSetting::kVoiceChat,
+       {RobloxOwnedSetting::kGraphicsQuality, RobloxOwnedSetting::kFrameRate,
+        RobloxOwnedSetting::kFullscreen, RobloxOwnedSetting::kTheme,
+        RobloxOwnedSetting::kVolume, RobloxOwnedSetting::kOutputSwitch,
+        RobloxOwnedSetting::kVoiceChat,
         RobloxOwnedSetting::kCameraSensitivity,
         RobloxOwnedSetting::kCameraMode, RobloxOwnedSetting::kChat}) {
     EXPECT_TRUE(Owns(settings, owned)) << static_cast<int>(owned);
   }
-  EXPECT_TRUE(FindOverrideConflicts(settings).empty());
-
-  // Intel integrated graphics with Vulkan get level 1.
-  GameSettings intel;
-  intel.intel_integrated_vulkan = true;
-  EXPECT_EQ(RobloxOverrideOf(intel, "engine.graphics_quality")->number, 1);
+  EXPECT_EQ(FindOverrideConflicts(settings),
+            (std::vector<OverrideConflict>{
+                OverrideConflict::kRobloxSliderUnderPresetLimits}));
 }
 
 TEST(RobloxOverridesTest, ThePresetFollowsBothPerformanceKeys) {
@@ -1506,12 +1499,12 @@ TEST(RobloxOverridesTest, ThePresetFollowsBothPerformanceKeys) {
   settings.physics_worker_mode = "latency";
   settings.multithreaded_rendering = "true";
   settings.graphics_quality = "12";
-  // Low latency never merges the preset, so no level is forced either.
-  EXPECT_FALSE(RobloxOverrideOf(settings, "engine.graphics_quality"));
+  // Low latency never merges the preset; a level is forced all the same.
+  EXPECT_EQ(RobloxOverrideOf(settings, "engine.graphics_quality")->number, 12);
   EXPECT_FALSE(RobloxOverrideOf(settings, "performance.physics_worker_mode"));
   EXPECT_FALSE(
       RobloxOverrideOf(settings, "performance.multithreaded_rendering"));
-  EXPECT_TRUE(Owns(settings, RobloxOwnedSetting::kGraphicsQuality));
+  EXPECT_FALSE(Owns(settings, RobloxOwnedSetting::kGraphicsQuality));
   EXPECT_TRUE(FindOverrideConflicts(settings).empty());
 
   // Automatic physics workers: multithreaded rendering turns it on.
@@ -1523,7 +1516,8 @@ TEST(RobloxOverridesTest, ThePresetFollowsBothPerformanceKeys) {
   EXPECT_FALSE(RobloxOverrideOf(settings, "performance.physics_worker_mode"));
   EXPECT_EQ(RobloxOverrideOf(settings, "engine.graphics_quality")->number, 12);
   settings.multithreaded_rendering = "false";
-  EXPECT_EQ(ResolveRobloxOverrides(settings).size(), 1U);  // the device
+  // The level and the device.
+  EXPECT_EQ(ResolveRobloxOverrides(settings).size(), 2U);
 
   // Throughput turns it on by itself; multithreaded rendering adds nothing.
   settings.physics_worker_mode = "throughput";
@@ -1543,12 +1537,18 @@ TEST(RobloxOverridesTest, WarnsWhenThePresetStillLimitsAHigherLevel) {
   const std::optional<RobloxOverride> quality =
       RobloxOverrideOf(settings, "engine.graphics_quality");
   ASSERT_TRUE(quality.has_value());
-  EXPECT_EQ(quality->value, "level");
+  EXPECT_EQ(quality->kind, RobloxOverrideKind::kGraphicsQuality);
   EXPECT_EQ(quality->number, 12);
-  // Levels up to Mocktail's own 3 lose nothing to the preset.
+  // Levels up to 3, the low end, are not warned about.
   settings.graphics_quality = "3";
   EXPECT_TRUE(FindOverrideConflicts(settings).empty());
-  // Roblox's slider decides the level, the preset's other limits stay.
+  // Roblox's slider decides the level, the preset's limits stay; default
+  // and manual are the same choice.
+  settings.graphics_quality = "default";
+  EXPECT_FALSE(RobloxOverrideOf(settings, "engine.graphics_quality"));
+  EXPECT_EQ(FindOverrideConflicts(settings),
+            (std::vector<OverrideConflict>{
+                OverrideConflict::kRobloxSliderUnderPresetLimits}));
   settings.graphics_quality = "manual";
   EXPECT_FALSE(RobloxOverrideOf(settings, "engine.graphics_quality"));
   EXPECT_TRUE(Owns(settings, RobloxOwnedSetting::kGraphicsQuality));

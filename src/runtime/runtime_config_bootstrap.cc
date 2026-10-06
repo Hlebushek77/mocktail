@@ -164,11 +164,10 @@ account:
   sign_in: native
 
 engine:
-  # String (default: default): Roblox graphics quality while Mocktail's
-  # rendering preset is active (physics_worker_mode throughput, or auto with
-  # multithreaded_rendering). default forces level 3 (level 1 with direct
-  # Vulkan on Intel integrated graphics), manual leaves Roblox's in-game
-  # graphics slider in control, and an integer from 1 to 21 forces that level.
+  # String (default: default): Roblox's graphics quality level. default
+  # leaves it to Roblox's own Graphics Quality setting (manual means the
+  # same), and an integer from 1 to 21 forces that level, whatever the
+  # performance settings; Roblox's in-game slider then has no effect.
   graphics_quality: default
   # String (default: auto): graphics card for direct Vulkan when the computer
   # has more than one: auto, discrete, or integrated. auto prefers the
