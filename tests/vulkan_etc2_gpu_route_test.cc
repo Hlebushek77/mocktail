@@ -1280,5 +1280,44 @@ TEST_F(Etc2GpuRouteFakeTest, FrameStatsReportGpuSubmits) {
   EXPECT_EQ(Field(log, kTotals, " gpu="), "6");
 }
 
+// DESIGN C3.6: once a loading burst's output chunks have been idle for 2 s,
+// all but 32 MiB of them go even when no GPU-route upload follows: the
+// housekeeping that runs at a present (at most once a second) trims the
+// arenas, not only a submit with GPU-route uploads.
+TEST_F(Etc2GpuRouteFakeTest, IdleOutputChunksGoWithoutAnotherUpload) {
+  constexpr VkDeviceSize kMebibyte = 1024 * 1024;
+  FakeRig rig(GpuOptions());
+  ASSERT_TRUE(rig.WarmUp());
+  const VkCommandPool pool = rig.Pool(0);
+  // Three 2048x2048 ETC2 RGB8 textures, 2 MiB compressed and 16 MiB
+  // decoded each: two fill the first 32 MiB chunk, the third a second one.
+  RigSource* source = rig.Source(6 * kMebibyte, 37);
+  const VkCommandBuffer command_buffer = rig.Begin(pool);
+  for (VkDeviceSize index = 0; index < 3; ++index) {
+    RigImage* image =
+        rig.Image(VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK, 2048, 2048, 1);
+    VkBufferImageCopy region{};
+    region.bufferOffset = index * 2 * kMebibyte;
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = {2048, 2048, 1};
+    rig.Upload(command_buffer, *image, *source, {region});
+  }
+  rig.End(command_buffer);
+  ASSERT_EQ(rig.Submit(rig.queue(), {{command_buffer}}, VK_NULL_HANDLE),
+            VK_SUCCESS);
+  EXPECT_EQ(rig.gpu()->stats().passes, 1U);
+  // Roblox resets its command buffer: both chunks are idle from now on.
+  rig.emulation().ReleaseCommandBuffer(command_buffer);
+  EXPECT_EQ(rig.gpu()->stats().arena_bytes, 64 * kMebibyte);
+  rig.emulation().OnPresent();
+  EXPECT_EQ(rig.gpu()->stats().arena_bytes, 64 * kMebibyte)
+      << "idle for less than 2 s";
+  std::this_thread::sleep_for(std::chrono::milliseconds(2100));
+  rig.emulation().OnPresent();
+  EXPECT_EQ(rig.gpu()->stats().arena_bytes, 32 * kMebibyte)
+      << "32 MiB stay for the next burst";
+  EXPECT_TRUE(rig.fake().errors().empty()) << rig.fake().errors().front();
+}
+
 }  // namespace
 }  // namespace mocktail::graphics::testing

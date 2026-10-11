@@ -1406,7 +1406,9 @@ struct Etc2GpuDevice::Impl {
     const Clock::time_point start = Clock::now();
     QueueState* queue_state = Queue(queue, family);
     std::lock_guard<std::mutex> lock(queue_state->mutex);
-    // [CR-29] Trimming and shrinking run here, on the submitting thread.
+    // [CR-29] Slot inputs shrink only on the submitting thread
+    // (PrepareSlotBuffers). Trimming the arenas touches no QueueState, so
+    // the emulation's housekeeping does it too (Trim).
     TrimArenas(start);
     Slot* slot = AcquireSlot(*queue_state);
     // After AcquireSlot: its fence polls may have found the device lost.
@@ -2114,6 +2116,10 @@ void Etc2GpuDevice::FinishSubmit(
   std::lock_guard<std::mutex> epoch_lock(impl_->epoch_mutex);
   slot.epoch = ++impl_->epoch;
   impl_->in_flight[slot.epoch] = slot.fence;
+}
+
+void Etc2GpuDevice::Trim(std::chrono::steady_clock::time_point now) {
+  impl_->TrimArenas(now);
 }
 
 void Etc2GpuDevice::Destroy() {

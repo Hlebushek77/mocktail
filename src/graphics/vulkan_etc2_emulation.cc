@@ -1885,7 +1885,8 @@ struct VulkanEtc2Emulation::State {
   // decoded texels. Thread-safe; uploads of one image must come in order.
   void EmitScaled(const PendingUpload& upload, const std::uint8_t* decoded);
   // At most once a second, from OnPresent and the CPU route: trims the
-  // host staging arenas and gives back idle scratch.
+  // host staging arenas and the GPU route's output arenas, and gives back
+  // idle scratch.
   void Housekeeping(Clock::time_point now);
   // The GPU route's rescue, its CPU half (DESIGN §6, CR-7): decodes the
   // GPU-route uploads of one batch of `dev` into host staging, in the
@@ -3469,16 +3470,16 @@ void VulkanEtc2Emulation::State::Housekeeping(Clock::time_point now) {
           due, now_ns + 1000000000LL, std::memory_order_relaxed)) {
     return;
   }
-  std::vector<VkDevice> staged;
+  std::vector<VkDevice> emulated;
   {
     std::lock_guard<std::mutex> lock(devices_mutex);
     for (const auto& dev : devices) {
-      if (dev->host_staging != nullptr) {
-        staged.push_back(dev->device);
+      if (dev->emulated) {
+        emulated.push_back(dev->device);
       }
     }
   }
-  for (VkDevice device : staged) {
+  for (VkDevice device : emulated) {
     // Hand over hand: once the device's own lock is held, DestroyDevice
     // waits for it before it destroys the arena and the device record.
     std::unique_lock<std::mutex> list(devices_mutex);
@@ -3495,6 +3496,11 @@ void VulkanEtc2Emulation::State::Housekeeping(Clock::time_point now) {
     list.unlock();
     if (dev->host_staging != nullptr) {
       dev->host_staging->Trim(now);
+    }
+    // Without this, only a submit with GPU-route uploads trims them, and a
+    // loading burst's chunks stay for as long as none comes.
+    if (dev->gpu != nullptr) {
+      dev->gpu->Trim(now);
     }
   }
   std::unique_lock<std::mutex> scratch(scratch_mutex, std::try_to_lock);

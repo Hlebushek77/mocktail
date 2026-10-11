@@ -217,6 +217,12 @@ class Etc2GpuDevice {
   // not submitted when the host submit failed.
   void FinishSubmit(Etc2SubmitPlan* plan, VkResult host_result,
                     const std::function<VkResult(VkFence)>& submit_fence_only);
+  // Frees output-arena chunks idle for 2 s beyond the 32 MiB kept, once no
+  // pass that may use them is pending (DESIGN C3.6, CR-8). Submits with
+  // GPU-route uploads do it too; the emulation's housekeeping calls it
+  // about once a second, so a loading burst's chunks also go when no
+  // GPU-route upload follows. Any thread; touches no queue's slots.
+  void Trim(std::chrono::steady_clock::time_point now);
 
   // vkDestroyDevice: joins the build, waits for Mocktail's own fences that
   // were submitted (1 s at most each) and destroys everything it made.
