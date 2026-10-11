@@ -28,6 +28,9 @@ readonly icon="${install_root}/usr/share/icons/hicolor/scalable/apps/space.bigra
 [[ -x "${runtime}/mocktail_webview_helper" ]]
 [[ -x "${runtime}/mocktail_launcher_ui" ]]
 [[ -f "${install_root}/usr/share/locale/ru/LC_MESSAGES/mocktail.mo" ]]
+# The installed window finds its catalogues relative to itself or in the
+# configured locale directory; it carries no path of the build tree.
+! grep -Fq -- "${build_dir}/locale" "${runtime}/mocktail_launcher_ui"
 [[ -x "${runtime}/mocktail_freebsd_socket_helper" ]]
 LC_ALL=C readelf -h "${runtime}/mocktail_freebsd_socket_helper" |
   grep -Fq 'UNIX - FreeBSD'

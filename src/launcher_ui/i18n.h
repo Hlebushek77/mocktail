@@ -17,10 +17,9 @@ namespace mocktail::launcher_ui {
 // holds a compiled catalogue: MOCKTAIL_LOCALE_DIR, <dir of the executable>/
 // locale (the build tree), the install layout relative to the executable
 // for relocated and portable installs (../../share/locale from
-// <prefix>/lib/mocktail, ../share/locale from a bin directory), the
-// configured install directory, then the build tree's directory. Returns the
-// directory bound, empty when no catalogue was found (the window then shows
-// English).
+// <prefix>/lib/mocktail, ../share/locale from a bin directory), then the
+// configured install directory. Returns the directory bound, empty when no
+// catalogue was found (the window then shows English).
 std::string InitTranslations(const char* argv0);
 
 // printf-style formatting for translated strings (g_strdup_vprintf).
