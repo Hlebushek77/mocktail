@@ -228,7 +228,8 @@ so the game behaves as before. It still sends the shadow-map setting
 behind plus.1's "simpler shadows" (`FIntTM2ShadowMapMaxMips`), whose effect
 in Roblox 2.738 is unknown. A quality level you choose in
 `engine.graphics_quality` is now sent under the name Roblox registers for
-it, so it should apply; that is not verified in a game yet.
+it, and a live check confirmed that it applies: at the same spot in a busy
+lobby, level 1 ran at about 80 fps and level 21 at about 55 fps.
 
 ## Can I run multiple Roblox instances?
 

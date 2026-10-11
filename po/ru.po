@@ -3676,8 +3676,8 @@ msgstr "выберите «Как в Roblox» в «Качестве график
 msgid "fflags.json sets %s to another level, so Roblox will not start. Remove that flag or choose “Set in Roblox”."
 msgstr "В fflags.json для %s задан другой уровень, поэтому Roblox не запустится. Удалите этот флаг или выберите «Как в Roblox»."
 
-msgid "• Custom level: Mocktail sends the level you pick to Roblox, whatever the Performance settings, so Roblox's in-game slider should have no effect (not yet verified in a game for this Roblox build). The change applies the next time Roblox starts."
-msgstr "• Свой уровень: Mocktail передаёт Roblox выбранный вами уровень при любых настройках на странице «Производительность», поэтому ползунок в самой игре Roblox не должен действовать (в игре для этой сборки Roblox это ещё не проверено). Изменение вступит в силу при следующем запуске Roblox."
+msgid "• Custom level: Mocktail sends the level you pick to Roblox, whatever the Performance settings, and the level takes effect (in a test, level 1 ran at about 80 fps where level 21 ran at about 55). Roblox's in-game slider should then have no effect. The change applies the next time Roblox starts."
+msgstr "• Свой уровень: Mocktail передаёт Roblox выбранный вами уровень при любых настройках на странице «Производительность», и этот уровень действует (в проверке уровень 1 давал около 80 кадров/с там, где уровень 21 давал около 55). Ползунок в самой игре Roblox при этом не должен действовать. Изменение вступит в силу при следующем запуске Roblox."
 
 msgid "• Low latency: Roblox keeps its own pool sizes; Mocktail only batches physics contact work. The preset stays off, so Roblox's own anti-aliasing and texture limits apply (Mocktail still sizes Roblox's video memory from this computer's RAM)."
 msgstr "• Низкая задержка: Roblox сам определяет число потоков, Mocktail лишь группирует расчёт физических контактов. Пресет остаётся выключенным, поэтому действуют собственные сглаживание и ограничения текстур Roblox (объём видеопамяти для Roblox Mocktail всё равно рассчитывает по оперативной памяти компьютера)."

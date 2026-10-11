@@ -1065,12 +1065,15 @@ GtkWidget* BuildGraphicsQualityRow(LauncherContext* context,
       "\n\n" +
       // performance_policy.cc MergeGraphicsQuality:
       // DFIntDebugFRMQualityLevelOverride, whatever the preset does. The
-      // name and its DF scope come from Roblox 2.738's code; what the
-      // level does in a game is not verified yet.
+      // name and its DF scope come from Roblox 2.738's code. A live check
+      // on 2026-10-11 (Roblox 2.738, a busy lobby) saw level 1 run at about
+      // 80 fps and level 21 at about 55 fps at the same spot; whether the
+      // in-game slider is then ignored was not checked.
       _("• Custom level: Mocktail sends the level you pick to Roblox, "
-        "whatever the Performance settings, so Roblox's in-game slider "
-        "should have no effect (not yet verified in a game for this Roblox "
-        "build). The change applies the next time Roblox starts.") +
+        "whatever the Performance settings, and the level takes effect (in "
+        "a test, level 1 ran at about 80 fps where level 21 ran at about "
+        "55). Roblox's in-game slider should then have no effect. The "
+        "change applies the next time Roblox starts.") +
       "\n\n" +
       // performance_policy.cc rendering_settings.
       _("Separately, Mocktail's performance preset keeps anti-aliasing "

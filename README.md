@@ -121,8 +121,9 @@ shows every change, file by file.
   choose, or leaves the level to Roblox's own setting (the default). Since
   1.0.4-plus.2 the level goes under the name Roblox 2.738 registers for it
   (`DFIntDebugFRMQualityLevelOverride`); before, Mocktail sent it under a
-  name that, judging by Roblox's code, Roblox ignores. That a chosen level
-  now applies in a game is not verified yet.
+  name that, judging by Roblox's code, Roblox ignores. A live check
+  confirmed that a chosen level now applies: at the same spot in a busy
+  lobby, level 1 ran at about 80 fps and level 21 at about 55 fps.
 - Since 1.0.4-plus.2 the performance preset no longer sends 33 client
   settings that Roblox 2.738 never reads. Roblox looks a setting up only
   under the prefix it registered it with (`F` or `DF`), and some of the
