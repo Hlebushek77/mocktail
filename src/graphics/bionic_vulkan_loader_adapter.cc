@@ -1313,15 +1313,18 @@ void ReleaseEtc2PoolCommandBuffers(VkDevice device,
 }
 
 // Mocktail-only batches go first, and always through the core
-// vkQueueSubmit, also inside the vkQueueSubmit2 hooks.
+// vkQueueSubmit, also inside the vkQueueSubmit2 hooks. The plan keeps the
+// results, so FinishEtc2Submit can count what a failed one left undone.
 void SubmitEtc2PreSubmits(VkQueue queue,
-                          const mocktail::graphics::Etc2SubmitPlan& plan) {
-  if (plan.pre_submits().empty()) {
+                          mocktail::graphics::Etc2SubmitPlan* plan) {
+  if (plan->pre_submits().empty()) {
     return;
   }
   const PFN_vkQueueSubmit submit = HostDispatchForQueue(queue).queue_submit;
-  for (const mocktail::graphics::Etc2PreSubmit& pre : plan.pre_submits()) {
-    State().text_overlay.QueueSubmit(queue, 1, &pre.info, pre.fence, submit);
+  for (const mocktail::graphics::Etc2PreSubmit& pre : plan->pre_submits()) {
+    plan->NotePreSubmitResult(
+        pre, State().text_overlay.QueueSubmit(queue, 1, &pre.info, pre.fence,
+                                              submit));
   }
 }
 
@@ -2254,7 +2257,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(
   }
   mocktail::graphics::Etc2SubmitPlan plan;
   State().etc2.PrepareSubmit(queue, submit_count, submits, fence, &plan);
-  SubmitEtc2PreSubmits(queue, plan);
+  SubmitEtc2PreSubmits(queue, &plan);
   const VkResult result = State().text_overlay.QueueSubmit(
       queue, plan.count(submit_count), plan.submits(submits), plan.fence(fence),
       host_submit);
@@ -2279,7 +2282,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit2(
   }
   mocktail::graphics::Etc2SubmitPlan plan;
   State().etc2.PrepareSubmit2(queue, submit_count, submits, fence, &plan);
-  SubmitEtc2PreSubmits(queue, plan);
+  SubmitEtc2PreSubmits(queue, &plan);
   const VkResult result = State().text_overlay.QueueSubmit2(
       queue, plan.count(submit_count), plan.submits2(submits),
       plan.fence(fence), host_submit);
@@ -2304,7 +2307,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit2KHR(
   }
   mocktail::graphics::Etc2SubmitPlan plan;
   State().etc2.PrepareSubmit2(queue, submit_count, submits, fence, &plan);
-  SubmitEtc2PreSubmits(queue, plan);
+  SubmitEtc2PreSubmits(queue, &plan);
   const VkResult result = State().text_overlay.QueueSubmit2(
       queue, plan.count(submit_count), plan.submits2(submits),
       plan.fence(fence), reinterpret_cast<PFN_vkQueueSubmit2>(host_submit));

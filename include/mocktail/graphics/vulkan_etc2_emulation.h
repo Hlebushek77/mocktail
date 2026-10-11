@@ -124,6 +124,7 @@ Etc2EmulationTestHooks& Etc2EmulationTesting();
 struct Etc2PreSubmit {
   VkSubmitInfo info{};
   VkFence fence = VK_NULL_HANDLE;  // the selftest's only
+  std::uint64_t uploads = 0;       // a decode pass's GPU-route uploads
 };
 
 // What a vkQueueSubmit hook submits after PrepareSubmit(2). Until the GPU
@@ -145,6 +146,23 @@ struct Etc2SubmitPlan {
   // Signalled by a fence-only submit after Roblox's, when Roblox passed one.
   VkFence trailing_fence = VK_NULL_HANDLE;
   void* gpu_slot = nullptr;  // the GPU route's own bookkeeping
+  // The pre-submits whose host vkQueueSubmit failed (NotePreSubmitResult):
+  // their uploads, and the first failure's result.
+  std::uint64_t failed_pre_submit_uploads = 0;
+  VkResult pre_submit_result = VK_SUCCESS;
+
+  // The caller's result for one of pre_submits(). A decode pass that did
+  // not reach the queue leaves its uploads' arena ranges unfilled and its
+  // timestamps unwritten; FinishSubmit counts the uploads as dropped.
+  void NotePreSubmitResult(const Etc2PreSubmit& pre, VkResult result) {
+    if (result == VK_SUCCESS) {
+      return;
+    }
+    failed_pre_submit_uploads += pre.uploads;
+    if (pre_submit_result == VK_SUCCESS) {
+      pre_submit_result = result;
+    }
+  }
 
   std::uint32_t count(std::uint32_t original) const {
     if (!modified) {
@@ -282,8 +300,9 @@ class VulkanEtc2Emulation final {
   // Inside Roblox's vkQueueSubmit(2): decodes the CPU route's uploads of the
   // batches (resubmission rereads the source bytes) and fills `plan` with
   // what the caller submits instead. The caller first submits
-  // plan->pre_submits() with the host vkQueueSubmit, then
-  // plan->count/submits/fence, then calls FinishSubmit with the result;
+  // plan->pre_submits() with the host vkQueueSubmit, passing each result to
+  // plan->NotePreSubmitResult, then plan->count/submits/fence, then calls
+  // FinishSubmit with the result;
   // `submit_fence_only` submits (queue, 0, nullptr, fence) the same way.
   void PrepareSubmit(VkQueue queue, std::uint32_t count,
                      const VkSubmitInfo* submits, VkFence fence,

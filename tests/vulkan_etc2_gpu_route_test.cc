@@ -829,6 +829,72 @@ TEST_F(Etc2GpuRouteFakeTest, AFailedSubmitLeavesTheSlotUnsubmitted) {
   EXPECT_TRUE(rig.fake().errors().empty()) << rig.fake().errors().front();
 }
 
+// A protected batch's decode pass goes first on its own; when that
+// vkQueueSubmit fails and Roblox's succeeds, the pass's uploads are
+// counted as dropped and logged, and the slot's timestamps, which no
+// submitted command wrote, are not waited for when the slot comes back
+// (MOCKTAIL_FRAME_STATS): the fake device reports such a wait, which the
+// spec lets hang or lose the device.
+TEST_F(Etc2GpuRouteFakeTest, AFailedPreSubmitDropsItsUploads) {
+  Etc2EmulationOptions options = GpuOptions();
+  options.frame_stats = true;
+  ::testing::internal::CaptureStderr();
+  {
+    FakeRig rig(options);
+    ASSERT_TRUE(rig.WarmUp());
+    const VkCommandPool pool = rig.Pool(0);
+    RigImage* image = rig.Image(VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK, 32, 32, 3);
+    RigSource* source = rig.Source(4096, 31);
+    const VkCommandBuffer command_buffer = rig.Begin(pool);
+    rig.Upload(command_buffer, *image, *source);
+    rig.End(command_buffer);
+    VkProtectedSubmitInfo protected_info{};
+    protected_info.sType = VK_STRUCTURE_TYPE_PROTECTED_SUBMIT_INFO;
+    protected_info.protectedSubmit = VK_TRUE;
+    VkSubmitInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    info.pNext = &protected_info;
+    info.commandBufferCount = 1;
+    info.pCommandBuffers = &command_buffer;
+    Etc2SubmitPlan plan;
+    rig.emulation().PrepareSubmit(rig.queue(), 1, &info, VK_NULL_HANDLE,
+                                  &plan);
+    ASSERT_EQ(plan.pre_submits().size(), 1U);
+    EXPECT_EQ(plan.pre_submits()[0].uploads, 3U);
+    // What the adapter does: each pre-submit's result goes to the plan.
+    rig.fake().FailNextSubmits({VK_ERROR_OUT_OF_DEVICE_MEMORY});
+    for (const Etc2PreSubmit& pre : plan.pre_submits()) {
+      plan.NotePreSubmitResult(
+          pre, rig.fake().QueueSubmit(rig.queue(), 1, &pre.info, pre.fence));
+    }
+    EXPECT_EQ(plan.failed_pre_submit_uploads, 3U);
+    const VkResult result =
+        rig.fake().QueueSubmit(rig.queue(), plan.count(1), plan.submits(&info),
+                               plan.fence(VK_NULL_HANDLE));
+    EXPECT_EQ(result, VK_SUCCESS);
+    rig.emulation().FinishSubmit(&plan, result, [&](VkFence fence) {
+      return rig.fake().QueueSubmit(rig.queue(), 0, nullptr, fence);
+    });
+    EXPECT_EQ(rig.gpu()->stats().pre_submits, 1U);
+    EXPECT_EQ(rig.gpu()->stats().dropped_uploads, 3U);
+
+    // The next call takes the slot back and reads what timing it has.
+    const VkCommandBuffer next = rig.Begin(pool);
+    const auto regions = rig.Upload(next, *image, *source);
+    rig.End(next);
+    ASSERT_EQ(rig.Submit(rig.queue(), {{next}}, VK_NULL_HANDLE), VK_SUCCESS);
+    rig.Check(*image, *source, regions);
+    EXPECT_EQ(rig.gpu()->stats().slots_created, 1U);
+    EXPECT_TRUE(rig.fake().errors().empty()) << rig.fake().errors().front();
+  }
+  const std::string log = ::testing::internal::GetCapturedStderr();
+  EXPECT_NE(log.find("a decode pass submitted on its own failed; its uploads "
+                     "read stale texels (VkResult -2)"),
+            std::string::npos)
+      << log;
+  EXPECT_NE(log.find("rescued=0 dropped=3"), std::string::npos) << log;
+}
+
 // Roblox's fence stays with its batches; the slot fence follows in a
 // fence-only submit. When that one fails the slot is given up, never
 // reset while it may be pending, and a new slot serves the next call.

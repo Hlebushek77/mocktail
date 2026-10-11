@@ -929,7 +929,11 @@ struct Etc2GpuDevice::Impl {
   }
 
   // Reads the slot's timestamps once its fence signalled, and reports the
-  // submit they belong to.
+  // submit they belong to. Without VK_QUERY_RESULT_WAIT_BIT: every pass
+  // that reached the queue has finished by now, and a query that never got
+  // there would never become available (the spec lets such a wait hang or
+  // lose the device, here inside Roblox's vkQueueSubmit). VK_NOT_READY
+  // means no timing for this submit.
   void ReportSlot(Slot& slot) {
     std::uint64_t copy_ns = 0;
     std::uint64_t decode_ns = 0;
@@ -945,9 +949,7 @@ struct Etc2GpuDevice::Impl {
       if (fns().get_query_pool_results(
               info.device, slot.queries, 0, queries,
               raw.size() * sizeof(std::uint64_t), raw.data(),
-              sizeof(std::uint64_t),
-              VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) ==
-          VK_SUCCESS) {
+              sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
         const std::uint64_t mask =
             valid_bits >= 64 ? ~0ULL : (1ULL << valid_bits) - 1;
         const double period = info.properties.limits.timestampPeriod;
@@ -1342,13 +1344,17 @@ struct Etc2GpuDevice::Impl {
       fns().write_timestamp(command_buffer,
                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, slot.queries,
                             query + 2);
-      ++slot.timed_passes;
     }
     Barrier(command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
             VK_ACCESS_TRANSFER_READ_BIT);
     if (fns().end_command_buffer(command_buffer) != VK_SUCCESS) {
       return false;
+    }
+    // Only now: an abandoned command buffer's queries are never reset nor
+    // written, and ReportSlot reads every counted pass.
+    if (timed) {
+      ++slot.timed_passes;
     }
     *input_cursor += pass.input_bytes;
     *job_cursor += static_cast<std::uint32_t>(pass.jobs.size());
@@ -1476,7 +1482,8 @@ struct Etc2GpuDevice::Impl {
           dropped += batch.uploads.size();
         }
         if (recorded) {
-          decodes.push_back({batch.batch, command_buffer});
+          decodes.push_back({batch.batch, command_buffer,
+                             batch.uploads.size()});
         }
       }
     } else {
@@ -2061,6 +2068,21 @@ void Etc2GpuDevice::FinishSubmit(
   Slot& slot = *static_cast<Slot*>(plan->gpu_slot);
   plan->gpu_slot = nullptr;
   std::lock_guard<std::mutex> lock(slot.queue->mutex);
+  if (plan->failed_pre_submit_uploads != 0) {
+    // A pass that had to go first on its own never reached the queue: the
+    // rewritten copies of its batch read whatever its arena ranges held,
+    // and its timestamps stay unwritten.
+    impl_->LogOnce("a decode pass submitted on its own failed; its uploads "
+                   "read stale texels",
+                   plan->pre_submit_result);
+    slot.timed_passes = 0;
+    const std::uint64_t dropped = plan->failed_pre_submit_uploads;
+    impl_->CountStats(
+        [dropped](Stats& counts) { counts.dropped_uploads += dropped; });
+    impl_->Count([dropped](Etc2DecodeTotals& totals) {
+      totals.dropped_uploads += dropped;
+    });
+  }
   VkResult fence_result = VK_SUCCESS;
   if (host_result == VK_SUCCESS) {
     if (plan->trailing_fence != VK_NULL_HANDLE) {
