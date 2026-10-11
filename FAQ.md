@@ -128,9 +128,10 @@ walking, with single frames of up to 0.4 s.
 Since 1.0.4-plus.2 the graphics card converts the textures, and in the same
 test no conversion stalled the game any more; the longest frame while
 walking was 44–101 ms. The processor path that remains as the fallback is
-about seven times faster than before (0.15–0.21 s of stalls in the same
-40 s). The README's [ETC2 textures](README.md#etc2-textures) section has
-the numbers.
+much faster too: in a four-minute session it spent 3.2 s converting
+instead of 23.4 s, and in the same 40 s of walking its stalls added up to
+0.15–0.21 s instead of 2.3–4.0 s. The README's
+[ETC2 textures](README.md#etc2-textures) section has the numbers.
 
 The session log shows which path converts:
 `[vulkan] ETC2 GPU decode ready ...` means the graphics card does. If you
@@ -199,7 +200,7 @@ of them under **What Mocktail decides and what Roblox decides** (the
 Performance page links there). Depending on your settings these are:
 
 - Roblox's **Graphics Quality** slider, when `engine.graphics_quality`
-  forces a level (see the [README](README.md#configuration)).
+  sets a level (see the [README](README.md#configuration)).
 - Anti-aliasing and texture memory: the performance preset
   (`performance.physics_worker_mode: throughput`, the default, or `auto`
   with `multithreaded_rendering`) turns MSAA off and caps the texture budget
@@ -217,14 +218,17 @@ The same group shows what is left to Roblox (volume, camera, chat and
 anything not overridden) and the client settings Mocktail sets at every
 start, such as Roblox's crash uploads being off.
 
-Until 1.0.4-plus.2 the window also listed a forced quality level 3,
-low-end level of detail, simpler shadows and fewer sound channels. The
-performance preset did send settings for those, but Roblox 2.738 never read
-them: it looks a client setting up only under the prefix it registered it
-with (`F` or `DF`), and some of the names do not exist in it at all. The
-preset no longer sends these 33 settings, so the game behaves as before,
-and a quality level you choose in `engine.graphics_quality` now really
-applies.
+Until 1.0.4-plus.2 the window also listed a forced quality level 3, a
+texture mip bias, low-end level of detail and fewer sound channels. The
+performance preset did send settings for those, but, judging by Roblox
+2.738's code, Roblox never read them: it looks a client setting up only
+under the prefix it registered it with (`F` or `DF`), and some of the names
+do not exist in it at all. The preset no longer sends these 33 settings,
+so the game behaves as before. It still sends the shadow-map setting
+behind plus.1's "simpler shadows" (`FIntTM2ShadowMapMaxMips`), whose effect
+in Roblox 2.738 is unknown. A quality level you choose in
+`engine.graphics_quality` is now sent under the name Roblox registers for
+it, so it should apply; that is not verified in a game yet.
 
 ## Can I run multiple Roblox instances?
 

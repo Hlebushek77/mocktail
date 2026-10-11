@@ -117,17 +117,20 @@ shows every change, file by file.
 - `engine.gpu` chooses the graphics card on computers with more than one,
   including laptops with AMD integrated graphics and an NVIDIA card, where
   upstream always used the NVIDIA card.
-- `engine.graphics_quality` forces a graphics quality level you choose, or
-  leaves the level to Roblox's own setting (the default). A chosen level
-  takes effect since 1.0.4-plus.2; before, Mocktail sent it under a name
-  Roblox ignores.
+- `engine.graphics_quality` sends Roblox a graphics quality level you
+  choose, or leaves the level to Roblox's own setting (the default). Since
+  1.0.4-plus.2 the level goes under the name Roblox 2.738 registers for it
+  (`DFIntDebugFRMQualityLevelOverride`); before, Mocktail sent it under a
+  name that, judging by Roblox's code, Roblox ignores. That a chosen level
+  now applies in a game is not verified yet.
 - Since 1.0.4-plus.2 the performance preset no longer sends 33 client
   settings that Roblox 2.738 never reads. Roblox looks a setting up only
   under the prefix it registered it with (`F` or `DF`), and some of the
   names do not exist in it at all. Among them were the quality level 3 the
   settings window said the preset forced, a texture mip bias and low-end
-  level of detail. Roblox never applied them, so the game behaves as before;
-  the preset now sends 40 settings.
+  level of detail. Roblox never applied them, so the game behaves as before.
+  With Physics workers on Throughput (the default) the preset now sends 40
+  settings, with Automatic and Multithreaded rendering 38.
 - With direct Vulkan, vertical sync "On" now stays synchronized with Mesa's
   drivers (AMD, Intel, NVK) when the frame rate limit is unlimited.
 - The session log names the graphics card the game renders on, and how much
@@ -154,12 +157,12 @@ shows every change, file by file.
 
 **Memory**
 
-- The processor path of the texture conversion gives its scratch memory
-  back after a loading burst: anything over 64 MiB, once no texture has
-  been uploaded for 5 seconds. 1.0.4-plus.1 gave back anything over 32 MiB
-  after every upload batch, which in one test took the game's anonymous
-  memory from 1817 MiB to 1455 MiB at the same frame rate, but made each
-  batch of a loading burst allocate the memory again.
+- The processor path of the texture conversion frees a scratch buffer
+  larger than 64 MiB once it has not converted anything for 5 seconds.
+  1.0.4-plus.1 freed one larger than 32 MiB after every upload batch, which
+  in one test took the game's anonymous memory from 1817 MiB to 1455 MiB at
+  the same frame rate, but made each batch of a loading burst allocate the
+  memory again.
 - The description of `performance.memory_limit_mb` now says what it does: a
   watchdog stops Mocktail with exit status 137 once the game's resident
   memory plus swap reaches the limit; swap stays enabled.
@@ -216,6 +219,13 @@ Mocktail ignores the new `config.yaml` sections, so the file keeps working.
 The settings window moves the saved Roblox session into its account store
 (`~/.local/share/mocktail/auth/accounts/`), which upstream does not read, so
 after switching back you may have to sign in again.
+
+Going back from 1.0.4-plus.2 to 1.0.4-plus.1 needs one edit first: remove
+the `etc2_to_bc` line under `engine` in `config.yaml`. 1.0.4-plus.1 refuses
+keys it does not know, so with that line it does not start ("Mocktail could
+not load its configuration"). A `config.yaml` that 1.0.4-plus.2 created has
+the line, and the settings window writes it when you change Compressed
+textures (BC).
 
 ### Upstream Mocktail
 
@@ -365,7 +375,7 @@ empty value, hides the value from the file (empty means the default):
 | `display.server` | `auto`, `wayland`, `x11` | `MOCKTAIL_DISPLAY_SERVER` | Display server for the game window. `auto` prefers Wayland, with the [NVIDIA rule](#nvidia). A server the session does not offer falls back to `auto`. `SDL_VIDEODRIVER`, `SDL_VIDEO_DRIVER` or a `MOCKTAIL_FORCE_*` switch in your environment takes precedence. |
 | `display.start_mode` | `remember`, `windowed`, `maximized`, `fullscreen` | `MOCKTAIL_WINDOW_START_MODE` | Window state at start. `remember` restores the mode the last session ended in. |
 | `account.sign_in` | `native`, `browser` | `MOCKTAIL_NATIVE_LOGIN` (`0` means `browser`, anything else `native`) | Where you sign in when Roblox starts without a working saved session: Roblox's own welcome screen, or Mocktail's roblox.com window. |
-| `engine.graphics_quality` | `default`, `manual`, `1` to `21` | `MOCKTAIL_GRAPHICS_QUALITY` (also `auto` or `0` for `manual`) | Roblox's graphics quality level. `default` and `manual` leave it to Roblox's own Graphics Quality setting; a number forces that level (`DFIntDebugFRMQualityLevelOverride`), whatever the performance settings, and Roblox's in-game slider then has no effect. Before 1.0.4-plus.2 the level was sent under a name Roblox 2.738 ignores, so it never took effect. |
+| `engine.graphics_quality` | `default`, `manual`, `1` to `21` | `MOCKTAIL_GRAPHICS_QUALITY` (also `auto` or `0` for `manual`) | Roblox's graphics quality level. `default` and `manual` leave it to Roblox's own Graphics Quality setting; a number is sent as that level (`DFIntDebugFRMQualityLevelOverride`, the name Roblox 2.738 registers), whatever the performance settings, in place of Roblox's in-game slider. That the level then applies in a game is not verified yet. Before 1.0.4-plus.2 the level was sent under a name that, judging by Roblox 2.738's code, Roblox ignores, so it never took effect. |
 | `engine.gpu` | `auto`, `discrete`, `integrated` | `MOCKTAIL_GPU` | Graphics card for direct Vulkan on computers with more than one. See [Hybrid laptops](#hybrid-laptops). |
 | `engine.nvidia_shader_mt` | `true`, `false` | `MOCKTAIL_NVIDIA_SHADER_MT` (`1`/`0`, `true`/`false`, `on`/`off`) | With direct Vulkan, lets Roblox load its shader pack on several threads on NVIDIA cards. `false` makes it use one thread there, as upstream does. |
 | `engine.etc2_to_bc` | `true`, `false` | `MOCKTAIL_ETC2_TO_BC` (`1`/`0`, `true`/`false`, `on`/`off`) | Compressed textures (BC). With direct Vulkan on a card that cannot read ETC2 (NVIDIA), Roblox's ETC2 textures are converted to BC and stay compressed. `false` unpacks them to full size, as before 1.0.4-plus.2. A card that reads ETC2 itself is not affected. See [ETC2 textures](#etc2-textures). |
@@ -670,7 +680,9 @@ caused by `Color3` errors in the newer SDUI page. An explicit
 
 ### Measuring stutter
 
-Start a session with `MOCKTAIL_FRAME_STATS=1`, for example
+Start a session with `MOCKTAIL_FRAME_STATS=1` on the default
+`direct-vulkan` graphics backend (with `graphics.backend: opengl` it logs
+none of these lines), for example
 `MOCKTAIL_FRAME_STATS=1 mocktail --play`. The session log then gets these
 lines:
 
