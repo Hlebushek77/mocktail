@@ -1064,10 +1064,13 @@ GtkWidget* BuildGraphicsQualityRow(LauncherContext* context,
         "changed while you play.") +
       "\n\n" +
       // performance_policy.cc MergeGraphicsQuality:
-      // DFIntDebugFRMQualityLevelOverride, whatever the preset does.
-      _("• Custom level: forces the level you pick, whatever the "
-        "Performance settings; Roblox's in-game slider then has no effect. "
-        "The change applies the next time Roblox starts.") +
+      // DFIntDebugFRMQualityLevelOverride, whatever the preset does. The
+      // name and its DF scope come from Roblox 2.738's code; what the
+      // level does in a game is not verified yet.
+      _("• Custom level: Mocktail sends the level you pick to Roblox, "
+        "whatever the Performance settings, so Roblox's in-game slider "
+        "should have no effect (not yet verified in a game for this Roblox "
+        "build). The change applies the next time Roblox starts.") +
       "\n\n" +
       // performance_policy.cc rendering_settings.
       _("Separately, Mocktail's performance preset keeps anti-aliasing "
@@ -1076,18 +1079,23 @@ GtkWidget* BuildGraphicsQualityRow(LauncherContext* context,
         "with Multithreaded rendering.") +
       "\n\n" +
       // performance_policy.h kGraphicsQualityClientSetting: Roblox
-      // registers the variable as a DFInt and ignored the FInt spelling.
+      // registers the variable as a DFInt, and its setter refuses a value
+      // under the FInt spelling (a static reading of libroblox). plus.1's
+      // default was level 3, level 1 with Vulkan on Intel integrated
+      // graphics.
       _("Before version 1.0.4-plus.2, Mocktail sent the level under a name "
-        "that Roblox 2.738 ignores, so neither its default level 3 nor a "
-        "level chosen here took effect: Roblox's own setting decided.");
+        "that, judging by Roblox 2.738's code, Roblox ignores, so neither "
+        "Mocktail's default level (3, or 1 on Intel integrated graphics) "
+        "nor a level chosen here took effect: Roblox's own setting "
+        "decided.");
   spec.hint.details_for = [](LauncherContext& ctx) {
     const QualityEffect effect =
         ResolveGraphicsQuality(ctx.EffectiveValue(kQualityKey, "default"));
     return effect.source == QualitySource::kRobloxSetting
                ? std::string(_("With the current settings Roblox's own "
                                "Graphics Quality setting decides."))
-               : Format(_("With the current settings Roblox runs at level "
-                          "%d."),
+               : Format(_("With the current settings Mocktail sends level "
+                          "%d to Roblox."),
                         effect.level);
   };
   spec.hint.recommend = [](const MachineProfile& machine) {
@@ -1154,9 +1162,10 @@ GtkWidget* BuildQualityLevelRow(LauncherContext* context) {
   spec.keywords = {"quality level", "уровень качества"};
   spec.hint.subtitle = _("1 is the fastest, 21 looks best");
   spec.hint.details =
-      _("The graphics quality level Mocktail forces. Level 1 draws the least "
-        "and runs fastest; level 21 draws the most detail. Roblox's own "
-        "quality slider has no effect while a level is set here.") +
+      _("The graphics quality level Mocktail sends to Roblox. Level 1 draws "
+        "the least and runs fastest; level 21 draws the most detail. While "
+        "a level is set here, Roblox's own quality slider should have no "
+        "effect.") +
       std::string("\n\n") +
       _("Change it in small steps and check the frame rate in a busy "
         "experience. Choose “Set in Roblox” above to let Roblox pick the "

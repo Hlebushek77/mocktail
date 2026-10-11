@@ -246,8 +246,8 @@ GtkWidget* BuildMultithreadedRow(LauncherContext* context) {
       "\n\n" +
       // performance_policy.cc: auto + multithreaded merges the preset.
       _("With Automatic physics workers, turning it on also turns on "
-        "Mocktail's performance preset: a 128 MB texture budget and no "
-        "MSAA.") +
+        "Mocktail's performance preset, which among other things sets a "
+        "128 MB texture budget and turns MSAA off.") +
       "\n\n" +
       _("More worker threads help busy places reach a higher frame rate; "
         "on a computer doing other heavy work at the same time, they compete "
@@ -282,11 +282,12 @@ GtkWidget* BuildPhysicsRow(LauncherContext* context) {
       std::string("\n\n") +
       // performance_policy.cc: throughput scheduler settings and
       // rendering_settings (FIntDebugForceMSAASamples=1,
-      // FIntRenderTextureTotalBudgetMB=128; the rest sizes worker threads
-      // and caches).
+      // FIntRenderTextureTotalBudgetMB=128, and settings for worker
+      // threads, caches, terrain, meshes and avatars).
       _("• Throughput (default): Roblox's worker pools may use every "
-        "physical core, and Mocktail's performance preset is on: a 128 MB "
-        "texture budget and anti-aliasing (MSAA) off.") +
+        "physical core, and Mocktail's performance preset is on; among "
+        "other things it sets a 128 MB texture budget and turns "
+        "anti-aliasing (MSAA) off.") +
       "\n\n" +
       // performance_policy.cc: latency only sets
       // DFIntSimMidPhaseContactPipelineBatchSize.

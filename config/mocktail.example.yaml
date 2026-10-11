@@ -142,8 +142,9 @@ account:
 engine:
   # String (default: default): Roblox's graphics quality level. default
   # leaves it to Roblox's own Graphics Quality setting (manual means the
-  # same), and an integer from 1 to 21 forces that level, whatever the
-  # performance settings; Roblox's in-game slider then has no effect.
+  # same), and an integer from 1 to 21 is sent to Roblox as that level
+  # (DFIntDebugFRMQualityLevelOverride), whatever the performance settings,
+  # in place of Roblox's in-game slider.
   graphics_quality: default
   # String (default: auto): graphics card for direct Vulkan when the computer
   # has more than one: auto, discrete, or integrated. auto prefers the

@@ -83,8 +83,8 @@ std::string RobloxSideTitle(RobloxOverrideKind kind) {
 std::string Summary(const RobloxOverride& entry) {
   switch (entry.kind) {
     case RobloxOverrideKind::kGraphicsQuality:
-      return Format(_("Mocktail forces graphics quality level %d, so Roblox's "
-                      "Graphics Quality slider has no effect"),
+      return Format(_("Mocktail sends graphics quality level %d in place of "
+                      "Roblox's Graphics Quality slider"),
                     entry.number);
     case RobloxOverrideKind::kRenderingLimits:
       return _(
@@ -140,21 +140,28 @@ std::string Details(const RobloxOverride& entry) {
   switch (entry.kind) {
     case RobloxOverrideKind::kGraphicsQuality:
       // performance_policy.cc MergeGraphicsQuality, for a level in
-      // engine.graphics_quality, whatever the preset does.
+      // engine.graphics_quality, whatever the preset does. The name and
+      // its DF scope come from Roblox 2.738's code, not from a game.
       return _(
-          "Mocktail sets DFIntDebugFRMQualityLevelOverride, which replaces "
-          "the level the Graphics Quality option in Roblox's settings "
-          "would choose.");
+          "Mocktail sets DFIntDebugFRMQualityLevelOverride, the name "
+          "Roblox 2.738 registers for this setting, in place of the level "
+          "the Graphics Quality option in Roblox's settings would choose. "
+          "That the option then has no effect is not verified in a game "
+          "for this Roblox build.");
     case RobloxOverrideKind::kRenderingLimits:
       // performance_policy.cc rendering_settings: the keys Roblox reads
-      // that decide what it draws; the rest size worker threads and caches.
+      // that decide most visibly what it draws. The rest size worker
+      // threads and caches or tune terrain, meshes and avatars;
+      // FIntTerrainArraySliceSize and FIntTextureCompositorLowResFactor,
+      // for example, are read as well.
       return _(
           "While the preset is on, Mocktail sets these Roblox client "
           "settings at every start, in place of what Roblox would choose "
           "itself: MSAA off (FIntDebugForceMSAASamples=1), a 128 MB "
           "texture budget (FIntRenderTextureTotalBudgetMB) and compressed "
           "terrain textures (FFlagDebugTerrainVTCompressedTextures), along "
-          "with settings for Roblox's worker threads and caches.");
+          "with other settings for Roblox's worker threads, caches, "
+          "terrain, meshes and avatars.");
     case RobloxOverrideKind::kFrameRateTarget:
       // frame_rate_policy.cc sets DFIntTaskSchedulerTargetFps and
       // FFlagGameBasicSettingsFramerateCap5; which of the target and the

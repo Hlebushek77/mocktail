@@ -194,9 +194,11 @@ TEST(RuntimeConfigBootstrapTest,
            "sign_in: native",
            "# String (default: default): Roblox's graphics quality level. "
            "default\n  # leaves it to Roblox's own Graphics Quality setting "
-           "(manual means the\n  # same), and an integer from 1 to 21 forces "
-           "that level, whatever the\n  # performance settings; Roblox's "
-           "in-game slider then has no effect.\n  graphics_quality: default",
+           "(manual means the\n  # same), and an integer from 1 to 21 is "
+           "sent to Roblox as that level\n  # "
+           "(DFIntDebugFRMQualityLevelOverride), whatever the performance "
+           "settings,\n  # in place of Roblox's in-game slider.\n  "
+           "graphics_quality: default",
            "# String (default: auto): graphics card for direct Vulkan when the "
            "computer\n  # has more than one: auto, discrete, or integrated. "
            "auto prefers the\n  # discrete card unless DRI_PRIME or "
