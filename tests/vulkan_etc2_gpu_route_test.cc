@@ -1012,6 +1012,52 @@ TEST_F(Etc2GpuRouteFakeTest, ARescueDecodesOnTheCpuIntoTheArena) {
   EXPECT_NE(log.find("rescued=6 dropped=3"), std::string::npos) << log;
 }
 
+// [CR-7] While the reserved rescue slot is still pending (the GPU is far
+// behind), the next rescue gets another rescue-only slot instead of a wait
+// without a bound inside Roblox's vkQueueSubmit; once the GPU has caught
+// up, the reserved one serves again.
+TEST_F(Etc2GpuRouteFakeTest, ARescueNeverWaitsForAPendingRescueSlot) {
+  FakeRig rig(GpuOptions());
+  ASSERT_TRUE(rig.WarmUp());
+  const VkCommandPool pool = rig.Pool(0);
+  RigImage* image = rig.Image(VK_FORMAT_EAC_R11_UNORM_BLOCK, 20, 20, 2);
+  RigSource* source = rig.Source(4096, 47);
+  const std::uint64_t slots = rig.gpu()->stats().slots_created;
+  const std::uint64_t waits = rig.fake().calls("vkWaitForFences");
+  Etc2GpuTesting().fail_slot_acquire = true;  // as if 32 calls were pending
+  rig.fake().HoldFences(true);
+  for (int call = 0; call < 3; ++call) {
+    const VkCommandBuffer command_buffer = rig.Begin(pool);
+    const auto regions = rig.Upload(command_buffer, *image, *source);
+    rig.End(command_buffer);
+    ASSERT_EQ(rig.Submit(rig.queue(), {{command_buffer}}, VK_NULL_HANDLE),
+              VK_SUCCESS);
+    rig.Check(*image, *source, regions);
+  }
+  Etc2GpuDevice::Stats stats = rig.gpu()->stats();
+  EXPECT_EQ(stats.rescues, 3U);
+  EXPECT_EQ(stats.rescued_uploads, 6U);
+  EXPECT_EQ(stats.dropped_uploads, 0U);
+  EXPECT_EQ(stats.slots_created, slots + 3) << "a rescue slot per pending call";
+  EXPECT_EQ(rig.fake().calls("vkWaitForFences"), waits);
+
+  rig.fake().HoldFences(false);
+  const VkCommandBuffer caught_up = rig.Begin(pool);
+  const auto regions = rig.Upload(caught_up, *image, *source);
+  rig.End(caught_up);
+  ASSERT_EQ(rig.Submit(rig.queue(), {{caught_up}}, VK_NULL_HANDLE),
+            VK_SUCCESS);
+  rig.Check(*image, *source, regions);
+  stats = rig.gpu()->stats();
+  EXPECT_EQ(stats.rescues, 4U);
+  EXPECT_EQ(stats.slots_created, slots + 3) << "the reserved one again";
+  EXPECT_EQ(rig.fake().calls("vkWaitForFences"), waits);
+  Etc2GpuTesting().fail_slot_acquire = false;
+  rig.Teardown();
+  ExpectEverythingReleased(rig.fake());
+  EXPECT_TRUE(rig.fake().errors().empty()) << rig.fake().errors().front();
+}
+
 // The CPU half reads Roblox's bytes where the decode pass would: rows and
 // layers apart (bufferRowLength, bufferImageHeight), from a source Roblox
 // does not keep mapped (mapped for the submit, as on the CPU route), in

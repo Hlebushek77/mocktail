@@ -128,7 +128,7 @@ struct Slot {
   GpuBuffer jobs;
   VkDescriptorSet set0 = VK_NULL_HANDLE;
   Phase phase = Phase::kFree;
-  bool rescue = false;  // the queue's reserved rescue slot (CR-7)
+  bool rescue = false;  // a rescue-only slot of the queue (CR-7)
   std::uint64_t epoch = 0;
   Clock::time_point input_needed{};
   struct QueueState* queue = nullptr;
@@ -146,7 +146,9 @@ struct QueueState {
   VkQueue queue = VK_NULL_HANDLE;
   std::uint32_t family = 0;
   std::vector<std::unique_ptr<Slot>> slots;
-  std::unique_ptr<Slot> rescue;
+  // Rescue-only slots (CR-7), never taken by a normal submit: the reserved
+  // one, and more while it is pending (AcquireRescueSlot).
+  std::vector<std::unique_ptr<Slot>> rescues;
 };
 
 struct Selftest {
@@ -1092,39 +1094,59 @@ struct Etc2GpuDevice::Impl {
     return Recycle(*oldest) ? oldest : nullptr;
   }
 
-  // [CR-7] The queue's reserved slot for a rescue when no normal slot came
-  // free. Waits for it without a cap only when its fence was submitted.
+  // [CR-7] A slot for a rescue when no normal slot came free: the queue's
+  // reserved rescue slot (recycled once its fence signalled), or, while it
+  // is still pending, another rescue-only slot (a pool and a fence, no
+  // buffers), up to kMaxSlots. Only with all of those pending does it
+  // wait, as AcquireSlot does, at most 50 ms for the oldest. It never waits
+  // without a bound: this runs inside Roblox's vkQueueSubmit, and the work
+  // ahead of the fence may wait for something this very thread submits
+  // later. Null: the batch's uploads are dropped.
   Slot* AcquireRescueSlot(QueueState& queue) {
     if (Etc2GpuTesting().fail_rescue_slot.load()) {
       return nullptr;
     }
-    if (queue.rescue == nullptr) {
-      auto slot = std::make_unique<Slot>();
-      if (!CreateSlot(queue.family, true, slot.get())) {
-        return nullptr;
+    Slot* oldest = nullptr;
+    for (const std::unique_ptr<Slot>& slot : queue.rescues) {
+      // Never reset a fence that may still be pending.
+      if (slot->phase == Slot::Phase::kInFlight &&
+          Signalled(fns().get_fence_status(info.device, slot->fence))) {
+        Recycle(*slot);
       }
-      slot->queue = &queue;
-      queue.rescue = std::move(slot);
-      return queue.rescue.get();
+      if (slot->phase == Slot::Phase::kNotSubmitted) {
+        Recycle(*slot);
+      }
+      if (slot->phase == Slot::Phase::kFree) {
+        return slot.get();
+      }
+      if (slot->phase == Slot::Phase::kInFlight &&
+          (oldest == nullptr || slot->epoch < oldest->epoch)) {
+        oldest = slot.get();
+      }
     }
-    Slot& slot = *queue.rescue;
-    switch (slot.phase) {
-      case Slot::Phase::kFree:
-        return &slot;
-      case Slot::Phase::kNotSubmitted:
-        return Recycle(slot) ? &slot : nullptr;
-      case Slot::Phase::kInFlight:
-        // Never reset a fence that may still be pending.
-        if (!Signalled(fns().wait_for_fences(info.device, 1, &slot.fence,
-                                             VK_TRUE, UINT64_MAX))) {
-          return nullptr;
-        }
-        return Recycle(slot) ? &slot : nullptr;
-      case Slot::Phase::kRecording:
-      case Slot::Phase::kLost:
-        break;
+    if (queue.rescues.size() < kMaxSlots) {
+      auto slot = std::make_unique<Slot>();
+      if (CreateSlot(queue.family, true, slot.get())) {
+        slot->queue = &queue;
+        queue.rescues.push_back(std::move(slot));
+        return queue.rescues.back().get();
+      }
     }
-    return nullptr;
+    if (oldest == nullptr) {
+      return nullptr;
+    }
+    const VkResult status = fns().wait_for_fences(
+        info.device, 1, &oldest->fence, VK_TRUE, kSlotWaitNs);
+    const bool signalled = Signalled(status);
+    CountStats([signalled](Stats& counts) {
+      ++counts.slot_waits;
+      counts.slot_timeouts += signalled ? 0 : 1;
+    });
+    Count([](Etc2DecodeTotals& totals) { ++totals.gpu_slot_waits; });
+    if (!signalled) {
+      return nullptr;
+    }
+    return Recycle(*oldest) ? oldest : nullptr;
   }
 
   VkCommandBuffer NextCommandBuffer(Slot& slot) {
@@ -1878,11 +1900,11 @@ struct Etc2GpuDevice::Impl {
         }
         DestroySlot(slot.get());
       }
-      if (queue_state->rescue != nullptr) {
-        if (queue_state->rescue->phase == Slot::Phase::kInFlight) {
-          WaitSubmitted(queue_state->rescue->fence, "a rescue pass");
+      for (std::unique_ptr<Slot>& slot : queue_state->rescues) {
+        if (slot->phase == Slot::Phase::kInFlight) {
+          WaitSubmitted(slot->fence, "a rescue pass");
         }
-        DestroySlot(queue_state->rescue.get());
+        DestroySlot(slot.get());
       }
     }
     {
