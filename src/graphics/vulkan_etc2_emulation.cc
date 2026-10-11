@@ -248,9 +248,8 @@ Etc2EmulationOptions Etc2EmulationOptions::FromLookup(
   }
   options.upscale =
       SmallTextureUpscale(lookup("MOCKTAIL_SMALL_TEXTURE_UPSCALE"));
-  options.fast_path = ParseSwitch(lookup("MOCKTAIL_ETC2_FAST_PATH"), true);
   options.gpu = ParseSwitch(lookup("MOCKTAIL_ETC2_GPU"), true);
-  options.to_bc = ParseSwitch(lookup("MOCKTAIL_ETC2_TO_BC"), false);
+  options.to_bc = ParseSwitch(lookup("MOCKTAIL_ETC2_TO_BC"), true);
   std::uint64_t value = 0;
   if (ParseCount(lookup("MOCKTAIL_ETC2_WORKERS"), 64, &value)) {
     options.workers = static_cast<unsigned>(value);
@@ -284,6 +283,11 @@ Etc2EmulationOptions Etc2EmulationOptions::FromEnvironment() {
   return FromLookup([](const char* name) -> const char* {
     return std::getenv(name);
   });
+}
+
+Etc2EmulationTestHooks& Etc2EmulationTesting() {
+  static auto* hooks = new Etc2EmulationTestHooks;
+  return *hooks;
 }
 
 namespace {
@@ -812,13 +816,10 @@ struct VulkanEtc2Emulation::State {
   std::atomic<bool> has_commands{false};
   // Concurrent submits decode one at a time.
   std::mutex scratch_mutex;
-  // The fast path's scratch: compressed bytes, and decoded texels of the
+  // The CPU route's scratch: compressed bytes, and decoded texels of the
   // uploads that do not decode straight into staging.
   Etc2Scratch fast_source;
   Etc2Scratch fast_decoded;
-  // MOCKTAIL_ETC2_FAST_PATH=0: plus.1's scratch and its policy.
-  std::vector<std::uint8_t> scratch_source;
-  std::vector<std::uint8_t> scratch_decoded;
   // When Housekeeping may run next (steady clock, ns).
   std::atomic<std::int64_t> next_housekeeping_ns{0};
   TextureOverrides overrides = TextureOverrides::FromEnvironment();
@@ -1119,6 +1120,32 @@ struct VulkanEtc2Emulation::State {
     return nullptr;
   }
 
+  // [CR-14] An image copy between a BC image of an ETC2->BC device and one
+  // of its images kept RGBA8/R16: a BC block is 8 or 16 bytes and a texel
+  // of those 2 to 4, so the host formats are not size-compatible
+  // (VUID-vkCmdCopyImage-srcImage-01548), and each side would read the
+  // extent in its own units. Such a copy is left out (the destination
+  // keeps what it held), logged and counted. True when it was.
+  bool SkipMixedBcCopy(const HostDevice& dev, VkImage source,
+                       VkImage destination) {
+    if (!dev.bc) {
+      return false;
+    }
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      const auto from = images.find(source);
+      const auto to = images.find(destination);
+      if (from == images.end() || to == images.end() ||
+          from->second.bc == to->second.bc) {
+        return false;
+      }
+    }
+    LogFailure("skipped an image copy between a BC image and one kept "
+               "RGBA8/R16");
+    CountTotals([](Etc2DecodeTotals& totals) { ++totals.bc_mixed_copies; });
+    return true;
+  }
+
   bool BlitScaledCopy(const HostDevice& dev, VkCommandBuffer command_buffer,
                       VkImage source, VkImageLayout source_layout,
                       VkImage destination, VkImageLayout destination_layout,
@@ -1262,8 +1289,8 @@ struct VulkanEtc2Emulation::State {
   // Records the CPU route of one copy: the decoded texels go to staging at
   // submit time, and the host copy reads them from there. Staging is a
   // range of the device's host staging arena, which costs no Vulkan call
-  // once its chunks exist; a one-off buffer only with
-  // MOCKTAIL_ETC2_FAST_PATH=0 or when the arena cannot grow.
+  // once its chunks exist; a one-off buffer only when the arena cannot
+  // grow.
   template <typename Region, typename HostCopy>
   CpuCopyResult RecordCpuCopy(const HostDevice& dev,
                               VkCommandBuffer command_buffer,
@@ -1849,8 +1876,6 @@ struct VulkanEtc2Emulation::State {
                               std::uint32_t count);
   std::uint32_t RunCpuUploadsFast(std::vector<CpuWork>* work,
                                   const SourceTypes& types);
-  std::uint32_t RunCpuUploadsLegacy(std::vector<CpuWork>* work,
-                                    const SourceTypes& types);
   // A CPU pass's stall line, totals and milestone.
   void FinishCpuPass(std::size_t uploads, VkDeviceSize compressed_total,
                      VkDeviceSize host_total, std::uint64_t decode_ns,
@@ -1860,7 +1885,8 @@ struct VulkanEtc2Emulation::State {
   // decoded texels. Thread-safe; uploads of one image must come in order.
   void EmitScaled(const PendingUpload& upload, const std::uint8_t* decoded);
   // At most once a second, from OnPresent and the CPU route: trims the
-  // host staging arenas and gives back idle scratch.
+  // host staging arenas and the GPU route's output arenas, and gives back
+  // idle scratch.
   void Housekeeping(Clock::time_point now);
   // The GPU route's rescue, its CPU half (DESIGN §6, CR-7): decodes the
   // GPU-route uploads of one batch of `dev` into host staging, in the
@@ -2082,7 +2108,7 @@ void VulkanEtc2Emulation::RegisterDevice(
     instance_proc(dev->enumerate_device_extensions,
                   "vkEnumerateDeviceExtensionProperties");
   }
-  if (emulated && state_->options.fast_path) {
+  if (emulated && !Etc2EmulationTesting().no_host_staging.load()) {
     // The CPU route's staging (DESIGN C1). Chunks come on first use.
     const HostDevice* const host = dev.get();
     const Etc2StagingMemory kind = state_->options.staging_memory;
@@ -2232,8 +2258,6 @@ void VulkanEtc2Emulation::DestroyDevice(VkDevice device) {
     std::lock_guard<std::mutex> lock(state_->scratch_mutex);
     state_->fast_source.Release();
     state_->fast_decoded.Release();
-    std::vector<std::uint8_t>().swap(state_->scratch_source);
-    std::vector<std::uint8_t>().swap(state_->scratch_decoded);
   }
 }
 
@@ -2754,6 +2778,9 @@ void VulkanEtc2Emulation::CmdCopyImage(
     return;
   }
   CountImageCopy(state_, *dev, source, destination);
+  if (state_->SkipMixedBcCopy(*dev, source, destination)) {
+    return;
+  }
   if (dev->emulated && state_->options.upscale > 1 &&
       state_->BlitScaledCopy(*dev, command_buffer, source, source_layout,
                              destination, destination_layout, region_count,
@@ -2772,6 +2799,9 @@ void VulkanEtc2Emulation::CmdCopyImage2(VkDevice device,
     return;
   }
   CountImageCopy(state_, *dev, info->srcImage, info->dstImage);
+  if (state_->SkipMixedBcCopy(*dev, info->srcImage, info->dstImage)) {
+    return;
+  }
   if (dev->emulated && state_->options.upscale > 1 &&
       info->pRegions != nullptr) {
     std::vector<VkImageCopy> regions;
@@ -2988,9 +3018,7 @@ std::uint32_t VulkanEtc2Emulation::State::RunCpuUploads(
     return 0;
   }
   const SourceTypes types = CountSourceTypes(work);
-  const std::uint32_t decoded = options.fast_path
-                                    ? RunCpuUploadsFast(&work, types)
-                                    : RunCpuUploadsLegacy(&work, types);
+  const std::uint32_t decoded = RunCpuUploadsFast(&work, types);
   Housekeeping(Clock::now());
   return decoded;
 }
@@ -3048,138 +3076,11 @@ std::uint64_t Milliseconds(Clock::duration duration) {
 
 }  // namespace
 
-std::uint32_t VulkanEtc2Emulation::State::RunCpuUploadsLegacy(
-    std::vector<CpuWork>* work, const SourceTypes& types) {
-  // Decode in cached RAM; mapped Vulkan memory makes scattered reads slow.
-  TemporaryMappings temporary;
-  struct Copy {
-    const std::uint8_t* source = nullptr;
-    VkDeviceSize compressed = 0;
-    VkDeviceSize decoded = 0;
-  };
-  // Everything from here on holds up the submit.
-  const auto decode_start = Clock::now();
-  std::vector<Copy> copies;
-  std::vector<const PendingUpload*> copied_uploads;
-  std::vector<std::uint32_t> copied_types;
-  VkDeviceSize compressed_total = 0;
-  VkDeviceSize decoded_total = 0;
-  for (const CpuWork& item : *work) {
-    const PendingUpload& upload = item.upload;
-    const std::uint8_t* source = item.source;
-    if (source == nullptr) {
-      source = temporary.Map(Find(upload.device), item.memory,
-                             item.memory_offset);
-      if (source == nullptr) {
-        LogFailure("could not map an unmapped upload source");
-        continue;
-      }
-    }
-    copies.push_back({source, upload.compressed, upload.decoded});
-    copied_uploads.push_back(&upload);
-    copied_types.push_back(item.memory_type);
-    compressed_total += upload.compressed;
-    decoded_total += upload.decoded;
-  }
-
-  std::unique_lock<std::mutex> scratch_lock(scratch_mutex);
-  const auto copy_start = Clock::now();
-  if (scratch_source.size() < compressed_total) {
-    scratch_source.resize(compressed_total);
-  }
-  if (scratch_decoded.size() < decoded_total) {
-    scratch_decoded.resize(decoded_total);
-  }
-  std::vector<EtcDecodeJob> jobs;
-  VkDeviceSize compressed_offset = 0;
-  VkDeviceSize decoded_offset = 0;
-  for (std::size_t index = 0; index < copies.size(); ++index) {
-    const Copy& copy = copies[index];
-    const PendingUpload& upload = *copied_uploads[index];
-    std::uint8_t* source = scratch_source.data() + compressed_offset;
-    std::uint8_t* decoded = scratch_decoded.data() + decoded_offset;
-    const VkDeviceSize compressed_layer = upload.compressed / upload.layers;
-    const VkDeviceSize decoded_layer = upload.decoded / upload.layers;
-    if (upload.source_span == copy.compressed) {
-      std::memcpy(source, copy.source, copy.compressed);
-    } else {
-      const VkDeviceSize block_rows =
-          (static_cast<VkDeviceSize>(upload.height) + 3) / 4;
-      const VkDeviceSize packed_row = compressed_layer / block_rows;
-      for (std::uint32_t layer = 0; layer < upload.layers; ++layer) {
-        for (VkDeviceSize row = 0; row < block_rows; ++row) {
-          std::memcpy(source + layer * compressed_layer + row * packed_row,
-                      copy.source + layer * upload.source_layer_stride +
-                          row * upload.source_row_stride,
-                      packed_row);
-        }
-      }
-    }
-    for (std::uint32_t layer = 0; layer < upload.layers; ++layer) {
-      EtcDecodeJob job;
-      job.format = upload.format;
-      job.source = source + layer * compressed_layer;
-      job.source_bytes = compressed_layer;
-      job.width = upload.width;
-      job.height = upload.height;
-      job.destination = decoded + layer * decoded_layer;
-      job.destination_bytes = decoded_layer;
-      jobs.push_back(job);
-    }
-    compressed_offset += copy.compressed;
-    decoded_offset += copy.decoded;
-    if (ShouldLog(&g_decode_logs, 4)) {
-      std::fprintf(stderr,
-                   "  [vulkan] ETC2 upload decoded %ux%u layers=%u\n",
-                   upload.width, upload.height, upload.layers);
-    }
-  }
-  temporary.UnmapAll();
-  const auto jobs_start = Clock::now();
-  const unsigned threads =
-      std::max(1U, DecodeEtcJobs(jobs.data(), jobs.size(), WorkerCount()));
-  const auto jobs_end = Clock::now();
-  for (const EtcDecodeJob& job : jobs) {
-    if (!job.ok) {
-      LogFailure("could not decode an upload layer");
-    }
-  }
-  compressed_offset = 0;
-  decoded_offset = 0;
-  VkDeviceSize host_total = 0;
-  for (const PendingUpload* upload : copied_uploads) {
-    EmitUpload(*upload, scratch_source.data() + compressed_offset,
-               scratch_decoded.data() + decoded_offset);
-    compressed_offset += upload->compressed;
-    decoded_offset += upload->decoded;
-    host_total += upload->target_bytes;
-  }
-  const auto emit_end = Clock::now();
-  const std::uint64_t trace_ns =
-      Tracing() && !copied_uploads.empty()
-          ? TraceUploads(copied_uploads, copied_types, scratch_source.data())
-          : 0;
-  ReleaseOversizedEtc2Scratch(&scratch_source);
-  ReleaseOversizedEtc2Scratch(&scratch_decoded);
-  scratch_lock.unlock();
-  if (copied_uploads.empty()) {
-    return 0;
-  }
-  const std::uint64_t decode_ns =
-      Nanoseconds(Clock::now() - decode_start) - trace_ns;
-  const std::uint64_t phase_ms[4] = {
-      Milliseconds(copy_start - decode_start),
-      Milliseconds(jobs_start - copy_start),
-      Milliseconds(jobs_end - jobs_start), Milliseconds(emit_end - jobs_end)};
-  FinishCpuPass(copied_uploads.size(), compressed_total, host_total,
-                decode_ns, phase_ms, threads, types);
-  return static_cast<std::uint32_t>(copied_uploads.size());
-}
-
-// The fast path (DESIGN C2): copy-in with streaming loads and decode on the
-// worker pool; unscaled uploads decode straight into their staging, which
-// rewritten regions lay out exactly as the decoder writes; upscaled ones
-// resample per image in parallel. Its output is the same, byte for byte.
+// The CPU fast path (DESIGN C2): copy-in with streaming loads and decode on
+// the worker pool; unscaled uploads decode straight into their staging,
+// which rewritten regions lay out exactly as the decoder writes; upscaled
+// ones resample per image in parallel. Its output is plus.1's, byte for byte
+// (the WP0T goldens).
 // Uploads into BC images (C4.4) transcode straight into their staging, in
 // pieces on the pool, unless an override may replace them.
 std::uint32_t VulkanEtc2Emulation::State::RunCpuUploadsFast(
@@ -3499,8 +3400,7 @@ void VulkanEtc2Emulation::State::FinishCpuPass(
                  static_cast<unsigned long long>(phase_ms[1]),
                  static_cast<unsigned long long>(phase_ms[2]),
                  static_cast<unsigned long long>(phase_ms[3]),
-                 FormatEtc2StallSuffix(threads, options.fast_path,
-                                       types.bytes, types.unknown)
+                 FormatEtc2StallSuffix(threads, types.bytes, types.unknown)
                      .c_str());
   }
   bool milestone = false;
@@ -3570,16 +3470,16 @@ void VulkanEtc2Emulation::State::Housekeeping(Clock::time_point now) {
           due, now_ns + 1000000000LL, std::memory_order_relaxed)) {
     return;
   }
-  std::vector<VkDevice> staged;
+  std::vector<VkDevice> emulated;
   {
     std::lock_guard<std::mutex> lock(devices_mutex);
     for (const auto& dev : devices) {
-      if (dev->host_staging != nullptr) {
-        staged.push_back(dev->device);
+      if (dev->emulated) {
+        emulated.push_back(dev->device);
       }
     }
   }
-  for (VkDevice device : staged) {
+  for (VkDevice device : emulated) {
     // Hand over hand: once the device's own lock is held, DestroyDevice
     // waits for it before it destroys the arena and the device record.
     std::unique_lock<std::mutex> list(devices_mutex);
@@ -3596,6 +3496,11 @@ void VulkanEtc2Emulation::State::Housekeeping(Clock::time_point now) {
     list.unlock();
     if (dev->host_staging != nullptr) {
       dev->host_staging->Trim(now);
+    }
+    // Without this, only a submit with GPU-route uploads trims them, and a
+    // loading burst's chunks stay for as long as none comes.
+    if (dev->gpu != nullptr) {
+      dev->gpu->Trim(now);
     }
   }
   std::unique_lock<std::mutex> scratch(scratch_mutex, std::try_to_lock);

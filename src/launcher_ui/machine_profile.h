@@ -202,10 +202,6 @@ struct MachineProfile {
       std::string_view gpu_preference) const;
   // The Vulkan driver and card for direct Vulkan with `gpu_preference`.
   VulkanDriverSelection VulkanDriver(std::string_view gpu_preference) const;
-  // Direct Vulkan with `gpu_preference` renders on Intel integrated
-  // graphics, which then get graphics quality level 1 by default
-  // (graphics_launch_policy.h RendersOnIntelIntegratedGraphics).
-  bool RendersOnIntelIntegratedGraphics(std::string_view gpu_preference) const;
   // What the game window's video driver policy reads with `backend` and
   // `gpu_preference` (config.yaml graphics.backend and engine.gpu values)
   // and `unthrottled_presentation` (graphics.vsync and frame_rate_limit

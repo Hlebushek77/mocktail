@@ -537,7 +537,7 @@ RuntimeConfig RuntimeConfig::FromEnvironment(const Environment& environment) {
     config.engine_.nvidia_shader_mt_valid = false;
   }
   if (const std::optional<bool> etc2_to_bc = ParseEnvironmentSwitch(
-          environment.GetOr("MOCKTAIL_ETC2_TO_BC", "0"))) {
+          environment.GetOr("MOCKTAIL_ETC2_TO_BC", "1"))) {
     config.engine_.etc2_to_bc = *etc2_to_bc;
   } else {
     config.engine_.etc2_to_bc_valid = false;

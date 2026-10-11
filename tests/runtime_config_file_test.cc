@@ -192,9 +192,13 @@ TEST(RuntimeConfigBootstrapTest,
            "# String (default: native): sign in on Roblox's own welcome screen "
            "(native)\n  # or in Mocktail's browser sign-in window (browser).\n  "
            "sign_in: native",
-           "# Vulkan on Intel integrated graphics), manual leaves Roblox's "
-           "in-game\n  # graphics slider in control, and an integer from 1 to "
-           "21 forces that level.\n  graphics_quality: default",
+           "# String (default: default): Roblox's graphics quality level. "
+           "default\n  # leaves it to Roblox's own Graphics Quality setting "
+           "(manual means the\n  # same), and an integer from 1 to 21 is "
+           "sent to Roblox as that level\n  # "
+           "(DFIntDebugFRMQualityLevelOverride), whatever the performance "
+           "settings,\n  # in place of Roblox's in-game slider.\n  "
+           "graphics_quality: default",
            "# String (default: auto): graphics card for direct Vulkan when the "
            "computer\n  # has more than one: auto, discrete, or integrated. "
            "auto prefers the\n  # discrete card unless DRI_PRIME or "
@@ -205,13 +209,15 @@ TEST(RuntimeConfigBootstrapTest,
            "Intel and AMD.\n  # false makes Roblox load it on one thread "
            "there, as Mocktail did before\n  # this setting existed; use it "
            "only if shader loading fails on NVIDIA.\n  nvidia_shader_mt: true",
-           "# Boolean (default: false): on graphics cards that cannot read "
+           "# Boolean (default: true): on graphics cards that cannot read "
            "ETC2\n  # textures (NVIDIA, some others), convert Roblox's ETC2 "
-           "textures to BC\n  # instead of unpacking them, so they take 4 to "
-           "8 times less video memory.\n  # Fine detail can lose some "
-           "quality, and loading can take longer when the\n  # conversion "
-           "runs on the processor instead of the graphics card. Only the\n  "
-           "# Vulkan backend reads it.\n  etc2_to_bc: false",
+           "textures to BC and\n  # keep them compressed instead of unpacking "
+           "them, so they take 4 to 8\n  # times less video memory. Fine "
+           "detail can lose some quality, and loading\n  # can stutter briefly "
+           "when the conversion runs on the processor instead\n  # of the "
+           "graphics card. false unpacks them to full size. A card that "
+           "reads\n  # ETC2 itself is not affected. Only the Vulkan backend "
+           "reads it.\n  etc2_to_bc: true",
            "# Boolean (default: true): show the Mocktail settings window before "
            "Roblox\n  # starts. Website joins never show it; `mocktail "
            "--launcher` shows it and\n  # `mocktail --play` skips it regardless "
@@ -1182,7 +1188,7 @@ TEST(RuntimeConfigFileTest, ShippedTemplateDefaultsTheLauncherSections) {
   EXPECT_EQ(loaded.config.engine().graphics_quality, GraphicsQuality{});
   EXPECT_EQ(loaded.config.engine().gpu, GpuPreference::kAuto);
   EXPECT_TRUE(loaded.config.engine().nvidia_shader_mt);
-  EXPECT_FALSE(loaded.config.engine().etc2_to_bc);
+  EXPECT_TRUE(loaded.config.engine().etc2_to_bc);
   EXPECT_TRUE(loaded.config.launcher().show_on_start);
   // New keys live in new top-level sections so that older Mocktail builds,
   // which ignore unknown sections, still start with this file.
@@ -1226,13 +1232,13 @@ TEST(RuntimeConfigFileTest, LoadsEveryLauncherManagedValue) {
                 "engine:\n  graphics_quality: 1\n",
                 DisplayServer::kX11, WindowStartMode::kMaximized,
                 SignInMethod::kNative,
-                GraphicsQuality{GraphicsQualityMode::kLevel, 1}, true, false,
+                GraphicsQuality{GraphicsQualityMode::kLevel, 1}, true, true,
                 true},
            Case{"display:\n  start_mode: fullscreen\n"
                 "engine:\n  graphics_quality: \"21\"\n",
                 DisplayServer::kAuto, WindowStartMode::kFullscreen,
                 SignInMethod::kNative,
-                GraphicsQuality{GraphicsQualityMode::kLevel, 21}, true, false,
+                GraphicsQuality{GraphicsQualityMode::kLevel, 21}, true, true,
                 true},
        }) {
     const std::filesystem::path file =
@@ -1446,7 +1452,7 @@ launcher:
   EXPECT_EQ(loaded.config.engine().graphics_quality, GraphicsQuality{});
   EXPECT_EQ(loaded.config.engine().gpu, GpuPreference::kAuto);
   EXPECT_TRUE(loaded.config.engine().nvidia_shader_mt);
-  EXPECT_FALSE(loaded.config.engine().etc2_to_bc);
+  EXPECT_TRUE(loaded.config.engine().etc2_to_bc);
   EXPECT_TRUE(loaded.config.launcher().show_on_start);
 }
 
@@ -1506,7 +1512,7 @@ engine:
   graphics_quality: 7
   gpu: integrated
   nvidia_shader_mt: false
-  etc2_to_bc: true
+  etc2_to_bc: false
 launcher:
   show_on_start: false
 )yaml"));
@@ -1518,7 +1524,7 @@ launcher:
   EXPECT_EQ(GetVariable("MOCKTAIL_GRAPHICS_QUALITY"), "7");
   EXPECT_EQ(GetVariable("MOCKTAIL_GPU"), "integrated");
   EXPECT_EQ(GetVariable("MOCKTAIL_NVIDIA_SHADER_MT"), "0");
-  EXPECT_EQ(GetVariable("MOCKTAIL_ETC2_TO_BC"), "1");
+  EXPECT_EQ(GetVariable("MOCKTAIL_ETC2_TO_BC"), "0");
   EXPECT_EQ(GetVariable("MOCKTAIL_LAUNCHER_SHOW_ON_START"), "0");
 
   // The exported values read back to the same settings, which is what every
@@ -1532,7 +1538,7 @@ launcher:
             (GraphicsQuality{GraphicsQualityMode::kLevel, 7}));
   EXPECT_EQ(resolved.engine().gpu, GpuPreference::kIntegrated);
   EXPECT_FALSE(resolved.engine().nvidia_shader_mt);
-  EXPECT_TRUE(resolved.engine().etc2_to_bc);
+  EXPECT_FALSE(resolved.engine().etc2_to_bc);
   EXPECT_FALSE(resolved.launcher().show_on_start);
 
   loaded = LoadRuntimeConfig(
@@ -1546,39 +1552,42 @@ launcher:
   EXPECT_EQ(GetVariable("MOCKTAIL_GRAPHICS_QUALITY"), "manual");
   EXPECT_EQ(GetVariable("MOCKTAIL_GPU"), "auto");
   EXPECT_EQ(GetVariable("MOCKTAIL_NVIDIA_SHADER_MT"), "1");
-  EXPECT_EQ(GetVariable("MOCKTAIL_ETC2_TO_BC"), "0");
+  EXPECT_EQ(GetVariable("MOCKTAIL_ETC2_TO_BC"), "1");
   EXPECT_EQ(GetVariable("MOCKTAIL_LAUNCHER_SHOW_ON_START"), "1");
 }
 
-TEST(RuntimeConfigFileTest, DefaultGraphicsQualityLeavesThePresetInCharge) {
+TEST(RuntimeConfigFileTest, DefaultGraphicsQualityExportsNoLevel) {
   const ScopedEnvironment scoped({"MOCKTAIL_GRAPHICS_QUALITY"});
   TemporaryDirectory temporary;
   const std::filesystem::path file =
       temporary.Write("version: 1\nengine:\n  graphics_quality: default\n");
   std::string error;
 
-  // Unset stays unset, so the preset keeps its level 3.
+  // Unset stays unset: no level is forced.
   RuntimeConfigLoadResult loaded =
       LoadRuntimeConfig(ProcessEnvironment(), file);
   ASSERT_TRUE(loaded) << loaded.error;
   ASSERT_TRUE(ExportRuntimeConfigEnvironment(loaded.config, &error)) << error;
   EXPECT_EQ(GetVariable("MOCKTAIL_GRAPHICS_QUALITY"), std::nullopt);
 
-  // The Intel integrated graphics level the graphics launch policy
-  // publishes survives.
+  // A level in the variable wins over the YAML default and is kept.
   ASSERT_EQ(setenv("MOCKTAIL_GRAPHICS_QUALITY", "1", 1), 0);
   loaded = LoadRuntimeConfig(ProcessEnvironment(), file);
   ASSERT_TRUE(loaded) << loaded.error;
   ASSERT_TRUE(ExportRuntimeConfigEnvironment(loaded.config, &error)) << error;
   EXPECT_EQ(GetVariable("MOCKTAIL_GRAPHICS_QUALITY"), "1");
 
-  // The preset does not know the word "default"; it must never see it.
-  ASSERT_EQ(setenv("MOCKTAIL_GRAPHICS_QUALITY", "default", 1), 0);
-  loaded = LoadRuntimeConfig(ProcessEnvironment(), file);
-  ASSERT_TRUE(loaded) << loaded.error;
-  EXPECT_EQ(loaded.config.engine().graphics_quality, GraphicsQuality{});
-  ASSERT_TRUE(ExportRuntimeConfigEnvironment(loaded.config, &error)) << error;
-  EXPECT_EQ(GetVariable("MOCKTAIL_GRAPHICS_QUALITY"), std::nullopt);
+  // The words for the default, and an empty variable, leave it unset.
+  for (const char* value : {"default", ""}) {
+    ASSERT_EQ(setenv("MOCKTAIL_GRAPHICS_QUALITY", value, 1), 0);
+    loaded = LoadRuntimeConfig(ProcessEnvironment(), file);
+    ASSERT_TRUE(loaded) << loaded.error;
+    EXPECT_EQ(loaded.config.engine().graphics_quality, GraphicsQuality{});
+    ASSERT_TRUE(ExportRuntimeConfigEnvironment(loaded.config, &error))
+        << error;
+    EXPECT_EQ(GetVariable("MOCKTAIL_GRAPHICS_QUALITY"), std::nullopt)
+        << '"' << value << '"';
+  }
 }
 
 // ApplyGraphicsLaunchPolicy with a system backend, which publishes only the

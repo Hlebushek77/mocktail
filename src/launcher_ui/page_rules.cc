@@ -14,7 +14,8 @@
 namespace mocktail::launcher_ui {
 namespace {
 
-constexpr std::string_view kQualityFlag = "FIntDebugFRMQualityLevelOverride";
+constexpr std::string_view kQualityFlag =
+    runtime::kGraphicsQualityClientSetting;
 
 bool IsDigits(std::string_view text) {
   return !text.empty() && std::all_of(text.begin(), text.end(), [](char c) {
@@ -296,20 +297,12 @@ std::string CanonicalDevicePreset(std::string_view value) {
 
 std::optional<std::string> ManagedQualityLevel(
     const FastFlagSettings& settings) {
-  if (!RenderingPresetActive(settings.physics_worker_mode,
-                             settings.multithreaded_rendering)) {
-    return std::nullopt;
-  }
-  // performance_policy.cc: "manual" (and its "auto"/"0" spellings) leaves
-  // the slider to Roblox; a level is forced as given; the default is 3,
-  // or 1 where graphics_launch_policy.cc publishes it for direct Vulkan on
-  // Intel integrated graphics.
-  const std::string& quality = settings.graphics_quality;
-  if (quality == "manual" || quality == "auto" || quality == "0") {
-    return std::nullopt;
-  }
-  if (IsDigits(quality)) return quality;
-  return std::string(settings.intel_integrated_vulkan ? "1" : "3");
+  // performance_policy.cc: a level is forced as given, whatever the preset
+  // does; default and manual (with the variable's "auto" and "0") leave the
+  // level to Roblox.
+  const std::optional<int> level = ParseQualityLevel(settings.graphics_quality);
+  if (!level.has_value()) return std::nullopt;
+  return std::to_string(*level);
 }
 
 std::vector<launcher::FastFlagConflict> FindFastFlagConflicts(

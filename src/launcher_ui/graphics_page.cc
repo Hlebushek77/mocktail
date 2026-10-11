@@ -498,8 +498,7 @@ GtkWidget* BuildGpuRow(LauncherContext* context) {
         "loader just that card's drivers (VK_DRIVER_FILES). OpenGL ES and "
         "ANGLE are not affected, and VK_DRIVER_FILES or VK_ICD_FILENAMES set "
         "in the shortcut or terminal win over this setting. The card also "
-        "decides whether NVIDIA's display-server rule applies and whether "
-        "Intel integrated graphics get quality level 1.");
+        "decides whether NVIDIA's display-server rule applies.");
   spec.hint.details_for = [](LauncherContext& ctx) {
     const MachineProfile& machine = ctx.machine();
     if (!machine.detected) return std::string();
@@ -784,8 +783,8 @@ GtkWidget* BuildTextureCompressionRow(LauncherContext* context) {
   RowSpec spec;
   spec.key = kEtc2ToBcKey;
   spec.title = _("Compressed textures (BC)");
-  // runtime_config.cc: MOCKTAIL_ETC2_TO_BC defaults to off.
-  spec.fallback = "false";
+  // runtime_config.cc: MOCKTAIL_ETC2_TO_BC defaults to on.
+  spec.fallback = "true";
   spec.keywords = {"bc",         "dxt",          "etc2",       "texture",
                    "textures",   "compression",  "compressed", "video memory",
                    "vram",       "memory",       "текстуры",   "сжатие",
@@ -816,45 +815,61 @@ GtkWidget* BuildTextureCompressionRow(LauncherContext* context) {
       // ETC2/EAC uploads per session on an RTX 3060.
       _("Roblox sends most textures in the ETC2 format. NVIDIA graphics "
         "cards, and some others, cannot read ETC2, so Mocktail converts these "
-        "textures for the card. By default it unpacks them to full size, "
-        "which takes 4 to 8 times the video memory of the compressed "
-        "texture.") +
+        "textures for the card. Unpacked to full size, they would take 4 to 8 "
+        "times the video memory of the compressed texture.") +
       std::string("\n\n") +
       // FAQ.md "Why is ETC2 kept": the ETC2 / MOCKTAIL_ADVERTISE_ETC2=0 A/B
       // (Roblox 2.738.1397, RTX 3060 Laptop, driver 615.71.09).
-      _("With this setting on, Mocktail converts them to BC (also called "
-        "DXT) instead, a compressed format these cards read natively, so the "
-        "textures take about as much video memory as Roblox itself counts "
-        "for them. Roblox keeps using ETC2: letting it switch to DXT itself "
-        "(MOCKTAIL_ADVERTISE_ETC2=0) was much slower in a test on an RTX "
-        "3060.") +
+      _("With this setting on, as it is by default, Mocktail converts them "
+        "to BC (also called DXT) instead, a compressed format these cards "
+        "read natively, so the textures take about as much video memory as "
+        "Roblox itself counts for them. Roblox keeps using ETC2: letting it "
+        "switch to DXT itself (MOCKTAIL_ADVERTISE_ETC2=0) was much slower in "
+        "a test on an RTX 3060.") +
+      "\n\n" +
+      // The live test in README's ETC2 textures section: Anime Vanguards
+      // (Roblox 2.738.1397), the Mocktail process's video memory: average
+      // 774 and 841 MiB, peak 907 and 1008 MiB in BC mode (two runs),
+      // against 1800 and 1934 MiB, peak 2406 and 2416 MiB unpacked.
+      _("In a test on an RTX 3060 (driver 615), the same Roblox game used "
+        "about 800 MiB of video memory on average with this setting on, "
+        "against about 1900 MiB with it off, and at most about 1000 against "
+        "2400 MiB.") +
       "\n\n" +
       // BC1 keeps 2 colours and 2 blends per 4x4 block: about 35 dB PSNR
       // on the APK's own ETC1 textures. BC mode creates images at scale 1;
       // otherwise MOCKTAIL_SMALL_TEXTURE_UPSCALE (default 4) enlarges
-      // colour textures of up to kSmallTextureMaxExtent (64) pixels a side.
-      // The loading sentence is provisional until BC mode's loading time is
-      // measured in a real game: converting on the graphics card may cost
-      // nothing, since BC uploads are 4 to 8 times smaller, while
-      // converting on the processor, whenever the graphics card cannot do
-      // it, costs several times the work of unpacking. Keep config.yaml's
-      // template in step (runtime_config_bootstrap.cc).
+      // colour textures of up to kSmallTextureMaxExtent (64) pixels a side
+      // by repeating texels.
       _("The cost: fine detail can lose some quality, so sharp edges in text "
         "and icons or smooth gradients may look blockier. Small textures (up "
         "to 64 pixels across) also keep their own size instead of the "
-        "fourfold enlargement Mocktail gives them otherwise. Loading can take "
-        "longer when the conversion has to run on the processor instead of "
-        "the graphics card.") +
+        "fourfold enlargement Mocktail gives them otherwise, so they look "
+        "smoother but less crisp.") +
+      "\n\n" +
+      // The same test: no ETC2 stall in any phase while the graphics card
+      // converts (two runs, longest frames 62 and 64 ms while moving);
+      // stalls of up to 196 ms while a place loads when the processor
+      // converts (one run, MOCKTAIL_ETC2_GPU=0). vulkan_etc2_gpu.cc logs
+      // "ETC2 GPU decode ready" once the GPU route's selftest passed; until
+      // then, and without it, uploads take the CPU route. Keep config.yaml's
+      // template in step (runtime_config_bootstrap.cc).
+      _("Converting on the graphics card, which Mocktail does wherever it "
+        "can, added no stutter in that test. When the conversion has to run "
+        "on the processor instead (the session log then has no “[vulkan] "
+        "ETC2 GPU decode ready” line), loading can stutter briefly: for up to "
+        "about 0.2 s in the same game.") +
       "\n\n" +
       // vulkan_etc2_emulation.cc logs "ETC2/EAC emulation enabled" when it
-      // emulates for a device; Etc2EmulationOptions are read once, when the
-      // game creates its Vulkan device.
-      _("Turn it on if video memory runs short: on a card with 4 GB or less, "
-        "at a high resolution, or while other programs use the graphics "
-        "card. The change applies the next time Roblox starts. On a card "
-        "that reads ETC2 itself the setting changes nothing; the session log "
-        "says whether textures are converted (a “[vulkan] ETC2/EAC emulation "
-        "enabled” line).");
+      // emulates for a device, with "become BC1/BC3/BC4/BC5 host images" in
+      // BC mode; Etc2EmulationOptions are read once, when the game creates
+      // its Vulkan device.
+      _("Turn it off if textures look wrong to you: Mocktail then unpacks "
+        "them to full size, as earlier versions did. The change applies the "
+        "next time Roblox starts. On a card that reads ETC2 itself the "
+        "setting changes nothing; the session log says whether and how "
+        "textures are converted (a “[vulkan] ETC2/EAC emulation enabled” "
+        "line).");
   spec.hint.details_for = [](LauncherContext& ctx) {
     const Etc2ConversionState state = Etc2Conversion(ctx);
     const VulkanDriverSelection driver =
@@ -880,9 +895,20 @@ GtkWidget* BuildTextureCompressionRow(LauncherContext* context) {
                           "changes nothing."),
                         name.c_str());
   };
-  // No recommendation: it trades image quality for video memory, and the
-  // launcher cannot read how much video memory the card has without
-  // loading its driver.
+  // Recommended where the game's card is known to lack ETC2 (NVIDIA);
+  // elsewhere only the game's Vulkan device tells whether it applies.
+  spec.hint.recommend = [context](const MachineProfile&) {
+    return Etc2Conversion(*context) == Etc2ConversionState::kNvidia
+               ? std::optional<std::string>("true")
+               : std::optional<std::string>();
+  };
+  spec.hint.recommend_reason = [](const MachineProfile&) {
+    // The live test quoted in the details (README, ETC2 textures).
+    return std::string(
+        _("This card cannot read ETC2. With its textures kept compressed, "
+          "the game used less than half the video memory in a test on an "
+          "RTX 3060, and ran as smoothly."));
+  };
   spec.unavailable = [](LauncherContext& ctx) {
     return Etc2Conversion(ctx) == Etc2ConversionState::kNotVulkan
                ? std::string(_("Only the Vulkan backend reads this setting"))
@@ -978,85 +1004,28 @@ class GraphicsPageState {
   bool custom_frame_rate_ = false;
 };
 
-// performance_policy.cc: the preset (and with it the forced quality level)
-// follows the Performance page's physics workers and multithreading.
-bool PresetActive(const LauncherContext& context) {
-  return RenderingPresetActive(
-      context.GameValue("performance.physics_worker_mode", "throughput"),
-      context.GameValue("performance.multithreaded_rendering", "false"));
-}
-
-// graphics_launch_policy.cc: direct Vulkan (any spelling) that renders on
-// Intel integrated graphics, with the card engine.gpu picks, publishes
-// MOCKTAIL_GRAPHICS_QUALITY=1 while the level is default.
-bool IntelIntegratedVulkan(const LauncherContext& context) {
-  const MachineProfile& machine = context.machine();
-  return machine.detected &&
-         IsVulkanSpelling(
-             context.GameValue("graphics.backend", "direct-vulkan")) &&
-         machine.RendersOnIntelIntegratedGraphics(
-             context.GameValue("engine.gpu", "auto"));
-}
-
-QualityEffect CurrentQuality(const LauncherContext& context,
-                             const std::string& value) {
-  return ResolveGraphicsQuality(value, PresetActive(context),
-                                IntelIntegratedVulkan(context));
-}
-
-std::vector<ComboOption> QualityOptions(LauncherContext& context) {
+// engine.graphics_quality's options (performance_policy.cc
+// MergeGraphicsQuality): default sets no level, and manual, its older
+// spelling, does the same; a level is forced whatever the preset does.
+std::vector<ComboOption> QualityOptions() {
   std::vector<ComboOption> options;
-  const int default_level = IntelIntegratedVulkan(context) ? 1 : 3;
-  // A level is named only while the preset forces one.
-  options.push_back(
-      {"default",
-       PresetActive(context)
-           ? Format(_("Mocktail default (level %d)"), default_level)
-           : std::string(_("Mocktail default")),
-       {},
-       {},
-       [](LauncherContext& ctx) {
-         if (!PresetActive(ctx)) {
-           return std::string(
-               _("No level is forced while Mocktail's performance preset is "
-                 "off"));
-         }
-         return IntelIntegratedVulkan(ctx)
-                    ? std::string(_("Level 1 of 21: Mocktail's choice for "
-                                    "Intel integrated graphics with Vulkan"))
-                    : std::string(_("Level 3 of 21, forced by Mocktail's "
-                                    "performance preset"));
-       },
-       nullptr,
-       false,
-       false});
-  options.push_back(
-      {"manual",
-       _("Roblox in-game slider"),
-       _("Roblox's Graphics Quality setting picks the level; the "
-         "performance preset's other limits stay"),
-       {},
-       nullptr,
-       nullptr,
-       false,
-       false});
+  options.push_back({"default",
+                     _("Set in Roblox"),
+                     _("Roblox's own Graphics Quality setting picks the "
+                       "level; Mocktail forces none"),
+                     {"manual"},
+                     nullptr,
+                     nullptr,
+                     false,
+                     false});
   // A level from config.yaml is listed while it is the value; the number row
   // below changes it.
   for (int level = 1; level <= 21; ++level) {
     options.push_back({std::to_string(level),
                        Format(_("Level %d"), level),
+                       Format(_("Level %d of 21, forced by Mocktail"), level),
                        {},
-                       {},
-                       [level](LauncherContext& ctx) {
-                         return PresetActive(ctx)
-                                    ? Format(_("Level %d of 21, forced by "
-                                               "Mocktail"),
-                                             level)
-                                    : Format(_("Level %d of 21; no effect "
-                                               "while the performance preset "
-                                               "is off"),
-                                             level);
-                       },
+                       nullptr,
                        nullptr,
                        true,
                        false});
@@ -1082,62 +1051,52 @@ GtkWidget* BuildGraphicsQualityRow(LauncherContext* context,
   spec.keywords = {"quality",  "level",    "detail",
                    "slider",   "frm",      "settings",
                    "качество", "графика",  "детализация",
-                   "уровень",  "ползунок", "FIntDebugFRMQualityLevelOverride"};
+                   "уровень",  "ползунок", "DFIntDebugFRMQualityLevelOverride"};
   spec.hint.details =
       _("Roblox's graphics quality level, from 1 to 21, decides how much "
         "detail Roblox draws: view distance, shadows, effects and similar. "
         "Higher levels look better and need more of the graphics card.") +
       std::string("\n\n") +
-      // performance_policy.cc: FIntDebugFRMQualityLevelOverride is merged
-      // only together with the rendering preset.
-      _("Mocktail forces a level only while its performance preset is on: "
+      // performance_policy.cc MergeGraphicsQuality: nothing is sent for
+      // default (or manual).
+      _("• Set in Roblox (the default): Mocktail forces no level, and the "
+        "Graphics Quality option in Roblox's own settings decides; it can be "
+        "changed while you play.") +
+      "\n\n" +
+      // performance_policy.cc MergeGraphicsQuality:
+      // DFIntDebugFRMQualityLevelOverride, whatever the preset does. The
+      // name and its DF scope come from Roblox 2.738's code; what the
+      // level does in a game is not verified yet.
+      _("• Custom level: Mocktail sends the level you pick to Roblox, "
+        "whatever the Performance settings, so Roblox's in-game slider "
+        "should have no effect (not yet verified in a game for this Roblox "
+        "build). The change applies the next time Roblox starts.") +
+      "\n\n" +
+      // performance_policy.cc rendering_settings.
+      _("Separately, Mocktail's performance preset keeps anti-aliasing "
+        "(MSAA) off and Roblox's texture budget at 128 MB while it is on: "
         "with Physics workers on Throughput (the default), or on Automatic "
-        "with Multithreaded rendering. Otherwise Roblox's own setting always "
-        "decides.") +
+        "with Multithreaded rendering.") +
       "\n\n" +
-      // graphics_launch_policy.cc: MOCKTAIL_GRAPHICS_QUALITY=1 when direct
-      // Vulkan renders on Intel integrated graphics
-      // (RendersOnIntelIntegratedGraphics, with the card engine.gpu picks).
-      _("• Mocktail default: level 3, or level 1 when Vulkan renders on "
-        "Intel integrated graphics. Roblox's in-game quality slider then has "
-        "no effect.") +
-      "\n\n" +
-      // performance_policy.cc: "manual" leaves out only
-      // FIntDebugFRMQualityLevelOverride; the rest of the preset stays.
-      _("• Roblox in-game slider: Mocktail stops forcing a quality level, and "
-        "the Graphics Quality option in Roblox's settings decides it. While "
-        "the performance preset is on, Mocktail still lowers texture detail, "
-        "turns MSAA off and uses low-end level of detail; set Physics workers "
-        "to Low latency (or Automatic without Multithreaded rendering) to "
-        "turn that off too.") +
-      "\n\n" + _("• Custom level: forces the level you pick.") + "\n\n" +
-      // performance_policy.cc rendering_settings (MSAA, texture budgets,
-      // shadow map mips, low-end LOD).
-      _("The preset also lowers texture memory, turns anti-aliasing (MSAA) "
-        "off and uses simpler shadows and level of detail, whatever level is "
-        "chosen here.");
+      // performance_policy.h kGraphicsQualityClientSetting: Roblox
+      // registers the variable as a DFInt, and its setter refuses a value
+      // under the FInt spelling (a static reading of libroblox). plus.1's
+      // default was level 3, level 1 with Vulkan on Intel integrated
+      // graphics.
+      _("Before version 1.0.4-plus.2, Mocktail sent the level under a name "
+        "that, judging by Roblox 2.738's code, Roblox ignores, so neither "
+        "Mocktail's default level (3, or 1 on Intel integrated graphics) "
+        "nor a level chosen here took effect: Roblox's own setting "
+        "decided.");
   spec.hint.details_for = [](LauncherContext& ctx) {
     const QualityEffect effect =
-        CurrentQuality(ctx, ctx.EffectiveValue(kQualityKey, "default"));
-    std::string text;
-    if (effect.source == QualitySource::kRobloxSetting) {
-      text = PresetActive(ctx)
-                 ? std::string(_("With the current settings Roblox's own "
-                                 "Graphics Quality setting decides."))
-                 : std::string(_("Mocktail's performance preset is off with "
-                                 "the current Performance settings, so "
-                                 "Roblox's own Graphics Quality setting "
-                                 "decides."));
-    } else {
-      text = Format(_("With the current settings Roblox runs at level %d."),
-                    effect.level);
-    }
-    const std::string note =
-        ctx.UnfollowedOverrideNote({"performance.physics_worker_mode",
-                                    "performance.multithreaded_rendering",
-                                    "graphics.backend", "engine.gpu"});
-    if (!note.empty()) text += "\n\n" + note;
-    return text;
+        ResolveGraphicsQuality(ctx.EffectiveValue(kQualityKey, "default"));
+    return effect.source == QualitySource::kRobloxSetting
+               ? std::string(_("With the current settings Roblox's own "
+                               "Graphics Quality setting decides."))
+               : Format(_("With the current settings Mocktail sends level "
+                          "%d to Roblox."),
+                        effect.level);
   };
   spec.hint.recommend = [](const MachineProfile& machine) {
     const QualityRecommendation recommendation =
@@ -1147,40 +1106,28 @@ GtkWidget* BuildGraphicsQualityRow(LauncherContext* context,
   };
   spec.hint.recommend_reason = [](const MachineProfile& machine) {
     switch (RecommendGraphicsQuality(machine).reason) {
-      case QualityRecommendationReason::kCapableGraphics:
-        return Format(_("Your %s graphics can usually draw more than level 3. "
-                        "Roblox's own Graphics Quality setting then picks the "
-                        "level; while Physics workers is on Throughput, "
-                        "Mocktail's preset still keeps textures and "
-                        "anti-aliasing low."),
-                      machine.DiscreteGpuLabel().c_str());
-      case QualityRecommendationReason::kModestGraphics:
+      case QualityRecommendationReason::kRobloxSetting:
         return std::string(
-            _("With integrated graphics, Mocktail's low default keeps the "
-              "frame rate up."));
+            _("Roblox's own setting can be changed while you play; a level "
+              "forced here changes only when Roblox starts again."));
       case QualityRecommendationReason::kUnknown:
         break;
     }
     return std::string();
   };
   spec.hint.warning = [state](LauncherContext& ctx, const std::string& value) {
-    const QualityEffect effect = CurrentQuality(ctx, value);
+    const QualityEffect effect = ResolveGraphicsQuality(value);
     if (const launcher::FastFlagsDocument* flags = state->fast_flags()) {
       const std::string conflict = QualityFlagConflict(*flags, effect);
       if (!conflict.empty()) {
         return Format(_("fflags.json sets %s to another level, so Roblox will "
-                        "not start. Remove that flag or choose “Roblox in-game "
-                        "slider”."),
+                        "not start. Remove that flag or choose “Set in "
+                        "Roblox”."),
                       conflict.c_str());
       }
     }
-    if (effect.ignored && ParseQualityLevel(value).has_value()) {
-      return std::string(
-          _("No effect: Mocktail's performance preset is off "
-            "(Performance › Physics workers)."));
-    }
     // roblox_overrides.h FindOverrideConflicts: a level above 3 under the
-    // preset's other limits.
+    // preset's limits.
     const GameSettings settings = CurrentGameSettings(ctx);
     for (const OverrideConflict conflict : FindOverrideConflicts(settings)) {
       if (conflict == OverrideConflict::kHighLevelUnderPresetLimits) {
@@ -1192,10 +1139,10 @@ GtkWidget* BuildGraphicsQualityRow(LauncherContext* context,
   spec.hint.overrides_roblox = RobloxOverrideHint(kQualityKey);
 
   ComboSpec combo;
-  combo.options_for = QualityOptions;
+  combo.options = QualityOptions();
   combo.on_custom = [state](LauncherContext& ctx) {
-    QualityEffect effect =
-        CurrentQuality(ctx, ctx.EffectiveValue(kQualityKey, "default"));
+    const QualityEffect effect =
+        ResolveGraphicsQuality(ctx.EffectiveValue(kQualityKey, "default"));
     const int level = effect.level > 0 ? effect.level : 3;
     if (ctx.SetValue(kQualityKey, std::to_string(level),
                      launcher::ScalarKind::kInteger) &&
@@ -1215,14 +1162,14 @@ GtkWidget* BuildQualityLevelRow(LauncherContext* context) {
   spec.keywords = {"quality level", "уровень качества"};
   spec.hint.subtitle = _("1 is the fastest, 21 looks best");
   spec.hint.details =
-      _("The graphics quality level Mocktail forces while its performance "
-        "preset is on. Level 1 draws the least and runs fastest; level 21 "
-        "draws the most detail. Roblox's own quality slider has no effect "
-        "while a level is set here.") +
+      _("The graphics quality level Mocktail sends to Roblox. Level 1 draws "
+        "the least and runs fastest; level 21 draws the most detail. While "
+        "a level is set here, Roblox's own quality slider should have no "
+        "effect.") +
       std::string("\n\n") +
       _("Change it in small steps and check the frame rate in a busy "
-        "experience. Choose “Roblox in-game slider” above to let Roblox "
-        "pick the level again.");
+        "experience. Choose “Set in Roblox” above to let Roblox pick the "
+        "level again.");
   spec.hint.overrides_roblox = RobloxOverrideHint(kQualityKey);
   // Graphics quality, right above, shows the badge.
   spec.hint.override_badge = false;

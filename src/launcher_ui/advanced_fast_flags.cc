@@ -42,11 +42,6 @@ std::string Normalized(const std::string& value) {
   return value;
 }
 
-bool IsVulkanBackend(const std::string& value) {
-  return value == "direct-vulkan" || value == "vulkan" ||
-         value == "native-vulkan";
-}
-
 // fflags.json, staged until Save.
 class FastFlagsState {
  public:
@@ -185,10 +180,6 @@ class FastFlagsState {
     settings.gamemode = SettingValue("performance.gamemode", "auto");
     settings.graphics_quality =
         SettingValue("engine.graphics_quality", "default");
-    settings.intel_integrated_vulkan =
-        IsVulkanBackend(SettingValue("graphics.backend", "direct-vulkan")) &&
-        context_->machine().RendersOnIntelIntegratedGraphics(
-            SettingValue("engine.gpu", "auto"));
     if (settings_ == settings_key(settings) && !conflicts_dirty_) return;
     settings_ = settings_key(settings);
     conflicts_dirty_ = false;
@@ -200,8 +191,7 @@ class FastFlagsState {
     return settings.frame_rate_limit + '\n' + settings.multithreaded_rendering +
            '\n' + settings.physics_worker_mode + '\n' +
            settings.memory_limit_mb + '\n' + settings.gamemode + '\n' +
-           settings.graphics_quality + '\n' +
-           (settings.intel_integrated_vulkan ? "1" : "0");
+           settings.graphics_quality;
   }
 
   void Changed() {

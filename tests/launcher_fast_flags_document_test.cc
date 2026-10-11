@@ -296,20 +296,19 @@ TEST_F(LauncherFastFlagsDocumentTest, ReportsFlagsMocktailManages) {
       runtime::ParseFrameRatePolicy("165");
   const runtime::PerformancePolicy preset =
       runtime::ParsePerformancePolicy("true", "0", "on", "throughput");
+  // No quality level is configured, so Mocktail sends none; the FInt
+  // spelling, which Roblox ignores, is the user's own.
   std::vector<FastFlagConflict> conflicts =
       document.FindManagedConflicts(fixed_165, preset);
-  ASSERT_EQ(conflicts.size(), 3U);
+  ASSERT_EQ(conflicts.size(), 2U);
   EXPECT_EQ(conflicts[0].name, "DFIntTaskSchedulerTargetFps");
   EXPECT_EQ(conflicts[0].file_value, "60");
   EXPECT_EQ(conflicts[0].managed_value, "165");
   EXPECT_EQ(conflicts[0].effect, FastFlagConflictEffect::kBlocksStart);
-  EXPECT_EQ(conflicts[1].name, "FIntDebugFRMQualityLevelOverride");
-  EXPECT_EQ(conflicts[1].managed_value, "3");
-  EXPECT_EQ(conflicts[1].effect, FastFlagConflictEffect::kBlocksStart);
-  EXPECT_EQ(conflicts[2].name, "FFlagUseCrashpad");
-  EXPECT_EQ(conflicts[2].file_value, "True");
-  EXPECT_EQ(conflicts[2].managed_value, "False");
-  EXPECT_EQ(conflicts[2].effect, FastFlagConflictEffect::kOverridden);
+  EXPECT_EQ(conflicts[1].name, "FFlagUseCrashpad");
+  EXPECT_EQ(conflicts[1].file_value, "True");
+  EXPECT_EQ(conflicts[1].managed_value, "False");
+  EXPECT_EQ(conflicts[1].effect, FastFlagConflictEffect::kOverridden);
 
   // With Roblox owning the frame rate and no preset, only the always-on
   // crash-report policy remains.
@@ -328,8 +327,14 @@ TEST_F(LauncherFastFlagsDocumentTest, ReportsFlagsMocktailManages) {
   }
 
   EXPECT_TRUE(FastFlagsDocument::IsManagedFlag("DFIntTaskSchedulerTargetFps"));
+  // A configured level sets it (runtime::kGraphicsQualityClientSetting).
   EXPECT_TRUE(
+      FastFlagsDocument::IsManagedFlag("DFIntDebugFRMQualityLevelOverride"));
+  // Keys the preset stopped sending, since Roblox never read them.
+  EXPECT_FALSE(
       FastFlagsDocument::IsManagedFlag("FIntDebugFRMQualityLevelOverride"));
+  EXPECT_FALSE(FastFlagsDocument::IsManagedFlag("FIntMaxAudibleSoundChannels"));
+  EXPECT_FALSE(FastFlagsDocument::IsManagedFlag("FFlagRenderEnableLowEndLOD"));
   EXPECT_TRUE(FastFlagsDocument::IsManagedFlag("FIntTaskSchedulerThreadMin"));
   EXPECT_TRUE(FastFlagsDocument::IsManagedFlag(
       "DFIntSimMidPhaseContactPipelineBatchSize"));

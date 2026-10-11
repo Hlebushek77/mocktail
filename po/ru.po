@@ -618,38 +618,12 @@ msgid "Automatic"
 msgstr "Автоматически"
 
 #, c-format
-msgid "Mocktail default (level %d)"
-msgstr "Стандарт (уровень %d)"
-
-msgid "Mocktail default"
-msgstr "Стандарт Mocktail"
-
-msgid "No level is forced while Mocktail's performance preset is off"
-msgstr "Пока пресет производительности Mocktail выключен, уровень не задаётся"
-
-msgid "Level 1 of 21: Mocktail's choice for Intel integrated graphics with Vulkan"
-msgstr "Уровень 1 из 21: выбор Mocktail для встроенной графики Intel с Vulkan"
-
-msgid "Level 3 of 21, forced by Mocktail's performance preset"
-msgstr "Уровень 3 из 21, его задаёт пресет производительности Mocktail"
-
-msgid "Roblox in-game slider"
-msgstr "Ползунок в игре Roblox"
-
-msgid "Roblox's Graphics Quality setting picks the level; the performance preset's other limits stay"
-msgstr "Уровень выбирает настройка качества графики в Roblox; остальные ограничения пресета остаются"
-
-#, c-format
 msgid "Level %d"
 msgstr "Уровень %d"
 
 #, c-format
 msgid "Level %d of 21, forced by Mocktail"
 msgstr "Уровень %d из 21, его задаёт Mocktail"
-
-#, c-format
-msgid "Level %d of 21; no effect while the performance preset is off"
-msgstr "Уровень %d из 21; не действует, пока пресет производительности выключен"
 
 msgid "Custom level…"
 msgstr "Свой уровень…"
@@ -663,56 +637,18 @@ msgstr "Качество графики"
 msgid "Roblox's graphics quality level, from 1 to 21, decides how much detail Roblox draws: view distance, shadows, effects and similar. Higher levels look better and need more of the graphics card."
 msgstr "Уровень качества графики Roblox, от 1 до 21, определяет, сколько деталей рисует Roblox: дальность прорисовки, тени, эффекты и тому подобное. Чем выше уровень, тем красивее картинка и тем больше нагрузка на видеокарту."
 
-msgid "Mocktail forces a level only while its performance preset is on: with Physics workers on Throughput (the default), or on Automatic with Multithreaded rendering. Otherwise Roblox's own setting always decides."
-msgstr "Mocktail задаёт уровень только при включённом пресете производительности: когда «Потоки физики» стоят на «Пропускная способность» (по умолчанию) или на «Автоматически» вместе с многопоточным рендерингом. В остальных случаях всегда решает настройка самого Roblox."
-
-msgid "• Mocktail default: level 3, or level 1 when Vulkan renders on Intel integrated graphics. Roblox's in-game quality slider then has no effect."
-msgstr "• Стандарт Mocktail: уровень 3, а когда Vulkan отрисовывает игру на встроенной графике Intel — уровень 1. Ползунок качества в самой игре Roblox тогда не действует."
-
-msgid "• Roblox in-game slider: Mocktail stops forcing a quality level, and the Graphics Quality option in Roblox's settings decides it. While the performance preset is on, Mocktail still lowers texture detail, turns MSAA off and uses low-end level of detail; set Physics workers to Low latency (or Automatic without Multithreaded rendering) to turn that off too."
-msgstr "• Ползунок в игре Roblox: Mocktail перестаёт задавать уровень качества, и его определяет параметр «Качество графики» в настройках Roblox. Пока включён пресет производительности, Mocktail всё равно снижает детализацию текстур, выключает MSAA и использует упрощённую детализацию для слабых устройств; чтобы отключить и это, выберите в «Потоках физики» «Низкая задержка» (или «Автоматически» без многопоточного рендеринга)."
-
-msgid "• Custom level: forces the level you pick."
-msgstr "• Свой уровень: задаётся выбранный вами уровень."
-
-msgid "The preset also lowers texture memory, turns anti-aliasing (MSAA) off and uses simpler shadows and level of detail, whatever level is chosen here."
-msgstr "Кроме того, пресет при любом уровне урезает память под текстуры, выключает сглаживание (MSAA) и упрощает тени и детализацию."
-
 msgid "With the current settings Roblox's own Graphics Quality setting decides."
 msgstr "С текущими настройками решает настройка качества графики самого Roblox."
 
-msgid "Mocktail's performance preset is off with the current Performance settings, so Roblox's own Graphics Quality setting decides."
-msgstr "С текущими настройками в разделе «Производительность» пресет производительности Mocktail выключен, поэтому решает настройка качества графики самого Roblox."
-
 #, c-format
-msgid "With the current settings Roblox runs at level %d."
-msgstr "С текущими настройками Roblox работает на уровне %d."
-
-#, c-format
-msgid "Your %s graphics can usually draw more than level 3. Roblox's own Graphics Quality setting then picks the level; while Physics workers is on Throughput, Mocktail's preset still keeps textures and anti-aliasing low."
-msgstr "Видеокарта %s обычно справляется с уровнями выше третьего. Тогда уровень выбирает настройка качества графики самого Roblox; пока в «Потоках физики» выбрана «Пропускная способность», пресет Mocktail всё равно держит текстуры и сглаживание на низком уровне."
-
-msgid "With integrated graphics, Mocktail's low default keeps the frame rate up."
-msgstr "Со встроенной графикой низкий стандартный уровень Mocktail помогает удержать частоту кадров."
-
-#, c-format
-msgid "fflags.json sets %s to another level, so Roblox will not start. Remove that flag or choose “Roblox in-game slider”."
-msgstr "В fflags.json для %s задан другой уровень, поэтому Roblox не запустится. Удалите этот флаг или выберите «Ползунок в игре Roblox»."
-
-msgid "No effect: Mocktail's performance preset is off (Performance › Physics workers)."
-msgstr "Не действует: пресет производительности Mocktail выключен («Производительность» › «Потоки физики»)."
+msgid "With the current settings Mocktail sends level %d to Roblox."
+msgstr "С текущими настройками Mocktail передаёт Roblox уровень %d."
 
 msgid "Quality level"
 msgstr "Уровень качества"
 
 msgid "1 is the fastest, 21 looks best"
 msgstr "1 — быстрее всего, 21 — красивее всего"
-
-msgid "The graphics quality level Mocktail forces while its performance preset is on. Level 1 draws the least and runs fastest; level 21 draws the most detail. Roblox's own quality slider has no effect while a level is set here."
-msgstr "Уровень качества графики, который Mocktail задаёт при включённом пресете производительности. На уровне 1 рисуется меньше всего и игра идёт быстрее всего; на уровне 21 деталей больше всего. Пока уровень задан здесь, ползунок качества в самом Roblox не действует."
-
-msgid "Change it in small steps and check the frame rate in a busy experience. Choose “Roblox in-game slider” above to let Roblox pick the level again."
-msgstr "Меняйте его понемногу и проверяйте частоту кадров в насыщенном месте. Чтобы уровень снова выбирал Roblox, выберите выше «Ползунок в игре Roblox»."
 
 msgid "Set in Roblox"
 msgstr "Как в Roblox"
@@ -1322,9 +1258,6 @@ msgstr "Задаёт размер планировщика задач Roblox п�
 msgid "It only matters while Physics workers is set to Automatic: Throughput already gives Roblox every physical core, and Low latency ignores this setting."
 msgstr "Это важно, только когда в «Потоках физики» выбрано «Автоматически»: «Пропускная способность» и так отдаёт Roblox все физические ядра, а «Низкая задержка» эту настройку не учитывает."
 
-msgid "With Automatic physics workers, turning it on also turns on Mocktail's performance preset: less texture memory, no MSAA, simpler shadows and the graphics quality level from Graphics."
-msgstr "При «Автоматически» в потоках физики эта настройка заодно включает пресет производительности Mocktail: меньше памяти под текстуры, без MSAA, более простые тени и уровень качества из раздела «Графика»."
-
 msgid "More worker threads help busy places reach a higher frame rate; on a computer doing other heavy work at the same time, they compete with it for the processor."
 msgstr "Больше рабочих потоков помогает поднять частоту кадров в насыщенных местах; но если компьютер одновременно занят другой тяжёлой работой, потоки будут отнимать у неё процессор."
 
@@ -1337,12 +1270,6 @@ msgstr "Потоки физики"
 
 msgid "How Mocktail tunes Roblox's worker threads for physics, render preparation and background tasks. The change applies the next time Roblox starts."
 msgstr "Как Mocktail настраивает рабочие потоки Roblox для физики, подготовки отрисовки и фоновых задач. Изменение вступит в силу при следующем запуске Roblox."
-
-msgid "• Throughput (default): Roblox's worker pools may use every physical core, and Mocktail's performance preset is on: less texture memory, anti-aliasing (MSAA) off, simpler shadows and level of detail, at most 32 sounds at once, and the graphics quality level from Graphics."
-msgstr "• Пропускная способность (по умолчанию): рабочие потоки Roblox могут занять все физические ядра, и включён пресет производительности Mocktail: меньше памяти под текстуры, сглаживание (MSAA) выключено, тени и детализация проще, одновременно звучит не больше 32 звуков, а уровень качества берётся из раздела «Графика»."
-
-msgid "• Low latency: Roblox keeps its own pool sizes; Mocktail only batches physics contact work. The preset stays off, so Roblox's own graphics quality and texture limits apply (Mocktail still sizes Roblox's video memory from this computer's RAM)."
-msgstr "• Низкая задержка: Roblox сам определяет число потоков, Mocktail лишь группирует расчёт физических контактов. Пресет остаётся выключенным, поэтому действуют собственные качество графики и ограничения текстур Roblox (объём видеопамяти для Roblox Mocktail всё равно рассчитывает по оперативной памяти компьютера)."
 
 msgid "• Automatic: no tuning at all, unless Multithreaded rendering is on; that sizes the scheduler from the physical cores and turns the preset on."
 msgstr "• Автоматически: никакой настройки, если только не включён многопоточный рендеринг; тогда планировщик рассчитывается по физическим ядрам и включается пресет."
@@ -3164,9 +3091,6 @@ msgstr "Какие из них перекрывает это окно"
 msgid "Graphics Quality slider"
 msgstr "Ползунок «Качество графики»"
 
-msgid "Anti-aliasing, textures and level of detail"
-msgstr "Сглаживание, текстуры и детализация"
-
 msgid "Maximum Frame Rate"
 msgstr "Максимальная частота кадров"
 
@@ -3177,11 +3101,8 @@ msgid "Device and interface"
 msgstr "Устройство и интерфейс"
 
 #, c-format
-msgid "Mocktail forces graphics quality level %d, so Roblox's Graphics Quality slider has no effect"
-msgstr "Mocktail задаёт уровень качества графики %d, поэтому ползунок «Качество графики» в Roblox не действует"
-
-msgid "Mocktail's performance preset replaces Roblox's own choices for anti-aliasing, texture memory, level of detail, shadows and sound channels"
-msgstr "Пресет производительности Mocktail заменяет собственный выбор Roblox для сглаживания, памяти под текстуры, детализации, теней и числа звуков"
+msgid "Mocktail sends graphics quality level %d in place of Roblox's Graphics Quality slider"
+msgstr "Mocktail передаёт уровень качества графики %d вместо ползунка «Качество графики» в Roblox"
 
 #, c-format
 msgid "Mocktail sets Roblox's frame-rate target to %d FPS, the most Roblox's menu offers"
@@ -3215,12 +3136,6 @@ msgstr "Серверы Roblox считают вас игроком на конс
 msgid "Roblox shows its desktop interface instead of the layout its servers choose for Android"
 msgstr "Roblox показывает настольный интерфейс вместо того, который его серверы выбирают для Android"
 
-msgid "Mocktail's performance preset sets FIntDebugFRMQualityLevelOverride, which replaces the level the Graphics Quality option in Roblox's settings would choose."
-msgstr "Пресет производительности Mocktail задаёт FIntDebugFRMQualityLevelOverride, а он заменяет уровень, который выбрал бы параметр «Качество графики» в настройках Roblox."
-
-msgid "While the preset is on, Mocktail sets these Roblox client settings at every start, in place of what Roblox would choose itself: MSAA off (FIntDebugForceMSAASamples=1), a 128 MB texture budget (FIntRenderTextureTotalBudgetMB), a texture mip bias (FIntRenderTextureMipBias), low-end level of detail (FFlagRenderEnableLowEndLOD), one shadow-map mip (FIntTM2ShadowMapMaxMips) and at most 32 sounds at once (FIntMaxAudibleSoundChannels). Unless Graphics quality is set to “Roblox in-game slider”, it also forces the quality level."
-msgstr "Пока пресет включён, Mocktail при каждом запуске задаёт эти параметры клиента Roblox вместо того, что выбрал бы сам Roblox: MSAA выключено (FIntDebugForceMSAASamples=1), бюджет текстур 128 МБ (FIntRenderTextureTotalBudgetMB), смещение мип-уровней текстур (FIntRenderTextureMipBias), детализация для слабых устройств (FFlagRenderEnableLowEndLOD), один мип-уровень карты теней (FIntTM2ShadowMapMaxMips) и не больше 32 звуков одновременно (FIntMaxAudibleSoundChannels). Если в «Качестве графики» не выбран «Ползунок в игре Roblox», пресет задаёт и уровень качества."
-
 msgid "DFIntTaskSchedulerTargetFps replaces the target that Roblox's Maximum Frame Rate menu would set. The menu stays in Roblox's settings, as Mocktail always turns it on (FFlagGameBasicSettingsFramerateCap5); whether a lower choice there still caps the game is not verified for this Roblox build."
 msgstr "DFIntTaskSchedulerTargetFps заменяет цель, которую задало бы меню «Максимальная частота кадров» в Roblox. Само меню остаётся в настройках Roblox, потому что Mocktail всегда его включает (FFlagGameBasicSettingsFramerateCap5); ограничивает ли игру выбранное там меньшее значение, для этой сборки Roblox не проверено."
 
@@ -3239,14 +3154,8 @@ msgstr "Профиль консоли представляет игру пров
 msgid "The PC profile reports a Windows 11 computer with mouse and keyboard, and Mocktail rewrites the app policy Roblox keeps for Android to its desktop layout (FStringAppConfigurationOverrideAppPolicy)."
 msgstr "Профиль ПК сообщает о компьютере с Windows 11, мышью и клавиатурой, а Mocktail переписывает политику приложения, которую Roblox хранит для Android, на настольный интерфейс (FStringAppConfigurationOverrideAppPolicy)."
 
-msgid "Level 1 is Mocktail's choice for Intel integrated graphics with Vulkan; other graphics get level 3."
-msgstr "Уровень 1 Mocktail выбирает для встроенной графики Intel с Vulkan; остальная графика получает уровень 3."
-
 msgid "With the PC device profile, Light and Dark are also set as ForceTheme in the app policy Mocktail gives Roblox."
 msgstr "С профилем устройства ПК светлая и тёмная темы ещё и задаются как ForceTheme в политике приложения, которую Mocktail передаёт Roblox."
-
-msgid "choose “Roblox in-game slider” under Graphics quality."
-msgstr "выберите «Ползунок в игре Roblox» в «Качестве графики»."
 
 msgid "set Physics workers to Low latency, or to Automatic with Multithreaded rendering off."
 msgstr "выберите в «Потоках физики» «Низкая задержка» или «Автоматически» с выключенным многопоточным рендерингом."
@@ -3298,9 +3207,6 @@ msgstr "Настройки чата Roblox; ничто из заданного M
 
 msgid "Roblox's audio settings can switch it; Audio › Output device picks it at start"
 msgstr "Его можно переключить в настройках звука Roblox; «Звук» › «Устройство вывода» выбирает его при запуске"
-
-msgid "Roblox's slider picks the level; the performance preset's other limits stay"
-msgstr "Уровень выбирает ползунок Roblox; остальные ограничения пресета производительности остаются"
 
 msgid "Roblox's slider picks the level"
 msgstr "Уровень выбирает ползунок Roblox"
@@ -3377,14 +3283,8 @@ msgstr "Ничего не перекрыто"
 msgid "Roblox's own settings decide everything Mocktail could take over"
 msgstr "Всё, что Mocktail мог бы перекрыть, решают собственные настройки Roblox"
 
-msgid "With the current settings no row in this window replaces one of Roblox's own settings: the performance preset is off, Roblox owns the frame rate, the fullscreen setting and the theme, the microphone is enabled, and the Phone profile leaves the interface to Roblox for Android."
-msgstr "При текущих настройках ни одна строка этого окна не заменяет собственные настройки Roblox: пресет производительности выключен, частоту кадров, полноэкранный режим и тему решает Roblox, микрофон включён, а профиль телефона оставляет интерфейс на усмотрение Roblox для Android."
-
 msgid "Other preset limits remain"
 msgstr "Остальные ограничения пресета остаются"
-
-msgid "Graphics quality only sets the level. The rest of the performance preset (MSAA off, a 128 MB texture budget, low-end level of detail, simpler shadows) stays while Physics workers is on Throughput, or on Automatic with Multithreaded rendering, whatever level Roblox runs at."
-msgstr "«Качество графики» задаёт только уровень. Остальная часть пресета производительности (MSAA выключено, бюджет текстур 128 МБ, детализация для слабых устройств, упрощённые тени) остаётся, пока «Потоки физики» стоят на «Пропускная способность» или на «Автоматически» с многопоточным рендерингом, на каком бы уровне ни работал Roblox."
 
 msgid "Left to Roblox"
 msgstr "Остаётся за Roblox"
@@ -3414,13 +3314,6 @@ msgstr "Они нужны, чтобы Roblox для Android работал на 
 msgid "fflags.json cannot change them: Mocktail replaces its values for web requests, crash reports, the audio device menu and the microphone check, and refuses to start when it sets the frame-rate menu flag to another value. Only a video memory budget in fflags.json wins over Mocktail's."
 msgstr "fflags.json не может их изменить: для веб-запросов, отчётов о сбоях, меню звуковых устройств и проверки микрофона Mocktail заменяет его значения, а если он задаёт флаг меню частоты кадров по-другому, Mocktail отказывается запускаться. Только бюджет видеопамяти из fflags.json важнее значения Mocktail."
 
-#, c-format
-msgid "Level %d is forced, but the performance preset still keeps MSAA off, textures at 128 MB and low-end level of detail, so the higher level gains less than it would. Set Physics workers to Low latency to lift those limits."
-msgstr "Задан уровень %d, но пресет производительности по-прежнему держит MSAA выключенным, текстуры в 128 МБ и детализацию для слабых устройств, так что высокий уровень даёт меньше, чем мог бы. Чтобы снять эти ограничения, выберите в «Потоках физики» «Низкая задержка»."
-
-msgid "Roblox's slider picks the level, but the performance preset still keeps MSAA off, textures at 128 MB and low-end level of detail. Set Physics workers to Low latency to lift those limits."
-msgstr "Уровень выбирает ползунок Roblox, но пресет производительности по-прежнему держит MSAA выключенным, текстуры в 128 МБ и детализацию для слабых устройств. Чтобы снять эти ограничения, выберите в «Потоках физики» «Низкая задержка»."
-
 msgid "What Mocktail decides and what Roblox decides"
 msgstr "Что решает Mocktail, а что — Roblox"
 
@@ -3436,9 +3329,6 @@ msgstr[2] "Сейчас Mocktail перекрывает %d собственны�
 
 msgid "Opens the overview on the Advanced page: which of Roblox's own settings the current settings take over and which row does it, what stays in Roblox's hands, and the client settings Mocktail sets at every start."
 msgstr "Открывает обзор на странице «Дополнительно»: какие собственные настройки Roblox перекрывают текущие настройки и какая строка это делает, что остаётся за Roblox и какие параметры клиента Mocktail задаёт при каждом запуске."
-
-msgid "On this page, Physics workers and Multithreaded rendering decide whether the performance preset replaces Roblox's choices for anti-aliasing, textures, level of detail and the graphics quality level."
-msgstr "На этой странице «Потоки физики» и «Многопоточный рендеринг» решают, заменяет ли пресет производительности выбор Roblox для сглаживания, текстур, детализации и уровня качества графики."
 
 
 #, c-format
@@ -3513,9 +3403,6 @@ msgstr "• Встроенная графика: графика, встроен�
 
 msgid "When no card of the chosen kind has a Vulkan driver, the game uses another card that has one, and with a single card every choice uses it. When the two cards share a driver (an AMD APU with a Radeon card), Mocktail also tells the Vulkan loader which one to put first."
 msgstr "Если ни у одной видеокарты выбранного типа нет драйвера Vulkan, игра использует другую, у которой он есть, а при единственной видеокарте любой вариант выбирает её. Если у двух видеокарт общий драйвер (APU AMD вместе с Radeon), Mocktail ещё и сообщает загрузчику Vulkan, какую из них поставить первой."
-
-msgid "It applies to the Vulkan backend only: Mocktail hands the Vulkan loader just that card's drivers (VK_DRIVER_FILES). OpenGL ES and ANGLE are not affected, and VK_DRIVER_FILES or VK_ICD_FILENAMES set in the shortcut or terminal win over this setting. The card also decides whether NVIDIA's display-server rule applies and whether Intel integrated graphics get quality level 1."
-msgstr "Настройка действует только для движка Vulkan: Mocktail передаёт загрузчику Vulkan драйверы лишь этой видеокарты (VK_DRIVER_FILES). На OpenGL ES и ANGLE она не влияет, а VK_DRIVER_FILES или VK_ICD_FILENAMES из ярлыка или терминала важнее неё. От видеокарты также зависит, действует ли правило NVIDIA для графического сервера и получает ли встроенная графика Intel уровень качества 1."
 
 msgid "Mocktail found no Intel, NVIDIA or AMD graphics card in /sys/class/drm, so this setting has nothing to choose from."
 msgstr "Mocktail не нашёл в /sys/class/drm видеокарт Intel, NVIDIA или AMD, так что выбирать этой настройке не из чего."
@@ -3637,17 +3524,23 @@ msgstr "На видеокарте без ETC2 текстуры ETC2 перево
 msgid "On a card without ETC2, ETC2 textures are unpacked to full size"
 msgstr "На видеокарте без ETC2 текстуры ETC2 распаковываются в полный размер"
 
-msgid "Roblox sends most textures in the ETC2 format. NVIDIA graphics cards, and some others, cannot read ETC2, so Mocktail converts these textures for the card. By default it unpacks them to full size, which takes 4 to 8 times the video memory of the compressed texture."
-msgstr "Roblox передаёт большинство текстур в формате ETC2. Видеокарты NVIDIA и некоторые другие не умеют читать ETC2, поэтому Mocktail преобразует такие текстуры для видеокарты. По умолчанию он распаковывает их в полный размер, и в видеопамяти они занимают в 4–8 раз больше места, чем в сжатом виде."
+msgid "Roblox sends most textures in the ETC2 format. NVIDIA graphics cards, and some others, cannot read ETC2, so Mocktail converts these textures for the card. Unpacked to full size, they would take 4 to 8 times the video memory of the compressed texture."
+msgstr "Roblox передаёт большинство текстур в формате ETC2. Видеокарты NVIDIA и некоторые другие не умеют читать ETC2, поэтому Mocktail преобразует такие текстуры для видеокарты. Распакованные в полный размер, они занимали бы в видеопамяти в 4–8 раз больше места, чем в сжатом виде."
 
-msgid "With this setting on, Mocktail converts them to BC (also called DXT) instead, a compressed format these cards read natively, so the textures take about as much video memory as Roblox itself counts for them. Roblox keeps using ETC2: letting it switch to DXT itself (MOCKTAIL_ADVERTISE_ETC2=0) was much slower in a test on an RTX 3060."
-msgstr "Если настройка включена, Mocktail вместо этого переводит их в BC (он же DXT) — сжатый формат, который эти видеокарты читают сами, и текстуры занимают в видеопамяти примерно столько, сколько на них рассчитывает сам Roblox. Roblox при этом продолжает работать с ETC2: если дать ему самому перейти на DXT (MOCKTAIL_ADVERTISE_ETC2=0), в тесте на RTX 3060 игра работала намного медленнее."
+msgid "With this setting on, as it is by default, Mocktail converts them to BC (also called DXT) instead, a compressed format these cards read natively, so the textures take about as much video memory as Roblox itself counts for them. Roblox keeps using ETC2: letting it switch to DXT itself (MOCKTAIL_ADVERTISE_ETC2=0) was much slower in a test on an RTX 3060."
+msgstr "Когда настройка включена (а по умолчанию так и есть), Mocktail вместо этого переводит их в BC (он же DXT) — сжатый формат, который эти видеокарты читают сами, и текстуры занимают в видеопамяти примерно столько, сколько на них рассчитывает сам Roblox. Roblox при этом продолжает работать с ETC2: если дать ему самому перейти на DXT (MOCKTAIL_ADVERTISE_ETC2=0), в тесте на RTX 3060 игра работала намного медленнее."
 
-msgid "The cost: fine detail can lose some quality, so sharp edges in text and icons or smooth gradients may look blockier. Small textures (up to 64 pixels across) also keep their own size instead of the fourfold enlargement Mocktail gives them otherwise. Loading can take longer when the conversion has to run on the processor instead of the graphics card."
-msgstr "Цена: мелкие детали могут потерять в качестве, поэтому резкие края текста и значков или плавные градиенты могут выглядеть более блочными. Кроме того, маленькие текстуры (до 64 пикселей по ширине и высоте) остаются своего размера, без четырёхкратного увеличения, которое иначе делает Mocktail. Загрузка может идти дольше, если преобразование приходится выполнять на процессоре, а не на видеокарте."
+msgid "In a test on an RTX 3060 (driver 615), the same Roblox game used about 800 MiB of video memory on average with this setting on, against about 1900 MiB with it off, and at most about 1000 against 2400 MiB."
+msgstr "В тесте на RTX 3060 (драйвер 615) одна и та же игра Roblox с включённой настройкой занимала в среднем около 800 МиБ видеопамяти, а с выключенной — около 1900 МиБ; в пике — около 1000 МиБ против 2400 МиБ."
 
-msgid "Turn it on if video memory runs short: on a card with 4 GB or less, at a high resolution, or while other programs use the graphics card. The change applies the next time Roblox starts. On a card that reads ETC2 itself the setting changes nothing; the session log says whether textures are converted (a “[vulkan] ETC2/EAC emulation enabled” line)."
-msgstr "Включайте, если не хватает видеопамяти: на видеокарте с 4 ГБ или меньше, при высоком разрешении или когда видеокартой пользуются другие программы. Изменение вступит в силу при следующем запуске Roblox. На видеокарте, которая сама читает ETC2, настройка ничего не меняет; есть ли преобразование, видно в журнале сеанса (строка «[vulkan] ETC2/EAC emulation enabled»)."
+msgid "The cost: fine detail can lose some quality, so sharp edges in text and icons or smooth gradients may look blockier. Small textures (up to 64 pixels across) also keep their own size instead of the fourfold enlargement Mocktail gives them otherwise, so they look smoother but less crisp."
+msgstr "Цена: мелкие детали могут потерять в качестве, поэтому резкие края текста и значков или плавные градиенты могут выглядеть более блочными. Кроме того, маленькие текстуры (до 64 пикселей по ширине и высоте) остаются своего размера, без четырёхкратного увеличения, которое иначе делает Mocktail, и поэтому выглядят мягче, но не так чётко."
+
+msgid "Converting on the graphics card, which Mocktail does wherever it can, added no stutter in that test. When the conversion has to run on the processor instead (the session log then has no “[vulkan] ETC2 GPU decode ready” line), loading can stutter briefly: for up to about 0.2 s in the same game."
+msgstr "Mocktail по возможности преобразует текстуры на видеокарте, и в этом тесте это не добавило подтормаживаний. Если же преобразование приходится выполнять на процессоре (тогда в журнале сеанса нет строки «[vulkan] ETC2 GPU decode ready»), загрузка может ненадолго подтормаживать — в той же игре примерно до 0,2 с."
+
+msgid "Turn it off if textures look wrong to you: Mocktail then unpacks them to full size, as earlier versions did. The change applies the next time Roblox starts. On a card that reads ETC2 itself the setting changes nothing; the session log says whether and how textures are converted (a “[vulkan] ETC2/EAC emulation enabled” line)."
+msgstr "Выключайте, если текстуры выглядят неправильно: тогда Mocktail распаковывает их в полный размер, как прежние версии. Изменение вступит в силу при следующем запуске Roblox. На видеокарте, которая сама читает ETC2, настройка ничего не меняет; есть ли преобразование и какое, видно в журнале сеанса (строка «[vulkan] ETC2/EAC emulation enabled»)."
 
 #, c-format
 msgid "The game renders on the %s card here, which has no ETC2 in Vulkan, so this setting applies."
@@ -3660,6 +3553,9 @@ msgstr "Здесь игра отрисовывается на встроенно
 #, c-format
 msgid "The game renders on the %s card here. If its Vulkan driver reads ETC2 itself, this setting changes nothing."
 msgstr "Здесь игра отрисовывается на видеокарте %s. Если её драйвер Vulkan сам читает ETC2, настройка ничего не меняет."
+
+msgid "This card cannot read ETC2. With its textures kept compressed, the game used less than half the video memory in a test on an RTX 3060, and ran as smoothly."
+msgstr "Эта видеокарта не умеет читать ETC2. Когда текстуры остаются сжатыми, игра в тесте на RTX 3060 занимала меньше половины видеопамяти, нужной без сжатия, и работала так же плавно."
 
 
 msgid "Uses X11 (XWayland) here"
@@ -3717,3 +3613,77 @@ msgstr "рабочий стол не поддерживает явную син�
 
 msgid "frames wait for the display outside Hyprland"
 msgstr "кадры ждут экран, а это не Hyprland"
+
+msgid "Anti-aliasing and texture memory"
+msgstr "Сглаживание и память под текстуры"
+
+msgid "Before version 1.0.4-plus.2, Mocktail sent the level under a name that, judging by Roblox 2.738's code, Roblox ignores, so neither Mocktail's default level (3, or 1 on Intel integrated graphics) nor a level chosen here took effect: Roblox's own setting decided."
+msgstr "До версии 1.0.4-plus.2 Mocktail передавал уровень под именем, которое Roblox 2.738, судя по его коду, не читает, поэтому ни стандартный уровень Mocktail (3, а на встроенной графике Intel — 1), ни уровень, выбранный здесь, не действовали: решала настройка самого Roblox."
+
+msgid "Change it in small steps and check the frame rate in a busy experience. Choose “Set in Roblox” above to let Roblox pick the level again."
+msgstr "Меняйте его понемногу и проверяйте частоту кадров в насыщенном месте. Чтобы уровень снова выбирал Roblox, выберите выше «Как в Roblox»."
+
+msgid "Graphics quality only sets the level. The performance preset's limits (MSAA off, a 128 MB texture budget) stay while Physics workers is on Throughput, or on Automatic with Multithreaded rendering, whatever level Roblox runs at."
+msgstr "«Качество графики» задаёт только уровень. Ограничения пресета производительности (MSAA выключено, бюджет текстур 128 МБ) остаются, пока «Потоки физики» стоят на «Пропускная способность» или на «Автоматически» с многопоточным рендерингом, на каком бы уровне ни работал Roblox."
+
+msgid "It applies to the Vulkan backend only: Mocktail hands the Vulkan loader just that card's drivers (VK_DRIVER_FILES). OpenGL ES and ANGLE are not affected, and VK_DRIVER_FILES or VK_ICD_FILENAMES set in the shortcut or terminal win over this setting. The card also decides whether NVIDIA's display-server rule applies."
+msgstr "Настройка действует только для движка Vulkan: Mocktail передаёт загрузчику Vulkan драйверы лишь этой видеокарты (VK_DRIVER_FILES). На OpenGL ES и ANGLE она не влияет, а VK_DRIVER_FILES или VK_ICD_FILENAMES из ярлыка или терминала важнее неё. От видеокарты также зависит, действует ли правило NVIDIA для графического сервера."
+
+#, c-format
+msgid "Level %d is forced, but the performance preset still keeps MSAA off and the texture budget at 128 MB, whatever the level. Set Physics workers to Low latency to lift those limits."
+msgstr "Задан уровень %d, но пресет производительности по-прежнему держит MSAA выключенным, а бюджет текстур — в 128 МБ, какой бы ни был уровень. Чтобы снять эти ограничения, выберите в «Потоках физики» «Низкая задержка»."
+
+msgid "Mocktail sets DFIntDebugFRMQualityLevelOverride, the name Roblox 2.738 registers for this setting, in place of the level the Graphics Quality option in Roblox's settings would choose. That the option then has no effect is not verified in a game for this Roblox build."
+msgstr "Mocktail задаёт DFIntDebugFRMQualityLevelOverride — под этим именем Roblox 2.738 регистрирует эту настройку — вместо уровня, который выбрал бы параметр «Качество графики» в настройках Roblox. То, что этот параметр тогда перестаёт действовать, в игре для этой сборки Roblox не проверено."
+
+msgid "Mocktail's performance preset replaces Roblox's own choices for anti-aliasing and texture memory"
+msgstr "Пресет производительности Mocktail заменяет собственный выбор Roblox для сглаживания и памяти под текстуры"
+
+msgid "On this page, Physics workers and Multithreaded rendering decide whether the performance preset replaces Roblox's choices for anti-aliasing and texture memory."
+msgstr "На этой странице «Потоки физики» и «Многопоточный рендеринг» решают, заменяет ли пресет производительности выбор Roblox для сглаживания и памяти под текстуры."
+
+msgid "Roblox's own Graphics Quality setting picks the level; Mocktail forces none"
+msgstr "Уровень выбирает настройка качества графики самого Roblox; Mocktail его не задаёт"
+
+msgid "Roblox's own setting can be changed while you play; a level forced here changes only when Roblox starts again."
+msgstr "Настройку самого Roblox можно менять прямо в игре, а уровень, заданный здесь, меняется только при новом запуске Roblox."
+
+msgid "Roblox's slider picks the level, but the performance preset still keeps MSAA off and the texture budget at 128 MB. Set Physics workers to Low latency to lift those limits."
+msgstr "Уровень выбирает ползунок Roblox, но пресет производительности по-прежнему держит MSAA выключенным, а бюджет текстур — в 128 МБ. Чтобы снять эти ограничения, выберите в «Потоках физики» «Низкая задержка»."
+
+msgid "Roblox's slider picks the level; the performance preset still keeps MSAA off and the texture budget at 128 MB"
+msgstr "Уровень выбирает ползунок Roblox; пресет производительности по-прежнему держит MSAA выключенным, а бюджет текстур — в 128 МБ"
+
+msgid "Separately, Mocktail's performance preset keeps anti-aliasing (MSAA) off and Roblox's texture budget at 128 MB while it is on: with Physics workers on Throughput (the default), or on Automatic with Multithreaded rendering."
+msgstr "Отдельно от этого пресет производительности Mocktail, пока он включён, держит сглаживание (MSAA) выключенным, а бюджет текстур Roblox — в 128 МБ: когда «Потоки физики» стоят на «Пропускная способность» (по умолчанию) или на «Автоматически» вместе с многопоточным рендерингом."
+
+msgid "The graphics quality level Mocktail sends to Roblox. Level 1 draws the least and runs fastest; level 21 draws the most detail. While a level is set here, Roblox's own quality slider should have no effect."
+msgstr "Уровень качества графики, который Mocktail передаёт Roblox. На уровне 1 рисуется меньше всего и игра идёт быстрее всего; на уровне 21 деталей больше всего. Пока уровень задан здесь, ползунок качества в самом Roblox не должен действовать."
+
+msgid "While the preset is on, Mocktail sets these Roblox client settings at every start, in place of what Roblox would choose itself: MSAA off (FIntDebugForceMSAASamples=1), a 128 MB texture budget (FIntRenderTextureTotalBudgetMB) and compressed terrain textures (FFlagDebugTerrainVTCompressedTextures), along with other settings for Roblox's worker threads, caches, terrain, meshes and avatars."
+msgstr "Пока пресет включён, Mocktail при каждом запуске задаёт эти параметры клиента Roblox вместо того, что выбрал бы сам Roblox: MSAA выключено (FIntDebugForceMSAASamples=1), бюджет текстур 128 МБ (FIntRenderTextureTotalBudgetMB) и сжатые текстуры ландшафта (FFlagDebugTerrainVTCompressedTextures), а также другие параметры рабочих потоков, кешей, ландшафта, мешей и аватаров Roblox."
+
+msgid "With Automatic physics workers, turning it on also turns on Mocktail's performance preset, which among other things sets a 128 MB texture budget and turns MSAA off."
+msgstr "При «Автоматически» в потоках физики эта настройка заодно включает пресет производительности Mocktail; среди прочего он задаёт бюджет текстур 128 МБ и выключает MSAA."
+
+msgid "With the current settings no row in this window replaces one of Roblox's own settings: Roblox picks the graphics quality level, the performance preset is off, Roblox owns the frame rate, the fullscreen setting and the theme, the microphone is enabled, and the Phone profile leaves the interface to Roblox for Android."
+msgstr "При текущих настройках ни одна строка этого окна не заменяет собственные настройки Roblox: уровень качества графики выбирает Roblox, пресет производительности выключен, частоту кадров, полноэкранный режим и тему решает Roblox, микрофон включён, а профиль телефона оставляет интерфейс на усмотрение Roblox для Android."
+
+msgid "choose “Set in Roblox” under Graphics quality."
+msgstr "выберите «Как в Roblox» в «Качестве графики»."
+
+#, c-format
+msgid "fflags.json sets %s to another level, so Roblox will not start. Remove that flag or choose “Set in Roblox”."
+msgstr "В fflags.json для %s задан другой уровень, поэтому Roblox не запустится. Удалите этот флаг или выберите «Как в Roblox»."
+
+msgid "• Custom level: Mocktail sends the level you pick to Roblox, whatever the Performance settings, so Roblox's in-game slider should have no effect (not yet verified in a game for this Roblox build). The change applies the next time Roblox starts."
+msgstr "• Свой уровень: Mocktail передаёт Roblox выбранный вами уровень при любых настройках на странице «Производительность», поэтому ползунок в самой игре Roblox не должен действовать (в игре для этой сборки Roblox это ещё не проверено). Изменение вступит в силу при следующем запуске Roblox."
+
+msgid "• Low latency: Roblox keeps its own pool sizes; Mocktail only batches physics contact work. The preset stays off, so Roblox's own anti-aliasing and texture limits apply (Mocktail still sizes Roblox's video memory from this computer's RAM)."
+msgstr "• Низкая задержка: Roblox сам определяет число потоков, Mocktail лишь группирует расчёт физических контактов. Пресет остаётся выключенным, поэтому действуют собственные сглаживание и ограничения текстур Roblox (объём видеопамяти для Roblox Mocktail всё равно рассчитывает по оперативной памяти компьютера)."
+
+msgid "• Set in Roblox (the default): Mocktail forces no level, and the Graphics Quality option in Roblox's own settings decides; it can be changed while you play."
+msgstr "• Как в Roblox (по умолчанию): Mocktail не задаёт уровень, его определяет параметр «Качество графики» в настройках самого Roblox, и его можно менять прямо в игре."
+
+msgid "• Throughput (default): Roblox's worker pools may use every physical core, and Mocktail's performance preset is on; among other things it sets a 128 MB texture budget and turns anti-aliasing (MSAA) off."
+msgstr "• Пропускная способность (по умолчанию): рабочие потоки Roblox могут занять все физические ядра, и включён пресет производительности Mocktail; среди прочего он задаёт бюджет текстур 128 МБ и выключает сглаживание (MSAA)."

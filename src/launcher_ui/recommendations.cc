@@ -62,38 +62,22 @@ std::optional<int> ParseQualityLevel(std::string_view value) {
   return level;
 }
 
-QualityEffect ResolveGraphicsQuality(std::string_view graphics_quality,
-                                     bool preset_active,
-                                     bool intel_integrated_vulkan) {
+QualityEffect ResolveGraphicsQuality(std::string_view graphics_quality) {
+  // performance_policy.cc: only a level is sent, whatever the preset does;
+  // default, manual (and absent) set nothing.
   QualityEffect effect;
-  if (graphics_quality == "manual") return effect;
   const std::optional<int> level = ParseQualityLevel(graphics_quality);
-  if (!preset_active) {
-    // performance_policy.cc sets FIntDebugFRMQualityLevelOverride only
-    // together with the rendering preset.
-    effect.ignored = true;
-    return effect;
-  }
   if (level.has_value()) {
     effect.source = QualitySource::kConfiguredLevel;
     effect.level = *level;
-    return effect;
   }
-  // "default" (or absent): MOCKTAIL_GRAPHICS_QUALITY stays unset, so the
-  // preset uses "3"; graphics_launch_policy.cc publishes "1" first when
-  // direct Vulkan renders on Intel integrated graphics.
-  effect.source = QualitySource::kMocktailDefault;
-  effect.level = intel_integrated_vulkan ? 1 : 3;
   return effect;
 }
 
 QualityRecommendation RecommendGraphicsQuality(const MachineProfile& machine) {
   if (!machine.detected) return {};
-  if (machine.gpu.discrete()) {
-    return {"manual", QualityRecommendationReason::kCapableGraphics};
-  }
-  if (machine.gpu.integrated_only()) {
-    return {"default", QualityRecommendationReason::kModestGraphics};
+  if (machine.gpu.discrete() || machine.gpu.integrated_only()) {
+    return {"default", QualityRecommendationReason::kRobloxSetting};
   }
   return {};
 }
@@ -147,15 +131,15 @@ std::string FrameRateFlagConflict(const launcher::FastFlagsDocument& flags,
 
 std::string QualityFlagConflict(const launcher::FastFlagsDocument& flags,
                                 const QualityEffect& quality) {
-  constexpr const char* kName = "FIntDebugFRMQualityLevelOverride";
   if (quality.source == QualitySource::kRobloxSetting) return {};
-  const launcher::FastFlagEntry* entry = flags.Find(kName);
+  const std::string name(runtime::kGraphicsQualityClientSetting);
+  const launcher::FastFlagEntry* entry = flags.Find(name);
   // performance_policy.cc refuses a different explicit value.
   if (entry == nullptr ||
       entry->RobloxValue() == std::to_string(quality.level)) {
     return {};
   }
-  return kName;
+  return name;
 }
 
 std::vector<WindowSizePreset> WindowSizePresets(const MonitorInfo& monitor) {

@@ -66,14 +66,6 @@ HostGpuSelection SelectHostGpu(
 std::string DescribeVulkanGpuSelection(const HostGpuSelection& selection,
                                        GpuPreference configured);
 
-// Whether direct Vulkan runs on Intel integrated graphics, which get
-// graphics quality level 1 while engine.graphics_quality is default.
-// `selected` is SelectHostGpu's card, or the card VK_LOADER_DEVICE_SELECT
-// names while the Vulkan drivers are already pinned; without one only an
-// Intel-only computer counts.
-bool RendersOnIntelIntegratedGraphics(const std::vector<HostGpu>& gpus,
-                                      const std::optional<HostGpu>& selected);
-
 // Readable ICD manifest for `vendor` that this build can actually load, or an
 // empty path. Directories are searched in order; a manifest built for another
 // architecture is never selected.

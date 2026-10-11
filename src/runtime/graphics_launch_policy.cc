@@ -118,13 +118,6 @@ bool ApplyDisplayServer(DisplayServer server, std::string* error) {
   return true;
 }
 
-// "default" is engine.graphics_quality's own word for an unset level.
-bool GraphicsQualityLeftToDefault() {
-  const char* current = std::getenv("MOCKTAIL_GRAPHICS_QUALITY");
-  return current == nullptr || current[0] == '\0' ||
-         std::strcmp(current, "default") == 0;
-}
-
 bool DenyNvidiaShaderLoadingThreads(std::string* error) {
   const char* current = std::getenv("MOCKTAIL_CLIENT_SETTINGS_OVERRIDES_JSON");
   std::string merged;
@@ -344,26 +337,6 @@ const char* AnvSysMemLimitPercent() {
   return "50";
 }
 
-// The detected card VK_LOADER_DEVICE_SELECT (vendor:device in hex, as the
-// loader reads it) names, if any.
-std::optional<HostGpu> FindLoaderSelectedGpu(const std::vector<HostGpu>& gpus,
-                                             std::string_view select) {
-  const std::size_t colon = select.find(':');
-  unsigned int vendor = 0;
-  unsigned int device = 0;
-  if (colon == std::string_view::npos ||
-      !ParsePciId(std::string(select.substr(0, colon)), &vendor) ||
-      !ParsePciId(std::string(select.substr(colon + 1)), &device)) {
-    return std::nullopt;
-  }
-  for (const HostGpu& gpu : gpus) {
-    if (gpu.vendor == vendor && gpu.device == device) {
-      return gpu;
-    }
-  }
-  return std::nullopt;
-}
-
 // Lines for the session log: into `*log` when the caller collects them,
 // else straight to stderr.
 void EmitLogLines(std::string* log, const std::string& lines) {
@@ -381,12 +354,11 @@ std::string PciIdHex(unsigned int id) {
 }
 
 // Pins the Vulkan driver of the card engine.gpu (or DRI_PRIME and
-// __NV_PRIME_RENDER_OFFLOAD under auto) asks for. `selected` receives that
-// card, or stays empty while the user pins the drivers or no card has one.
+// __NV_PRIME_RENDER_OFFLOAD under auto) asks for, unless the user pins the
+// drivers or no card has one.
 bool ApplyVulkanIcdPolicy(const std::vector<HostGpu>& gpus,
-                          GpuPreference configured,
-                          std::optional<HostGpu>* selected,
-                          std::string* error, std::string* log) {
+                          GpuPreference configured, std::string* error,
+                          std::string* log) {
   // Drop software/emulation ICDs even when the user already pinned a driver
   // list. Old loaders ignore this variable.
   if (!SetDefault("VK_LOADER_DRIVERS_DISABLE",
@@ -398,11 +370,7 @@ bool ApplyVulkanIcdPolicy(const std::vector<HostGpu>& gpus,
   if ((existing_files != nullptr && existing_files[0] != '\0') ||
       (existing_icds != nullptr && existing_icds[0] != '\0')) {
     // A memory-limit re-exec inherits what the first pass pinned, including
-    // the card VK_LOADER_DEVICE_SELECT names when one driver has two.
-    if (selected != nullptr) {
-      *selected =
-          FindLoaderSelectedGpu(gpus, EnvValue("VK_LOADER_DEVICE_SELECT"));
-    }
+    // VK_LOADER_DEVICE_SELECT when one driver has two cards.
     return true;
   }
   const GpuPreference preference =
@@ -425,9 +393,6 @@ bool ApplyVulkanIcdPolicy(const std::vector<HostGpu>& gpus,
       !SetDefault("VK_LOADER_DEVICE_SELECT", selection.loader_device_select,
                   error)) {
     return false;
-  }
-  if (selected != nullptr) {
-    *selected = selection.gpu;
   }
   return true;
 }
@@ -457,18 +422,6 @@ bool MergeNvidiaShaderLoadingClientSettingsOverrides(
   }
   *merged_json = overrides.dump();
   return true;
-}
-
-bool RendersOnIntelIntegratedGraphics(const std::vector<HostGpu>& gpus,
-                                      const std::optional<HostGpu>& selected) {
-  if (selected.has_value()) {
-    return selected->vendor == kIntelVendor && selected->integrated;
-  }
-  // The user pins the drivers, or no card has one: Intel-only machines.
-  return !gpus.empty() &&
-         std::all_of(gpus.begin(), gpus.end(), [](const HostGpu& gpu) {
-           return gpu.vendor == kIntelVendor;
-         });
 }
 
 std::vector<HostGpu> DetectHostGpus(
@@ -733,7 +686,6 @@ bool ApplyGraphicsLaunchPolicy(const RuntimeConfig& config,
     const char* wsi_mode =
         UnthrottledPresentation(config) ? "immediate" : "mailbox";
     const std::vector<HostGpu> gpus = DetectHostGpus();
-    std::optional<HostGpu> selected;
     // Roblox's loader holds its own lock around every fseek/fread pair on
     // the shared pack FILE, so several threads are safe on every vendor;
     // engine.nvidia_shader_mt: false brings back the old NVIDIA deny.
@@ -744,18 +696,7 @@ bool ApplyGraphicsLaunchPolicy(const RuntimeConfig& config,
         // Move GEM_EXECBUFFER2 off the application thread onto Mesa's submit
         // worker so the render thread is not stuck in i915 ioctl.
         !SetDefault("MESA_VK_ENABLE_SUBMIT_THREAD", "1", error) ||
-        !ApplyVulkanIcdPolicy(gpus, config.engine().gpu, &selected, error,
-                              log)) {
-      return false;
-    }
-    // Low FRM only when the game renders on Intel integrated graphics. A
-    // discrete card keeps the desktop quality default. A configured
-    // engine.graphics_quality wins: publishing "1" here would beat the YAML
-    // value in every later config load, because the environment wins there.
-    if (RendersOnIntelIntegratedGraphics(gpus, selected) &&
-        config.engine().graphics_quality.mode == GraphicsQualityMode::kDefault &&
-        GraphicsQualityLeftToDefault() &&
-        !SetValue("MOCKTAIL_GRAPHICS_QUALITY", "1", error)) {
+        !ApplyVulkanIcdPolicy(gpus, config.engine().gpu, error, log)) {
       return false;
     }
   }

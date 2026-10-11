@@ -224,12 +224,13 @@ std::string FormatEtc2DecodeTotalsDetail(const Etc2DecodeTotals& totals) {
          Count(totals.staging_fallbacks));
   Append(&out,
          " | record calls=%llu time=%.1f ms release=%.1f ms destroyed=%llu "
-         "bc_images=%llu bc_fallback=%llu copyimg=%llu aliasviews=%llu | ",
+         "bc_images=%llu bc_fallback=%llu bc_mixed_copies=%llu copyimg=%llu "
+         "aliasviews=%llu | ",
          Count(totals.record_calls), FractionalMilliseconds(totals.record_ns),
          FractionalMilliseconds(totals.release_ns),
          Count(totals.images_destroyed), Count(totals.bc_images),
-         Count(totals.bc_fallback_images), Count(totals.copy_image_calls),
-         Count(totals.alias_views));
+         Count(totals.bc_fallback_images), Count(totals.bc_mixed_copies),
+         Count(totals.copy_image_calls), Count(totals.alias_views));
   AppendUploadShape(totals, &out);
   return out;
 }
@@ -279,12 +280,11 @@ bool Etc2DecodeTotalsMilestone(std::uint64_t before, std::uint64_t after) {
 }
 
 std::string FormatEtc2StallSuffix(
-    unsigned threads, bool fast_path,
+    unsigned threads,
     const std::uint64_t (&source_bytes_by_type)[kEtc2CountedMemoryTypes],
     std::uint64_t unknown_type_bytes) {
   std::string out;
-  Append(&out, " [threads %u, path %s, src", threads,
-         fast_path ? "fast" : "legacy");
+  Append(&out, " [threads %u, src", threads);
   bool any = false;
   for (std::size_t type = 0; type < kEtc2CountedMemoryTypes; ++type) {
     if (source_bytes_by_type[type] != 0) {
@@ -337,13 +337,6 @@ bool Etc2Scratch::ReleaseIfIdle(std::chrono::steady_clock::time_point now) {
 void Etc2Scratch::Release() {
   data_.reset();
   capacity_ = 0;
-}
-
-void ReleaseOversizedEtc2Scratch(std::vector<std::uint8_t>* scratch) {
-  if (scratch != nullptr &&
-      scratch->capacity() > kEtc2LegacyScratchKeepBytes) {
-    std::vector<std::uint8_t>().swap(*scratch);
-  }
 }
 
 }  // namespace mocktail::graphics

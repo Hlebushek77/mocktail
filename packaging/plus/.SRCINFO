@@ -1,6 +1,6 @@
 pkgbase = mocktail-plus
 	pkgdesc = Android x86-64 Roblox compatibility runtime for Linux (unofficial Mocktail fork with a settings window and fixes)
-	pkgver = 1.0.4.plus.1
+	pkgver = 1.0.4.plus.2
 	pkgrel = 1
 	url = https://github.com/blackixxce12/mocktail
 	arch = x86_64
@@ -45,13 +45,13 @@ pkgbase = mocktail-plus
 	depends = webkitgtk-6.0
 	depends = zlib
 	optdepends = gamemode: Feral GameMode integration
-	provides = mocktail=1.0.4.plus.1
+	provides = mocktail=1.0.4.plus.2
 	conflicts = mocktail
 	conflicts = mocktail-bin
 	conflicts = mocktail-git
 	conflicts = mocktail-local
 	options = !debug
-	source = mocktail::git+https://github.com/blackixxce12/mocktail.git#tag=v1.0.4-plus.1
+	source = mocktail::git+https://github.com/blackixxce12/mocktail.git#tag=v1.0.4-plus.2
 	source = vulkan-headers-8d6039a455a7ecc7d2a592ff97f62db4e59b70bf.tar.gz::https://github.com/KhronosGroup/Vulkan-Headers/archive/8d6039a455a7ecc7d2a592ff97f62db4e59b70bf.tar.gz
 	sha256sums = SKIP
 	sha256sums = 54321019f1b98337d72a999ef94ad252006fb793ae1c53b50c8c2bed82901d23

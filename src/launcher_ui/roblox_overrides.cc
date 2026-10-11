@@ -19,25 +19,19 @@ constexpr char kStartModeKey[] = "display.start_mode";
 constexpr char kInputKey[] = "audio.input_device";
 constexpr char kDeviceKey[] = "device";
 
-// Mocktail's level when engine.graphics_quality is default
-// (performance_policy.cc uses "3" while MOCKTAIL_GRAPHICS_QUALITY is
-// unset).
-constexpr int kDefaultQualityLevel = 3;
+// A forced level above this one, the low end of Roblox's 21, asks for
+// detail: the preset's MSAA and texture limits are worth a warning then.
+constexpr int kLowQualityLevel = 3;
 
 bool PresetActive(const GameSettings& settings) {
   return RenderingPresetActive(settings.physics_worker_mode,
                                settings.multithreaded_rendering);
 }
 
+// runtime_config.cc ParseGraphicsQualityVariable: the environment's auto
+// and 0 mean manual, which ResolveGraphicsQuality reads as no level.
 QualityEffect Quality(const GameSettings& settings) {
-  // runtime_config.cc ParseGraphicsQualityVariable: the environment's auto
-  // and 0 mean manual, as performance_policy.cc reads them.
-  const std::string_view quality =
-      settings.graphics_quality == "auto" || settings.graphics_quality == "0"
-          ? std::string_view("manual")
-          : std::string_view(settings.graphics_quality);
-  return ResolveGraphicsQuality(quality, PresetActive(settings),
-                                settings.intel_integrated_vulkan);
+  return ResolveGraphicsQuality(settings.graphics_quality);
 }
 
 std::optional<RobloxOverride> QualityOverride(const GameSettings& settings) {
@@ -47,8 +41,6 @@ std::optional<RobloxOverride> QualityOverride(const GameSettings& settings) {
   entry.kind = RobloxOverrideKind::kGraphicsQuality;
   entry.key = kQualityKey;
   entry.number = effect.level;
-  entry.value =
-      effect.source == QualitySource::kConfiguredLevel ? "level" : "default";
   return entry;
 }
 
@@ -198,7 +190,7 @@ std::vector<OverrideConflict> FindOverrideConflicts(
   if (!PresetActive(settings)) return conflicts;
   const QualityEffect effect = Quality(settings);
   if (effect.source == QualitySource::kConfiguredLevel &&
-      effect.level > kDefaultQualityLevel) {
+      effect.level > kLowQualityLevel) {
     conflicts.push_back(OverrideConflict::kHighLevelUnderPresetLimits);
   }
   if (effect.source == QualitySource::kRobloxSetting) {

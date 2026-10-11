@@ -14,9 +14,6 @@
 #ifndef MOCKTAIL_LAUNCHER_LOCALEDIR
 #define MOCKTAIL_LAUNCHER_LOCALEDIR "/usr/share/locale"
 #endif
-#ifndef MOCKTAIL_LAUNCHER_BUILD_LOCALEDIR
-#define MOCKTAIL_LAUNCHER_BUILD_LOCALEDIR ""
-#endif
 // Space-separated languages with a catalogue (po/LINGUAS).
 #ifndef MOCKTAIL_LAUNCHER_LINGUAS
 #define MOCKTAIL_LAUNCHER_LINGUAS "ru"
@@ -79,7 +76,6 @@ std::string InitTranslations(const char* argv0) {
                          "locale");
   }
   candidates.emplace_back(MOCKTAIL_LAUNCHER_LOCALEDIR);
-  candidates.emplace_back(MOCKTAIL_LAUNCHER_BUILD_LOCALEDIR);
   std::string bound;
   for (const std::filesystem::path& candidate : candidates) {
     if (HoldsCatalogue(candidate)) {

@@ -4,7 +4,7 @@
 // runs (CR-25).
 //
 //   etc2_cpu_perf [--reps N] [--workload small|big|mixed]...
-//                 [--arm legacy|cached|coherent|bc|bc-legacy]... [section...]
+//                 [--arm cached|coherent|bc|bc-coherent]... [section...]
 //
 // Sections (all by default):
 //   kernels    the decoder and the resampler against the plus.1 references
@@ -18,12 +18,11 @@
 //              NVIDIA): memcpy and the streaming kernels, 1 to 8 threads
 //   emulation  the production VulkanEtc2Emulation on the real device: the
 //              small, big and mixed bursts of plus2-design/pipeline_bench.cc
-//              through the legacy path (MOCKTAIL_ETC2_FAST_PATH=0) and the
-//              fast path with cached and coherent staging; staging contents
-//              compared byte for byte; transient RAM; scratch and arena after
-//              the idle delays. ETC2->BC mode (MOCKTAIL_ETC2_TO_BC=1) only
-//              when asked for: --arm bc (fast path, cached staging) and
-//              --arm bc-legacy, whose BC staging is compared between them
+//              with cached and coherent staging; staging contents compared
+//              byte for byte; transient RAM; scratch and arena after the
+//              idle delays. ETC2->BC mode (MOCKTAIL_ETC2_TO_BC=1) only when
+//              asked for: --arm bc (cached staging) and --arm bc-coherent,
+//              whose BC staging is compared between them
 //   gpucopy    the GPU reading staging: vkCmdCopyBufferToImage of 64 MiB
 //              from cached (type 4) and coherent (type 3) system memory
 //
@@ -766,7 +765,6 @@ Workload MakeWorkload(const char* kind, bool per_mip) {
 struct Arm {
   const char* name;
   const char* word;  // for --arm
-  bool fast_path;
   Etc2StagingMemory staging;
   bool bc;  // MOCKTAIL_ETC2_TO_BC=1
 };
@@ -851,7 +849,6 @@ class Session {
       : device_(device), workload_(workload), arm_(arm) {
     Etc2EmulationOptions options;
     options.gpu = false;
-    options.fast_path = arm.fast_path;
     options.staging_memory = arm.staging;
     options.to_bc = arm.bc;
     options.frame_stats = true;
@@ -1014,7 +1011,7 @@ class Session {
     });
   }
 
-  // The fast path keeps staging chunks and scratch through a burst; the
+  // The CPU route keeps staging chunks and scratch through a burst; the
   // presents after the idle delays (2 s for chunks beyond 128 MiB, 5 s for
   // scratch beyond 64 MiB) give them back.
   std::string IdleCheck() {
@@ -1102,13 +1099,11 @@ void RunEmulation(const HeadlessVulkanDevice& device, int reps,
   }
   std::vector<Arm> arms;
   for (const Arm& arm :
-       {Arm{"legacy", "legacy", false, Etc2StagingMemory::kCoherent, false},
-        Arm{"fast cached", "cached", true, Etc2StagingMemory::kCached, false},
-        Arm{"fast coherent", "coherent", true, Etc2StagingMemory::kCoherent,
-            false},
-        Arm{"bc legacy", "bc-legacy", false, Etc2StagingMemory::kCoherent,
-            true},
-        Arm{"bc cached", "bc", true, Etc2StagingMemory::kCached, true}}) {
+       {Arm{"cached", "cached", Etc2StagingMemory::kCached, false},
+        Arm{"coherent", "coherent", Etc2StagingMemory::kCoherent, false},
+        Arm{"bc cached", "bc", Etc2StagingMemory::kCached, true},
+        Arm{"bc coherent", "bc-coherent", Etc2StagingMemory::kCoherent,
+            true}}) {
     // ETC2->BC mode only when asked for.
     if (only_arms.empty() ? !arm.bc
                           : std::find(only_arms.begin(), only_arms.end(),
@@ -1167,13 +1162,11 @@ void RunEmulation(const HeadlessVulkanDevice& device, int reps,
       session->Print((*first)->staging_hash());
     }
     sessions.clear();
-    const auto fast = std::find_if(arms.begin(), arms.end(),
-                                   [](const Arm& arm) { return arm.fast_path; });
-    if (std::strcmp(kind.kind, "mixed") == 0 && !kind.per_mip &&
-        fast != arms.end()) {
-      Session session(device, workload, bytes, source_type, *fast);
+    if (std::strcmp(kind.kind, "mixed") == 0 && !kind.per_mip) {
+      const Arm& first = arms.front();
+      Session session(device, workload, bytes, source_type, first);
       session.Round(true, false);
-      std::printf("                 %s, alone: %s\n", fast->name,
+      std::printf("                 %s, alone: %s\n", first.name,
                   session.IdleCheck().c_str());
     }
   }

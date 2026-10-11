@@ -22,7 +22,7 @@ is upstream's.
   is `space.bigrat.mocktail`, and it uses the same files as upstream's
   native packages and AppImage.
 
-![The settings window's Graphics page with a hint open](assets/screenshots/plus-settings-graphics.png)
+![The settings window's Accounts page](assets/screenshots/plus-settings-accounts.png)
 
 ## How it works
 
@@ -117,18 +117,52 @@ shows every change, file by file.
 - `engine.gpu` chooses the graphics card on computers with more than one,
   including laptops with AMD integrated graphics and an NVIDIA card, where
   upstream always used the NVIDIA card.
-- `engine.graphics_quality` chooses the graphics quality level that
-  Mocktail's performance preset forces, or leaves it to Roblox's slider.
+- `engine.graphics_quality` sends Roblox a graphics quality level you
+  choose, or leaves the level to Roblox's own setting (the default). Since
+  1.0.4-plus.2 the level goes under the name Roblox 2.738 registers for it
+  (`DFIntDebugFRMQualityLevelOverride`); before, Mocktail sent it under a
+  name that, judging by Roblox's code, Roblox ignores. That a chosen level
+  now applies in a game is not verified yet.
+- Since 1.0.4-plus.2 the performance preset no longer sends 33 client
+  settings that Roblox 2.738 never reads. Roblox looks a setting up only
+  under the prefix it registered it with (`F` or `DF`), and some of the
+  names do not exist in it at all. Among them were the quality level 3 the
+  settings window said the preset forced, a texture mip bias and low-end
+  level of detail. Roblox never applied them, so the game behaves as before.
+  With Physics workers on Throughput (the default) the preset now sends 40
+  settings, with Automatic and Multithreaded rendering 38.
 - With direct Vulkan, vertical sync "On" now stays synchronized with Mesa's
   drivers (AMD, Intel, NVK) when the frame rate limit is unlimited.
 - The session log names the graphics card the game renders on, and how much
   ETC2 texture decoding a session did.
 
+**Textures and stutter** (1.0.4-plus.2)
+
+- The stutter that texture conversion caused while moving or turning the
+  camera on NVIDIA cards is gone in our test. Roblox streams textures in
+  the ETC2 format, which these cards cannot read, and Mocktail used to
+  convert every one of them on the processor, on the game's render thread,
+  with a staging buffer created and destroyed for every texture copy. Now
+  the graphics card converts them, and the processor path that remains as
+  the fallback is about seven times faster. See
+  [ETC2 textures](#etc2-textures).
+- **Compressed textures (BC)** (`engine.etc2_to_bc`), on by default: on
+  cards without ETC2 the textures are converted to BC and stay compressed
+  instead of being unpacked. In the test the game used about 800 MiB of
+  video memory instead of about 1900 MiB.
+- `MOCKTAIL_FRAME_STATS=1` logs frame pacing and texture work,
+  `scripts/frame_stats_summary.py` summarizes such a log, and
+  `MOCKTAIL_VK_CALL_STATS=1` counts the game's Vulkan calls. See
+  [Measuring stutter](#measuring-stutter).
+
 **Memory**
 
-- ETC2 texture decoding gives its scratch memory back after a loading burst
-  (anything over 32 MiB). In one test in the same place, the game's
-  anonymous memory went from 1817 MiB to 1455 MiB at the same frame rate.
+- The processor path of the texture conversion frees a scratch buffer
+  larger than 64 MiB once it has not converted anything for 5 seconds.
+  1.0.4-plus.1 freed one larger than 32 MiB after every upload batch, which
+  in one test took the game's anonymous memory from 1817 MiB to 1455 MiB at
+  the same frame rate, but made each batch of a loading burst allocate the
+  memory again.
 - The description of `performance.memory_limit_mb` now says what it does: a
   watchdog stops Mocktail with exit status 137 once the game's resident
   memory plus swap reaches the limit; swap stays enabled.
@@ -155,11 +189,11 @@ Requirements:
 - A Vulkan driver for the default `direct-vulkan` graphics backend, or
   OpenGL ES 3.0 for `graphics.backend: opengl`.
 
-Download `mocktail-plus-1.0.4.plus.1-1-x86_64.pkg.tar.zst` from the
-`v1.0.4-plus.1` release and install it:
+Download `mocktail-plus-1.0.4.plus.2-1-x86_64.pkg.tar.zst` from the
+`v1.0.4-plus.2` release and install it:
 
 ```bash
-sudo pacman -U ./mocktail-plus-1.0.4.plus.1-1-x86_64.pkg.tar.zst
+sudo pacman -U ./mocktail-plus-1.0.4.plus.2-1-x86_64.pkg.tar.zst
 ```
 
 The package conflicts with `mocktail`, `mocktail-bin`, `mocktail-git` and
@@ -185,6 +219,13 @@ Mocktail ignores the new `config.yaml` sections, so the file keeps working.
 The settings window moves the saved Roblox session into its account store
 (`~/.local/share/mocktail/auth/accounts/`), which upstream does not read, so
 after switching back you may have to sign in again.
+
+Going back from 1.0.4-plus.2 to 1.0.4-plus.1 needs one edit first: remove
+the `etc2_to_bc` line under `engine` in `config.yaml`. 1.0.4-plus.1 refuses
+keys it does not know, so with that line it does not start ("Mocktail could
+not load its configuration"). A `config.yaml` that 1.0.4-plus.2 created has
+the line, and the settings window writes it when you change Compressed
+textures (BC).
 
 ### Upstream Mocktail
 
@@ -242,8 +283,6 @@ sudo apt install mocktail-nightly
 
 ## The settings window
 
-![The Accounts page](assets/screenshots/plus-settings-accounts.png)
-
 **When it opens.** On a normal start, from the application menu or with
 `mocktail`, the settings window opens first. Press **Play** to start Roblox;
 closing the window quits without starting it. The window is skipped:
@@ -264,7 +303,7 @@ If the window cannot start or crashes, Roblox starts as if Play was pressed.
 
 | Page | Settings |
 |---|---|
-| Graphics | Graphics backend, Graphics card (`engine.gpu`), Graphics quality (`engine.graphics_quality`), Multithreaded shader loading (`engine.nvidia_shader_mt`, under "More renderer options"), Frame rate limit, Vertical sync |
+| Graphics | Graphics backend, Graphics card (`engine.gpu`), Graphics quality (`engine.graphics_quality`), Compressed textures (BC) (`engine.etc2_to_bc`), Multithreaded shader loading (`engine.nvidia_shader_mt`, under "More renderer options"), Frame rate limit, Vertical sync |
 | Display | Window size, Start in (`display.start_mode`), Native resolution on scaled displays, Display server (`display.server`), Theme, Window title |
 | Performance | Multithreaded rendering, Physics workers, GameMode, Memory limit |
 | Audio | Output device, Microphone |
@@ -305,18 +344,17 @@ the desktop entry in `~/.local/share/applications`, or removes the copy when
 it only added them, and keeps a backup next to it.
 
 **Overrides Roblox setting.** Some settings replace one of Roblox's own
-in-game settings, for example the graphics quality level that Mocktail's
-performance preset forces. Such rows carry an **Overrides Roblox setting**
+in-game settings, for example a graphics quality level that you force in
+the settings window. Such rows carry an **Overrides Roblox setting**
 badge, and the Advanced page lists them under **What Mocktail decides and
 what Roblox decides**, together with the settings left to Roblox and the
 client settings Mocktail sets at every start.
 
-![The Advanced page: what Mocktail decides and what Roblox decides](assets/screenshots/plus-settings-advanced.png)
-
-The screenshots were taken during the window's self-test
-(`mocktail_launcher_ui --selftest`) in a nested Hyprland session, with a
-fresh `config.yaml` and a scratch home directory. The self-test sets
-`MOCKTAIL_GRAPHICS_BACKEND` to show the ENV badge and the banner.
+The screenshot at the top was taken with 1.0.4-plus.1 during the window's
+self-test (`mocktail_launcher_ui --selftest`) in a nested Hyprland session,
+with a fresh `config.yaml` and a scratch home directory; the Accounts page
+has not changed since. The self-test sets `MOCKTAIL_GRAPHICS_BACKEND` to
+show the ENV badge and the banner.
 
 ## Configuration
 
@@ -337,9 +375,10 @@ empty value, hides the value from the file (empty means the default):
 | `display.server` | `auto`, `wayland`, `x11` | `MOCKTAIL_DISPLAY_SERVER` | Display server for the game window. `auto` prefers Wayland, with the [NVIDIA rule](#nvidia). A server the session does not offer falls back to `auto`. `SDL_VIDEODRIVER`, `SDL_VIDEO_DRIVER` or a `MOCKTAIL_FORCE_*` switch in your environment takes precedence. |
 | `display.start_mode` | `remember`, `windowed`, `maximized`, `fullscreen` | `MOCKTAIL_WINDOW_START_MODE` | Window state at start. `remember` restores the mode the last session ended in. |
 | `account.sign_in` | `native`, `browser` | `MOCKTAIL_NATIVE_LOGIN` (`0` means `browser`, anything else `native`) | Where you sign in when Roblox starts without a working saved session: Roblox's own welcome screen, or Mocktail's roblox.com window. |
-| `engine.graphics_quality` | `default`, `manual`, `1` to `21` | `MOCKTAIL_GRAPHICS_QUALITY` (also `auto` or `0` for `manual`) | Roblox's graphics quality level while Mocktail's performance preset is on (`performance.physics_worker_mode: throughput`, the default, or `auto` with `multithreaded_rendering`). `default` forces level 3 (level 1 with direct Vulkan on Intel integrated graphics), `manual` leaves Roblox's in-game slider in control, a number forces that level. |
+| `engine.graphics_quality` | `default`, `manual`, `1` to `21` | `MOCKTAIL_GRAPHICS_QUALITY` (also `auto` or `0` for `manual`) | Roblox's graphics quality level. `default` and `manual` leave it to Roblox's own Graphics Quality setting; a number is sent as that level (`DFIntDebugFRMQualityLevelOverride`, the name Roblox 2.738 registers), whatever the performance settings, in place of Roblox's in-game slider. That the level then applies in a game is not verified yet. Before 1.0.4-plus.2 the level was sent under a name that, judging by Roblox 2.738's code, Roblox ignores, so it never took effect. |
 | `engine.gpu` | `auto`, `discrete`, `integrated` | `MOCKTAIL_GPU` | Graphics card for direct Vulkan on computers with more than one. See [Hybrid laptops](#hybrid-laptops). |
 | `engine.nvidia_shader_mt` | `true`, `false` | `MOCKTAIL_NVIDIA_SHADER_MT` (`1`/`0`, `true`/`false`, `on`/`off`) | With direct Vulkan, lets Roblox load its shader pack on several threads on NVIDIA cards. `false` makes it use one thread there, as upstream does. |
+| `engine.etc2_to_bc` | `true`, `false` | `MOCKTAIL_ETC2_TO_BC` (`1`/`0`, `true`/`false`, `on`/`off`) | Compressed textures (BC). With direct Vulkan on a card that cannot read ETC2 (NVIDIA), Roblox's ETC2 textures are converted to BC and stay compressed. `false` unpacks them to full size, as before 1.0.4-plus.2. A card that reads ETC2 itself is not affected. See [ETC2 textures](#etc2-textures). |
 | `launcher.show_on_start` | `true`, `false` | `MOCKTAIL_LAUNCHER_SHOW_ON_START` (`1`/`0`, `true`/`false`, `on`/`off`) | Show the settings window before Roblox starts. |
 
 A `config.yaml` from upstream Mocktail works unchanged: a missing section
@@ -430,29 +469,164 @@ renderer options, **Multithreaded shader loading**) or
 
 ### ETC2 textures
 
-NVIDIA's Vulkan driver has no ETC2 texture support. Mocktail tells Roblox
-that ETC2 is supported anyway and decodes those textures on the CPU into
-uncompressed ones (RGBA8, and 16-bit formats for EAC).
-`MOCKTAIL_ADVERTISE_ETC2=0` stops that, and Roblox then uses DXT/BC
-textures, which NVIDIA cards support natively. Plus keeps ETC2 on by default
-because it was much faster in a test:
+Roblox's Android client sends most of its textures in the ETC2 format (EAC
+for one- and two-channel ones). NVIDIA's Vulkan driver cannot read ETC2, so
+Mocktail tells Roblox that ETC2 is supported anyway and converts these
+textures as Roblox uploads them. A card whose driver reads ETC2 itself is
+left alone. The session log says what happens on yours, for example:
 
-| Same place and server | ETC2 (default) | `MOCKTAIL_ADVERTISE_ETC2=0` |
+```
+[vulkan] ETC2/EAC emulation enabled: compressed uploads become BC1/BC3/BC4/BC5 host images (GPU transcode)
+[vulkan] ETC2 GPU decode ready on family 0 (build 20 ms, selftest ok, BC transcode too)
+```
+
+Since 1.0.4-plus.2 the conversion works like this:
+
+- **On the graphics card.** A compute shader converts the uploads in the
+  same submission as Roblox's own copies, right before them. When a session
+  starts, Mocktail runs it on test blocks of every ETC2 and EAC format and
+  uses it only if the result matches the processor's byte for byte
+  (`selftest ok` above).
+- **Compressed textures (BC)**, on by default (`engine.etc2_to_bc`, the
+  Graphics page's **Compressed textures (BC)** row): the textures become
+  BC1, BC3, BC4 or BC5, which NVIDIA cards read natively, and stay
+  compressed, so they take as much video memory as Roblox counts for them.
+  Unpacked (RGBA8, and 16-bit formats for EAC), as earlier versions did and
+  as the setting's off position still does, they take 4 to 8 times as
+  much.
+- **On the processor** whenever the graphics card cannot take an upload:
+  with `MOCKTAIL_ETC2_GPU=0`, when the check fails, until the shader is
+  ready at the start of a session, for the small textures that are
+  enlarged without BC (see below), and in a few rarer cases that the
+  `cpu_route` counts of the session totals name. This is the same
+  conversion as before, rewritten: it reads Roblox's upload memory with
+  streaming loads, runs on a pool of worker threads with a faster decoder,
+  and reuses its staging memory instead of creating a buffer for every
+  copy.
+
+**Why Mocktail stuttered.** Roblox streams textures while you move and turn
+the camera, and uploads many of them again and again. In one four-minute
+session in Anime Vanguards it uploaded 33,162 textures, 1.8 GiB compressed
+and 12.6 GiB unpacked. 1.0.4-plus.1 converted every upload on the processor
+inside Roblox's `vkQueueSubmit`, that is on the game's render thread, and
+created and destroyed a staging buffer for every texture copy. That session
+spent 23.4 s converting and another 25.0 s creating and destroying those
+buffers; single frames took up to 0.4 s while moving, and one conversion
+held the game for 0.7 s while the place loaded. The new processor path
+converted about as many uploads (33,181, 2.4 GiB compressed) in 3.2 s in
+all, with no conversion longer than 69 ms. With BC on the graphics card, the
+processor converted 18 of 24,040 uploads, and the graphics card spent
+146 ms of its own time on the rest in the whole session.
+
+The test: Anime Vanguards, Roblox 2.738.1397, an RTX 3060 Laptop GPU (6 GB)
+with driver 615.71.09 on Hyprland, two runs per row on a random server
+each, turning the camera for about 30 s and then moving for about 40 s.
+"Stalls" adds up the conversions that held the render thread for 20 ms or
+more.
+
+| | Stalls, turning | Stalls, moving | Longest frame, moving | Frames over 100 ms, moving | Video memory of the game, average / peak |
+|---|---|---|---|---|---|
+| 1.0.4-plus.1's processor path | 0.35–2.0 s | 2.3–4.0 s | 366–384 ms | 24–39 | 1580–1680 / 2190–2210 MiB |
+| New processor path, BC off | 0.02–0.08 s | 0.15–0.21 s | 101–118 ms | 1–2 | 1570–1750 / 2130–2160 MiB |
+| Graphics card, BC off | none | none | 44–101 ms | 0–1 | 1800–1930 / 2410–2420 MiB |
+| Graphics card, BC on (the default) | none | none | 62–64 ms | none | 770–840 / 910–1010 MiB |
+| Processor, BC on (one run) | 0.12 s | none | 46 ms | none | 742 / 845 MiB |
+
+The average frame rate while moving was 76–106 fps in every row and
+depended more on the server than on the mode.
+
+**Compressed textures (BC).** In the test the game needed less than half
+the video memory with it, and converting on the graphics card caused no
+stall. Roblox also uploaded less: 514–655 MiB of compressed textures per
+run against 1.0–3.5 GiB with BC off. The cost is some quality in fine
+detail, because converting one compressed format into another loses a
+little: sharp edges in text and icons or smooth gradients can look
+blockier. In screenshots from the test the interface icons looked the
+same, and small avatar textures looked smoother with BC (see the next
+paragraph). When the processor has to convert to BC (`MOCKTAIL_ETC2_GPU=0`,
+or a session log without the `ETC2 GPU decode ready` line), loading can
+stutter briefly: in the test the longest conversion took 196 ms while the
+place loaded, and turning the camera brought three stalls of at most
+62 ms. If textures look wrong to you, turn the setting off in the settings
+window, with `engine.etc2_to_bc: false` or with `MOCKTAIL_ETC2_TO_BC=0`.
+
+**Small textures are enlarged fourfold without BC.** With BC off, Mocktail
+enlarges colour textures of up to 64×64 pixels four times in each
+direction by repeating pixels (`MOCKTAIL_SMALL_TEXTURE_UPSCALE`, default
+4), as earlier versions did, and converts them on the processor. Turning
+that off (`MOCKTAIL_SMALL_TEXTURE_UPSCALE=1`) saves some video memory, but
+in the same test Roblox then uploaded 132,893 textures, 15.5 GiB
+compressed, in about four minutes, and the game ran at 41 fps while moving
+instead of 80–90. So the enlargement stays. BC keeps small textures at
+their own size, and Roblox's uploads stayed low there.
+
+**Why ETC2 stays advertised.** `MOCKTAIL_ADVERTISE_ETC2=0` tells Roblox
+that the card has no ETC2. Roblox then takes a much slower path of its own:
+
+| Same place and server | ETC2 (1.0.4-plus.1) | `MOCKTAIL_ADVERTISE_ETC2=0` |
 |---|---|---|
 | Main menu | 113–123 fps | 53–56 fps |
 | In game | 158–164 fps | about 62 fps |
 | CPU use | about 2.3 cores | about 3.7 cores |
 | Video memory of the game | about 1165 MiB | about 660–700 MiB |
 
-The test ran Roblox 2.738.1397 in Greenville RP on an RTX 3060 Laptop GPU
-with driver 615.71.09 on Hyprland, on the same server for each pair of runs.
-The textures looked the same. With DXT/BC the extra work is on Roblox's own
-render thread inside `libroblox` (profiled), and it does not depend on
-Mocktail's performance preset: with the preset off it was 123 fps with ETC2
-against 38 fps with DXT/BC. What ETC2 costs is the video memory above and
-decoding while a place loads; the longest decoding stall was about 0.5 s.
-The session log reports the decoding in a line like
-`[vulkan] ETC2 decode totals: images=... uploads=... compressed=... host=... decode=... longest=...`.
+That test ran Roblox 2.738.1397 in Greenville RP on the same RTX 3060 Laptop
+GPU, on the same server for each pair of runs; with Mocktail's performance
+preset off it was 123 fps with ETC2 against 38 fps without. While working on
+1.0.4-plus.2 we counted the game's Vulkan calls (`MOCKTAIL_VK_CALL_STATS=1`)
+in Anime Vanguards while the character stood still for 20 seconds. Without
+ETC2, Roblox created about 156,000 textures in that time (about 7,800 a
+second), all but one of them uncompressed RGBA8 rather than BC, made about
+928,000 image copies and created about 929,000 buffers, and the game ran at
+33 fps. With ETC2 it created 88 textures and made 8,966 image copies at 105
+fps. Roblox's render thread was 85–87 % busy with work spread over
+`libroblox` itself, and Mocktail's Vulkan code took about 1.4 % of the
+profile. Three suspects on Mocktail's side were ruled out:
+
+- The format answers: until 1.0.4-plus.2, Mocktail still reported the ETC2
+  formats as usable while `MOCKTAIL_ADVERTISE_ETC2=0` hid ETC2 support. Now
+  both say no, and it was still 33 fps.
+- The performance preset's texture-compression flags: leaving them out
+  (`MOCKTAIL_PRESET_TEXTURE_COMPRESSION=off`) gave 37 fps. Three of the
+  five were among the settings Roblox never read (see
+  [What Plus changes](#what-plus-changes)).
+- The texture budget: leaving it to Roblox (`MOCKTAIL_TEXTURE_BUDGET_MB=roblox`)
+  gave 40 fps.
+
+The slow path is inside Roblox, so Mocktail does not try to change it.
+Compressed textures (BC) gives the video memory savings of that path while
+Roblox keeps its fast ETC2 one.
+
+**Texture budget.** The performance preset caps Roblox's texture budget at
+128 MB (`FIntRenderTextureTotalBudgetMB`). A tight budget makes Roblox
+upload textures again when the camera turns: with 1.0.4-plus.1's processor
+path, leaving the budget to Roblox cut the stalls while turning from 7.3 s
+to 0.4 s in one pair of runs (and while moving from 7.1 s to 3.8 s).
+1.0.4-plus.2 keeps 128 MB, because the graphics card now absorbs those
+uploads without stalls and BC reduces them. `MOCKTAIL_TEXTURE_BUDGET_MB`
+sets another budget for your own tests; `fflags.json` cannot, because
+Roblox does not start when it sets a preset setting to another value.
+
+**Variables.** `engine.etc2_to_bc` is the only one of these in
+`config.yaml` and the settings window; the others are for tests and
+troubleshooting.
+
+| Variable | Values (default first) | What it does |
+|---|---|---|
+| `MOCKTAIL_ETC2_TO_BC` | `1`, `0` (also `true`/`false`, `on`/`off`) | Compressed textures (BC), the variable for `engine.etc2_to_bc`. |
+| `MOCKTAIL_ETC2_GPU` | `1`, `0` (also `true`/`false`, `on`/`off`) | `0` keeps the conversion on the processor, for comparisons or if the graphics card path misbehaves. |
+| `MOCKTAIL_ADVERTISE_ETC2` | `1`, `0` | `0` tells Roblox the card has no ETC2 (much slower, see above). |
+| `MOCKTAIL_DISABLE_ETC2_EMULATION` | unset, `1` | Turns the ETC2 support off completely, as in Mocktail 1.0.4: Roblox sees a card without ETC2. |
+| `MOCKTAIL_SMALL_TEXTURE_UPSCALE` | `4`, `1` to `8` | How many times colour textures of up to 64×64 pixels are enlarged in each direction with BC off; `1` turns it off. BC mode never enlarges. |
+| `MOCKTAIL_TEXTURE_BUDGET_MB` | unset (128), `16` to `4095`, `roblox` | The texture budget while the performance preset is on; `roblox` leaves the budget to Roblox. Any other value stops the start with an error that names the variable. |
+| `MOCKTAIL_PRESET_TEXTURE_COMPRESSION` | `on`, `off` | `off` leaves the preset's texture-compression flags (`FFlagDebugTerrainVTCompressedTextures`, `FFlagVulkanCompressedTextureAliasing`) out. |
+| `MOCKTAIL_FRAME_STATS` | unset, `1` | Frame pacing and texture work in the session log; see [Measuring stutter](#measuring-stutter). |
+| `MOCKTAIL_VK_CALL_STATS` | unset, `1` | Counts the game's Vulkan calls; see [Measuring stutter](#measuring-stutter). |
+| `MOCKTAIL_ETC2_WORKERS` | half the CPU threads, at most 8; `1` to `64` | Worker threads of the processor path. |
+| `MOCKTAIL_ETC2_STAGING_MEMORY` | `cached`, `coherent` | Memory for the processor path's staging: cached system memory when the driver offers it, or uncached write-combined memory, the kind Roblox uploads from on the test card. |
+| `MOCKTAIL_ETC2_GPU_ARENA_MB` | automatic, a number of MiB | Video memory the graphics card path may hold for converted textures before it uses system memory. Automatic is 256 MiB, or 1/24 of the card's video memory if that is less. |
+| `MOCKTAIL_ETC2_TRACE` | unset, a file | Writes one CSV line per converted upload. |
+| `MOCKTAIL_ETC2_TRACE_BLOCKS` | unset, a directory | Saves up to 64 MiB of Roblox's compressed uploads per session, for quality tests. |
 
 ## Hybrid laptops
 
@@ -500,7 +674,88 @@ caused by `Color3` errors in the newer SDUI page. An explicit
   diagnostic info. Attach `latest.log` to a bug report.
 - Mocktail does not currently work with `hardened_malloc`, which may make it
   fail to start or crash. Run Mocktail without `hardened_malloc`.
+- Stutter: see [Measuring stutter](#measuring-stutter) below, and attach
+  the summary to the report.
 - More answers are in the [FAQ](FAQ.md).
+
+### Measuring stutter
+
+Start a session with `MOCKTAIL_FRAME_STATS=1` on the default
+`direct-vulkan` graphics backend (with `graphics.backend: opengl` it logs
+none of these lines), for example
+`MOCKTAIL_FRAME_STATS=1 mocktail --play`. The session log then gets these
+lines:
+
+- Every 2 seconds, how evenly frames arrived. The average frame rate hides
+  the long frames you feel as stutter: `max` is the longest frame, and
+  `over33`, `over50` and `over100` count the frames longer than 33, 50 and
+  100 ms.
+
+  ```
+  [perf] frame_stats frames=196 fps=97.7 median=6.1ms p99=122.3ms max=329.1ms over33=6 over50=5 over100=2
+  ```
+
+- Each time the processor path of the [ETC2 conversion](#etc2-textures)
+  holds the render thread for 20 ms or more, with its phases (preparing,
+  reading Roblox's upload memory, converting, writing the result), its
+  threads and the memory types it read from:
+
+  ```
+  [vulkan] ETC2 decode stall 68 ms: 4051 uploads, 50.6 MiB compressed, 367.2 MiB written (prepare 0, copy 11, decode 53, write 3 ms) [threads 8, src t3 50.6 MiB]
+  ```
+
+- Each graphics card batch whose recording took 1 ms or more, or whose
+  work on the graphics card took 4 ms or more. It does not hold the render
+  thread for the `gpu` time:
+
+  ```
+  [vulkan] ETC2 GPU submit: 2232 uploads, 48.2 MiB compressed, 289.5 MiB written, record 3.72 ms, gpu 7.66 ms (copy-in 3.85, decode 3.82; lag 1)
+  ```
+
+- Every 2 seconds with ETC2 texture activity, a `[perf] etc2_window` line
+  with that window's counters: processor and graphics card time
+  (`cpu_ms`, `gpu_ms`), uploads by path (`gpu=`, `fallback=` for the
+  processor), staging allocations, texture images created and destroyed,
+  and more.
+- The session totals, which Mocktail logs even without
+  `MOCKTAIL_FRAME_STATS` when the game closes its Vulkan device, and now
+  and then while the processor path converts. With the graphics card path,
+  or with `MOCKTAIL_FRAME_STATS`, details follow after the `|`, among them
+  why uploads took the processor path (`cpu_route`):
+
+  ```
+  [vulkan] ETC2 decode totals: images=6187 (upscaled 0) uploads=18 in 1 submits compressed=0.0 MiB host=0.0 MiB (1.0x) decode=0 ms longest=0 ms | gpu uploads=24022 submits=969 compressed=655.3 MiB ... | cpu_route gpu_disabled=0 gpu_not_ready=18 ...
+  ```
+
+`scripts/frame_stats_summary.py` from the source repository adds these
+lines up: frame rates, the longest frames, the stalls and their phases, the
+graphics card batches, the windows' counters and the totals. It prints only
+numbers and Mocktail's own lines, never other log text, so its output can
+go into a bug report. To compare parts of a session, such as standing still
+and running, note the log's line count
+(`wc -l ~/.local/state/mocktail/logs/latest.log`) when each part starts and
+ends, and name the parts:
+
+```bash
+python3 scripts/frame_stats_summary.py ~/.local/state/mocktail/logs/latest.log \
+  --phase idle=410:530 --phase move=530:1700
+```
+
+To see what the conversion paths do on your computer, play the same place
+with `MOCKTAIL_ETC2_GPU=0` (processor only) or `MOCKTAIL_ETC2_TO_BC=0`
+(unpacked textures) and compare the summaries.
+
+`MOCKTAIL_VK_CALL_STATS=1` adds a `[perf] vk_calls` line every 2 seconds:
+the game's Vulkan calls per frame (draws, pipeline and descriptor binds,
+copies), the window's totals (image copies and blits, buffers and images
+created, the images by format: ETC2, BC, RGBA8 and others) and the time the
+game spent waiting on fences, semaphores, image acquisition, presentation,
+submission and idle waits. Without the variable Mocktail does not wrap
+these calls at all.
+
+```
+[perf] vk_calls frames=193 span_ms=2006 per_frame: submit=1.0 draw=12.9 drawIdx=10.8 ... | window: copyImg=210 blit=168 ... createImg=381 (etc2 3 bc1-3 14 bc4-6 0 bc7 0 astc 0 rgba8 291 other 73) ... | blocked fence=... sem=... acquire=... present=... submit=... idle=... ms
+```
 
 ## Building from source
 

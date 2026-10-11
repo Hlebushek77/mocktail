@@ -16,11 +16,11 @@ namespace runtime {
 namespace {
 
 // config/mocktail.example.yaml is a copy of this text (a test compares
-// them). engine.etc2_to_bc's loading sentence is provisional until BC
-// mode's loading time is measured in a real game: converting on the
-// graphics card may cost nothing, since BC uploads are 4 to 8 times
-// smaller, while converting on the processor costs several times the work
-// of unpacking. Keep it in step with the Graphics page's hint for the key.
+// them). engine.etc2_to_bc's loading sentence follows the live test on an
+// RTX 3060 in README's ETC2 textures section: converting on the graphics
+// card gave no stall at all, converting on the processor stalls of up to
+// 196 ms while a place loaded. Keep it in step with the Graphics page's
+// hint for the key.
 constexpr std::string_view kDefaultRuntimeConfig =
     R"yaml(# Mocktail configuration.
 # The file is created once with mode 0600. Mocktail never replaces your edits.
@@ -164,11 +164,11 @@ account:
   sign_in: native
 
 engine:
-  # String (default: default): Roblox graphics quality while Mocktail's
-  # rendering preset is active (physics_worker_mode throughput, or auto with
-  # multithreaded_rendering). default forces level 3 (level 1 with direct
-  # Vulkan on Intel integrated graphics), manual leaves Roblox's in-game
-  # graphics slider in control, and an integer from 1 to 21 forces that level.
+  # String (default: default): Roblox's graphics quality level. default
+  # leaves it to Roblox's own Graphics Quality setting (manual means the
+  # same), and an integer from 1 to 21 is sent to Roblox as that level
+  # (DFIntDebugFRMQualityLevelOverride), whatever the performance settings,
+  # in place of Roblox's in-game slider.
   graphics_quality: default
   # String (default: auto): graphics card for direct Vulkan when the computer
   # has more than one: auto, discrete, or integrated. auto prefers the
@@ -180,13 +180,14 @@ engine:
   # false makes Roblox load it on one thread there, as Mocktail did before
   # this setting existed; use it only if shader loading fails on NVIDIA.
   nvidia_shader_mt: true
-  # Boolean (default: false): on graphics cards that cannot read ETC2
-  # textures (NVIDIA, some others), convert Roblox's ETC2 textures to BC
-  # instead of unpacking them, so they take 4 to 8 times less video memory.
-  # Fine detail can lose some quality, and loading can take longer when the
-  # conversion runs on the processor instead of the graphics card. Only the
-  # Vulkan backend reads it.
-  etc2_to_bc: false
+  # Boolean (default: true): on graphics cards that cannot read ETC2
+  # textures (NVIDIA, some others), convert Roblox's ETC2 textures to BC and
+  # keep them compressed instead of unpacking them, so they take 4 to 8
+  # times less video memory. Fine detail can lose some quality, and loading
+  # can stutter briefly when the conversion runs on the processor instead
+  # of the graphics card. false unpacks them to full size. A card that reads
+  # ETC2 itself is not affected. Only the Vulkan backend reads it.
+  etc2_to_bc: true
 
 launcher:
   # Boolean (default: true): show the Mocktail settings window before Roblox

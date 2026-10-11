@@ -6,7 +6,6 @@
 #include <cstdint>
 #include <memory>
 #include <string>
-#include <vector>
 
 namespace mocktail::graphics {
 
@@ -82,6 +81,7 @@ struct Etc2DecodeTotals {
   std::uint64_t images_destroyed = 0;
   std::uint64_t bc_images = 0;           // ETC2->BC mode: BC host images
   std::uint64_t bc_fallback_images = 0;  // ... kept RGBA8/R16 (CR-14)
+  std::uint64_t bc_mixed_copies = 0;     // copies between the two, skipped
   std::uint64_t image_copy_buckets[kEtc2ImageCopyBuckets] = {};
   std::uint64_t family_uploads[kEtc2CountedQueueFamilies] = {};
   std::uint64_t family_bytes[kEtc2CountedQueueFamilies] = {};  // compressed
@@ -147,11 +147,11 @@ std::string FormatEtc2Window(const Etc2DecodeTotals& window);
 // its totals a few times.
 bool Etc2DecodeTotalsMilestone(std::uint64_t before, std::uint64_t after);
 
-// " [threads 8, path fast, src t3 48.7 t4 0.3 MiB]": what the CPU route's
-// stall line appends after its phase breakdown (DESIGN C7). Memory types
-// without bytes are left out; "src - MiB" when none was known.
+// " [threads 8, src t3 48.7 t4 0.3 MiB]": what the CPU route's stall line
+// appends after its phase breakdown (DESIGN C7). Memory types without bytes
+// are left out; "src - MiB" when none was known.
 std::string FormatEtc2StallSuffix(
-    unsigned threads, bool fast_path,
+    unsigned threads,
     const std::uint64_t (&source_bytes_by_type)[kEtc2CountedMemoryTypes],
     std::uint64_t unknown_type_bytes);
 
@@ -186,15 +186,6 @@ class Etc2Scratch {
   std::size_t capacity_ = 0;
   std::chrono::steady_clock::time_point last_used_{};
 };
-
-// MOCKTAIL_ETC2_FAST_PATH=0 only (plus.1's policy, kept for the same-build
-// A/B until the legacy path goes): scratch vectors larger than this are
-// given back after every submit.
-inline constexpr std::size_t kEtc2LegacyScratchKeepBytes =
-    32U * 1024U * 1024U;
-
-// Frees `scratch` when it holds more than kEtc2LegacyScratchKeepBytes.
-void ReleaseOversizedEtc2Scratch(std::vector<std::uint8_t>* scratch);
 
 }  // namespace mocktail::graphics
 

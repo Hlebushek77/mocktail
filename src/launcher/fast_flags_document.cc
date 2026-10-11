@@ -120,7 +120,8 @@ std::string ManagedValueText(const nlohmann::json& value) {
 
 const std::set<std::string>& AllManagedFlagNames() {
   static const std::set<std::string> names = []() {
-    std::set<std::string> collected = {"FIntDebugFRMQualityLevelOverride"};
+    std::set<std::string> collected = {
+        std::string(runtime::kGraphicsQualityClientSetting)};
     runtime::FrameRatePolicy fixed;
     fixed.mode = runtime::FrameRateLimitMode::kFixed;
     fixed.fixed_fps = 60;

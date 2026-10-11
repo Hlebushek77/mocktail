@@ -3,6 +3,7 @@
 
 #include <vulkan/vulkan.h>
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -91,9 +92,8 @@ enum class Etc2StagingMemory { kCached, kCoherent };
 // construct the emulation with explicit options instead.
 struct Etc2EmulationOptions {
   std::uint32_t upscale = kDefaultSmallTextureUpscale;  // MOCKTAIL_SMALL_TEXTURE_UPSCALE (1..8)
-  bool fast_path = true;          // MOCKTAIL_ETC2_FAST_PATH (development only)
   bool gpu = true;                // MOCKTAIL_ETC2_GPU
-  bool to_bc = false;             // MOCKTAIL_ETC2_TO_BC
+  bool to_bc = true;              // MOCKTAIL_ETC2_TO_BC
   unsigned workers = 0;           // MOCKTAIL_ETC2_WORKERS, 0: min(8, cores / 2)
   std::uint64_t gpu_arena_bytes = 0;  // MOCKTAIL_ETC2_GPU_ARENA_MB, 0: automatic
   Etc2StagingMemory staging_memory = Etc2StagingMemory::kCached;  // MOCKTAIL_ETC2_STAGING_MEMORY
@@ -109,12 +109,22 @@ struct Etc2EmulationOptions {
       const std::function<const char*(const char*)>& lookup);
 };
 
+// Test switches; production never sets them.
+struct Etc2EmulationTestHooks {
+  // Emulated devices get no host staging arena, so every CPU-route copy and
+  // every rescue takes a one-off staging buffer: the fallback for an arena
+  // that cannot grow.
+  std::atomic<bool> no_host_staging{false};
+};
+Etc2EmulationTestHooks& Etc2EmulationTesting();
+
 // A batch that only Mocktail's work is in, submitted by the caller through
 // the host vkQueueSubmit right before Roblox's batches (the GPU route's
 // selftest, or its decode pass for a protected or device-group batch).
 struct Etc2PreSubmit {
   VkSubmitInfo info{};
   VkFence fence = VK_NULL_HANDLE;  // the selftest's only
+  std::uint64_t uploads = 0;       // a decode pass's GPU-route uploads
 };
 
 // What a vkQueueSubmit hook submits after PrepareSubmit(2). Until the GPU
@@ -136,6 +146,23 @@ struct Etc2SubmitPlan {
   // Signalled by a fence-only submit after Roblox's, when Roblox passed one.
   VkFence trailing_fence = VK_NULL_HANDLE;
   void* gpu_slot = nullptr;  // the GPU route's own bookkeeping
+  // The pre-submits whose host vkQueueSubmit failed (NotePreSubmitResult):
+  // their uploads, and the first failure's result.
+  std::uint64_t failed_pre_submit_uploads = 0;
+  VkResult pre_submit_result = VK_SUCCESS;
+
+  // The caller's result for one of pre_submits(). A decode pass that did
+  // not reach the queue leaves its uploads' arena ranges unfilled and its
+  // timestamps unwritten; FinishSubmit counts the uploads as dropped.
+  void NotePreSubmitResult(const Etc2PreSubmit& pre, VkResult result) {
+    if (result == VK_SUCCESS) {
+      return;
+    }
+    failed_pre_submit_uploads += pre.uploads;
+    if (pre_submit_result == VK_SUCCESS) {
+      pre_submit_result = result;
+    }
+  }
 
   std::uint32_t count(std::uint32_t original) const {
     if (!modified) {
@@ -273,8 +300,9 @@ class VulkanEtc2Emulation final {
   // Inside Roblox's vkQueueSubmit(2): decodes the CPU route's uploads of the
   // batches (resubmission rereads the source bytes) and fills `plan` with
   // what the caller submits instead. The caller first submits
-  // plan->pre_submits() with the host vkQueueSubmit, then
-  // plan->count/submits/fence, then calls FinishSubmit with the result;
+  // plan->pre_submits() with the host vkQueueSubmit, passing each result to
+  // plan->NotePreSubmitResult, then plan->count/submits/fence, then calls
+  // FinishSubmit with the result;
   // `submit_fence_only` submits (queue, 0, nullptr, fence) the same way.
   void PrepareSubmit(VkQueue queue, std::uint32_t count,
                      const VkSubmitInfo* submits, VkFence fence,

@@ -128,7 +128,7 @@ struct Slot {
   GpuBuffer jobs;
   VkDescriptorSet set0 = VK_NULL_HANDLE;
   Phase phase = Phase::kFree;
-  bool rescue = false;  // the queue's reserved rescue slot (CR-7)
+  bool rescue = false;  // a rescue-only slot of the queue (CR-7)
   std::uint64_t epoch = 0;
   Clock::time_point input_needed{};
   struct QueueState* queue = nullptr;
@@ -146,7 +146,9 @@ struct QueueState {
   VkQueue queue = VK_NULL_HANDLE;
   std::uint32_t family = 0;
   std::vector<std::unique_ptr<Slot>> slots;
-  std::unique_ptr<Slot> rescue;
+  // Rescue-only slots (CR-7), never taken by a normal submit: the reserved
+  // one, and more while it is pending (AcquireRescueSlot).
+  std::vector<std::unique_ptr<Slot>> rescues;
 };
 
 struct Selftest {
@@ -929,7 +931,11 @@ struct Etc2GpuDevice::Impl {
   }
 
   // Reads the slot's timestamps once its fence signalled, and reports the
-  // submit they belong to.
+  // submit they belong to. Without VK_QUERY_RESULT_WAIT_BIT: every pass
+  // that reached the queue has finished by now, and a query that never got
+  // there would never become available (the spec lets such a wait hang or
+  // lose the device, here inside Roblox's vkQueueSubmit). VK_NOT_READY
+  // means no timing for this submit.
   void ReportSlot(Slot& slot) {
     std::uint64_t copy_ns = 0;
     std::uint64_t decode_ns = 0;
@@ -945,9 +951,7 @@ struct Etc2GpuDevice::Impl {
       if (fns().get_query_pool_results(
               info.device, slot.queries, 0, queries,
               raw.size() * sizeof(std::uint64_t), raw.data(),
-              sizeof(std::uint64_t),
-              VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) ==
-          VK_SUCCESS) {
+              sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
         const std::uint64_t mask =
             valid_bits >= 64 ? ~0ULL : (1ULL << valid_bits) - 1;
         const double period = info.properties.limits.timestampPeriod;
@@ -1090,39 +1094,59 @@ struct Etc2GpuDevice::Impl {
     return Recycle(*oldest) ? oldest : nullptr;
   }
 
-  // [CR-7] The queue's reserved slot for a rescue when no normal slot came
-  // free. Waits for it without a cap only when its fence was submitted.
+  // [CR-7] A slot for a rescue when no normal slot came free: the queue's
+  // reserved rescue slot (recycled once its fence signalled), or, while it
+  // is still pending, another rescue-only slot (a pool and a fence, no
+  // buffers), up to kMaxSlots. Only with all of those pending does it
+  // wait, as AcquireSlot does, at most 50 ms for the oldest. It never waits
+  // without a bound: this runs inside Roblox's vkQueueSubmit, and the work
+  // ahead of the fence may wait for something this very thread submits
+  // later. Null: the batch's uploads are dropped.
   Slot* AcquireRescueSlot(QueueState& queue) {
     if (Etc2GpuTesting().fail_rescue_slot.load()) {
       return nullptr;
     }
-    if (queue.rescue == nullptr) {
-      auto slot = std::make_unique<Slot>();
-      if (!CreateSlot(queue.family, true, slot.get())) {
-        return nullptr;
+    Slot* oldest = nullptr;
+    for (const std::unique_ptr<Slot>& slot : queue.rescues) {
+      // Never reset a fence that may still be pending.
+      if (slot->phase == Slot::Phase::kInFlight &&
+          Signalled(fns().get_fence_status(info.device, slot->fence))) {
+        Recycle(*slot);
       }
-      slot->queue = &queue;
-      queue.rescue = std::move(slot);
-      return queue.rescue.get();
+      if (slot->phase == Slot::Phase::kNotSubmitted) {
+        Recycle(*slot);
+      }
+      if (slot->phase == Slot::Phase::kFree) {
+        return slot.get();
+      }
+      if (slot->phase == Slot::Phase::kInFlight &&
+          (oldest == nullptr || slot->epoch < oldest->epoch)) {
+        oldest = slot.get();
+      }
     }
-    Slot& slot = *queue.rescue;
-    switch (slot.phase) {
-      case Slot::Phase::kFree:
-        return &slot;
-      case Slot::Phase::kNotSubmitted:
-        return Recycle(slot) ? &slot : nullptr;
-      case Slot::Phase::kInFlight:
-        // Never reset a fence that may still be pending.
-        if (!Signalled(fns().wait_for_fences(info.device, 1, &slot.fence,
-                                             VK_TRUE, UINT64_MAX))) {
-          return nullptr;
-        }
-        return Recycle(slot) ? &slot : nullptr;
-      case Slot::Phase::kRecording:
-      case Slot::Phase::kLost:
-        break;
+    if (queue.rescues.size() < kMaxSlots) {
+      auto slot = std::make_unique<Slot>();
+      if (CreateSlot(queue.family, true, slot.get())) {
+        slot->queue = &queue;
+        queue.rescues.push_back(std::move(slot));
+        return queue.rescues.back().get();
+      }
     }
-    return nullptr;
+    if (oldest == nullptr) {
+      return nullptr;
+    }
+    const VkResult status = fns().wait_for_fences(
+        info.device, 1, &oldest->fence, VK_TRUE, kSlotWaitNs);
+    const bool signalled = Signalled(status);
+    CountStats([signalled](Stats& counts) {
+      ++counts.slot_waits;
+      counts.slot_timeouts += signalled ? 0 : 1;
+    });
+    Count([](Etc2DecodeTotals& totals) { ++totals.gpu_slot_waits; });
+    if (!signalled) {
+      return nullptr;
+    }
+    return Recycle(*oldest) ? oldest : nullptr;
   }
 
   VkCommandBuffer NextCommandBuffer(Slot& slot) {
@@ -1342,13 +1366,17 @@ struct Etc2GpuDevice::Impl {
       fns().write_timestamp(command_buffer,
                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, slot.queries,
                             query + 2);
-      ++slot.timed_passes;
     }
     Barrier(command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
             VK_ACCESS_TRANSFER_READ_BIT);
     if (fns().end_command_buffer(command_buffer) != VK_SUCCESS) {
       return false;
+    }
+    // Only now: an abandoned command buffer's queries are never reset nor
+    // written, and ReportSlot reads every counted pass.
+    if (timed) {
+      ++slot.timed_passes;
     }
     *input_cursor += pass.input_bytes;
     *job_cursor += static_cast<std::uint32_t>(pass.jobs.size());
@@ -1400,7 +1428,9 @@ struct Etc2GpuDevice::Impl {
     const Clock::time_point start = Clock::now();
     QueueState* queue_state = Queue(queue, family);
     std::lock_guard<std::mutex> lock(queue_state->mutex);
-    // [CR-29] Trimming and shrinking run here, on the submitting thread.
+    // [CR-29] Slot inputs shrink only on the submitting thread
+    // (PrepareSlotBuffers). Trimming the arenas touches no QueueState, so
+    // the emulation's housekeeping does it too (Trim).
     TrimArenas(start);
     Slot* slot = AcquireSlot(*queue_state);
     // After AcquireSlot: its fence polls may have found the device lost.
@@ -1476,7 +1506,8 @@ struct Etc2GpuDevice::Impl {
           dropped += batch.uploads.size();
         }
         if (recorded) {
-          decodes.push_back({batch.batch, command_buffer});
+          decodes.push_back({batch.batch, command_buffer,
+                             batch.uploads.size()});
         }
       }
     } else {
@@ -1869,11 +1900,11 @@ struct Etc2GpuDevice::Impl {
         }
         DestroySlot(slot.get());
       }
-      if (queue_state->rescue != nullptr) {
-        if (queue_state->rescue->phase == Slot::Phase::kInFlight) {
-          WaitSubmitted(queue_state->rescue->fence, "a rescue pass");
+      for (std::unique_ptr<Slot>& slot : queue_state->rescues) {
+        if (slot->phase == Slot::Phase::kInFlight) {
+          WaitSubmitted(slot->fence, "a rescue pass");
         }
-        DestroySlot(queue_state->rescue.get());
+        DestroySlot(slot.get());
       }
     }
     {
@@ -2061,6 +2092,21 @@ void Etc2GpuDevice::FinishSubmit(
   Slot& slot = *static_cast<Slot*>(plan->gpu_slot);
   plan->gpu_slot = nullptr;
   std::lock_guard<std::mutex> lock(slot.queue->mutex);
+  if (plan->failed_pre_submit_uploads != 0) {
+    // A pass that had to go first on its own never reached the queue: the
+    // rewritten copies of its batch read whatever its arena ranges held,
+    // and its timestamps stay unwritten.
+    impl_->LogOnce("a decode pass submitted on its own failed; its uploads "
+                   "read stale texels",
+                   plan->pre_submit_result);
+    slot.timed_passes = 0;
+    const std::uint64_t dropped = plan->failed_pre_submit_uploads;
+    impl_->CountStats(
+        [dropped](Stats& counts) { counts.dropped_uploads += dropped; });
+    impl_->Count([dropped](Etc2DecodeTotals& totals) {
+      totals.dropped_uploads += dropped;
+    });
+  }
   VkResult fence_result = VK_SUCCESS;
   if (host_result == VK_SUCCESS) {
     if (plan->trailing_fence != VK_NULL_HANDLE) {
@@ -2092,6 +2138,10 @@ void Etc2GpuDevice::FinishSubmit(
   std::lock_guard<std::mutex> epoch_lock(impl_->epoch_mutex);
   slot.epoch = ++impl_->epoch;
   impl_->in_flight[slot.epoch] = slot.fence;
+}
+
+void Etc2GpuDevice::Trim(std::chrono::steady_clock::time_point now) {
+  impl_->TrimArenas(now);
 }
 
 void Etc2GpuDevice::Destroy() {

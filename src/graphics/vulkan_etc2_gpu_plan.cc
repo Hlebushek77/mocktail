@@ -332,11 +332,13 @@ void SetFences(VkFence app_fence, VkFence slot_fence, Etc2SubmitPlan* plan) {
 }
 
 // A pre-submit of the pass alone; `slot` points into plan->command_buffers.
-void AddPreSubmit(const VkCommandBuffer* slot, Etc2SubmitPlan* plan) {
+void AddPreSubmit(const VkCommandBuffer* slot, std::uint64_t uploads,
+                  Etc2SubmitPlan* plan) {
   Etc2PreSubmit pre;
   pre.info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
   pre.info.commandBufferCount = 1;
   pre.info.pCommandBuffers = slot;
+  pre.uploads = uploads;
   plan->pre_submit_batches.push_back(pre);
 }
 
@@ -373,7 +375,7 @@ std::uint32_t RewriteSubmits(std::uint32_t count, const VkSubmitInfo* submits,
     const std::size_t at = plan->command_buffers.size();
     plan->command_buffers.push_back(decode.command_buffer);
     if (Etc2BatchNeedsPreSubmit(batch)) {
-      AddPreSubmit(&plan->command_buffers[at], plan);
+      AddPreSubmit(&plan->command_buffers[at], decode.uploads, plan);
       ++pre_submits;
       continue;
     }
@@ -428,7 +430,7 @@ std::uint32_t RewriteSubmits2(std::uint32_t count,
     const VkSubmitInfo2& batch = submits[decode.batch];
     if (Etc2BatchNeedsPreSubmit2(batch)) {
       plan->command_buffers.push_back(decode.command_buffer);
-      AddPreSubmit(&plan->command_buffers.back(), plan);
+      AddPreSubmit(&plan->command_buffers.back(), decode.uploads, plan);
       ++pre_submits;
       continue;
     }

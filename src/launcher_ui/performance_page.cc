@@ -246,8 +246,8 @@ GtkWidget* BuildMultithreadedRow(LauncherContext* context) {
       "\n\n" +
       // performance_policy.cc: auto + multithreaded merges the preset.
       _("With Automatic physics workers, turning it on also turns on "
-        "Mocktail's performance preset: less texture memory, no MSAA, "
-        "simpler shadows and the graphics quality level from Graphics.") +
+        "Mocktail's performance preset, which among other things sets a "
+        "128 MB texture budget and turns MSAA off.") +
       "\n\n" +
       _("More worker threads help busy places reach a higher frame rate; "
         "on a computer doing other heavy work at the same time, they compete "
@@ -281,13 +281,13 @@ GtkWidget* BuildPhysicsRow(LauncherContext* context) {
         "Roblox starts.") +
       std::string("\n\n") +
       // performance_policy.cc: throughput scheduler settings and
-      // rendering_settings (MSAA 1, texture budgets, shadow mips, 32 sound
-      // channels, FRM level).
+      // rendering_settings (FIntDebugForceMSAASamples=1,
+      // FIntRenderTextureTotalBudgetMB=128, and settings for worker
+      // threads, caches, terrain, meshes and avatars).
       _("• Throughput (default): Roblox's worker pools may use every "
-        "physical core, and Mocktail's performance preset is on: less texture "
-        "memory, anti-aliasing (MSAA) off, simpler shadows and level of "
-        "detail, at most 32 sounds at once, and the graphics quality level "
-        "from Graphics.") +
+        "physical core, and Mocktail's performance preset is on; among "
+        "other things it sets a 128 MB texture budget and turns "
+        "anti-aliasing (MSAA) off.") +
       "\n\n" +
       // performance_policy.cc: latency only sets
       // DFIntSimMidPhaseContactPipelineBatchSize.
@@ -295,7 +295,7 @@ GtkWidget* BuildPhysicsRow(LauncherContext* context) {
       // runs for every mode.
       _("• Low latency: Roblox keeps its own pool sizes; Mocktail only "
         "batches physics contact work. The preset stays off, so Roblox's own "
-        "graphics quality and texture limits apply (Mocktail still sizes "
+        "anti-aliasing and texture limits apply (Mocktail still sizes "
         "Roblox's video memory from this computer's RAM).") +
       "\n\n" +
       _("• Automatic: no tuning at all, unless Multithreaded rendering is "

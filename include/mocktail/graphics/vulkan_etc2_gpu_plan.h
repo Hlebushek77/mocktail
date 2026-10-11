@@ -103,11 +103,13 @@ std::uint32_t Etc2DecodeGroups(std::uint64_t blocks);
 void Etc2SplitDispatch(std::uint32_t groups, std::uint32_t* x,
                        std::uint32_t* y);
 
-// A batch that gets a decode pass in front of it: its index in pSubmits and
-// the pass's command buffer.
+// A batch that gets a decode pass in front of it: its index in pSubmits,
+// the pass's command buffer and the uploads it serves (which a pre-submit
+// of the pass carries).
 struct Etc2BatchDecode {
   std::uint32_t batch = 0;
   VkCommandBuffer command_buffer = VK_NULL_HANDLE;
+  std::uint64_t uploads = 0;
 };
 
 // True for a batch the pass cannot join: a protected batch (its command

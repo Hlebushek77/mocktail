@@ -148,13 +148,16 @@ bool PlanRegions(const Etc2ImageShape& record, VkDevice device,
       // ceil(width / 4) blocks, with the app's extent.
       upload.bc = true;
       upload.target_bytes = upload.compressed;
-      // An extent rounded up to whole blocks past a small mip's edge (8x8
-      // for 6x6), which the x4 upscale clipped, may not reach a
-      // block-compressed host (VUID-vkCmdCopyBufferToImage-
-      // imageSubresource-07971): the host copies the part inside the mip,
-      // from staging rows and layers of the extent given (the same blocks).
-      // A region that starts outside the mip is refused, as for an
-      // upscaled image.
+    }
+    if (scale == 1) {
+      // Roblox rounds a small mip's extent up to whole blocks (8x8 for
+      // 6x6), which the x4 upscale clips; past the mip's edge it may not
+      // reach the host image, BC or RGBA8/R16
+      // (VUID-vkCmdCopyBufferToImage-imageSubresource-07971). The host
+      // copies the part inside the mip, from staging rows and layers of the
+      // extent given: whole blocks for BC, the decoded texels otherwise, as
+      // the GPU route's copy does. A region that starts outside the mip is
+      // refused, as for an upscaled image.
       const std::uint32_t mip =
           std::min<std::uint32_t>(region.imageSubresource.mipLevel, 31);
       const std::uint32_t mip_width =
@@ -173,8 +176,10 @@ bool PlanRegions(const Etc2ImageShape& record, VkDevice device,
       if (upload.width > room_x || upload.height > room_y) {
         copy.imageExtent.width = std::min(upload.width, room_x);
         copy.imageExtent.height = std::min(upload.height, room_y);
-        copy.bufferRowLength = (upload.width + 3) & ~3U;
-        copy.bufferImageHeight = (upload.height + 3) & ~3U;
+        copy.bufferRowLength =
+            record.bc ? (upload.width + 3) & ~3U : upload.width;
+        copy.bufferImageHeight =
+            record.bc ? (upload.height + 3) & ~3U : upload.height;
       }
     }
     if (scale > 1) {

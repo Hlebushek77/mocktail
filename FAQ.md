@@ -11,6 +11,8 @@ Answers for Mocktail Plus. Paths are those of the Plus package; a custom
 - [How do I buy Robux?](#how-do-i-buy-robux)
 - [Chat text is invisible while I type](#chat-text-is-invisible-while-i-type)
 - [Why does the game use XWayland, or native Wayland, on my NVIDIA card?](#why-does-the-game-use-xwayland-or-native-wayland-on-my-nvidia-card)
+- [The game stutters when I move or turn the camera](#the-game-stutters-when-i-move-or-turn-the-camera)
+- [What does Compressed textures (BC) do, and when should I turn it off?](#what-does-compressed-textures-bc-do-and-when-should-i-turn-it-off)
 - [Why is ETC2 kept, and what does MOCKTAIL_ADVERTISE_ETC2=0 do?](#why-is-etc2-kept-and-what-does-mocktail_advertise_etc20-do)
 - [Which of my settings override Roblox's own in-game settings?](#which-of-my-settings-override-robloxs-own-in-game-settings)
 - [Can I run multiple Roblox instances?](#can-i-run-multiple-roblox-instances)
@@ -114,15 +116,60 @@ server** row, or for a `[window] NVIDIA` line in `latest.log`. To choose
 yourself, set **Display server** to Wayland or X11 (`display.server: wayland`
 or `x11`).
 
+## The game stutters when I move or turn the camera
+
+On NVIDIA cards, Mocktail's texture conversion caused most of it until
+1.0.4-plus.2. Roblox streams textures in the ETC2 format while you move,
+NVIDIA cards cannot read ETC2, and Mocktail converted each upload on the
+processor, on the game's render thread. In a test in Anime Vanguards on an
+RTX 3060 Laptop GPU that added up to 2.3–4.0 s of stalls in 40 s of
+walking, with single frames of up to 0.4 s.
+
+Since 1.0.4-plus.2 the graphics card converts the textures, and in the same
+test no conversion stalled the game any more; the longest frame while
+walking was 44–101 ms. The processor path that remains as the fallback is
+much faster too: in a four-minute session it spent 3.2 s converting
+instead of 23.4 s, and in the same 40 s of walking its stalls added up to
+0.15–0.21 s instead of 2.3–4.0 s. The README's
+[ETC2 textures](README.md#etc2-textures) section has the numbers.
+
+The session log shows which path converts:
+`[vulkan] ETC2 GPU decode ready ...` means the graphics card does. If you
+still see stutter, measure it as described under
+[Measuring stutter](README.md#measuring-stutter) and attach the summary
+and `latest.log` to a bug report. The summary also counts long frames that
+no conversion stall explains (`unexplained long frames`); those have other
+causes, such as a busy server.
+
+## What does Compressed textures (BC) do, and when should I turn it off?
+
+It is the Graphics page's **Compressed textures (BC)** row
+(`engine.etc2_to_bc`, `MOCKTAIL_ETC2_TO_BC`), on by default since
+1.0.4-plus.2. On a card that cannot read ETC2 (NVIDIA), Mocktail converts
+Roblox's ETC2 textures to BC, a compressed format the card reads natively,
+instead of unpacking them to full size. In a test on an RTX 3060 Laptop GPU
+the game then used about 800 MiB of video memory on average instead of
+about 1900 MiB (at most about 1000 instead of 2400 MiB), with no stalls.
+On a card that reads ETC2 itself it changes nothing.
+
+The cost is some quality in fine detail: sharp edges in text and icons or
+smooth gradients can look blockier. Small textures (up to 64×64 pixels)
+also stay at their own size instead of being enlarged fourfold, so they
+look smoother but less crisp. If the graphics card cannot convert (the
+session log has no `[vulkan] ETC2 GPU decode ready` line), the processor
+does it, and loading can stutter briefly: up to about 0.2 s in the test.
+
+Turn it off if textures look wrong to you. Mocktail then unpacks them, as
+earlier versions did; the change applies the next time Roblox starts.
+
 ## Why is ETC2 kept, and what does MOCKTAIL_ADVERTISE_ETC2=0 do?
 
 NVIDIA's Vulkan driver has no ETC2 textures, so Mocktail tells Roblox ETC2
-is supported and decodes those textures on the CPU into uncompressed ones.
-`MOCKTAIL_ADVERTISE_ETC2=0` stops advertising ETC2; Roblox then uses DXT/BC
-textures, which NVIDIA supports natively. That saves video memory, but in a
-test it was much slower:
+is supported and converts those textures itself.
+`MOCKTAIL_ADVERTISE_ETC2=0` stops advertising ETC2. That uses less video
+memory, but Roblox then takes a much slower path of its own:
 
-| Same place and server | ETC2 (default) | `MOCKTAIL_ADVERTISE_ETC2=0` |
+| Same place and server | ETC2 (1.0.4-plus.1) | `MOCKTAIL_ADVERTISE_ETC2=0` |
 |---|---|---|
 | Main menu | 113–123 fps | 53–56 fps |
 | In game | 158–164 fps | about 62 fps |
@@ -130,11 +177,19 @@ test it was much slower:
 | Video memory of the game | about 1165 MiB | about 660–700 MiB |
 
 (Roblox 2.738.1397, Greenville RP, RTX 3060 Laptop GPU, driver 615.71.09,
-Hyprland.) The textures looked the same. The extra work with DXT/BC is on
-Roblox's own render thread inside `libroblox`, and it stays with Mocktail's
-performance preset off (123 fps with ETC2 against 38 fps with DXT/BC). So
-ETC2 stays advertised by default. Try `MOCKTAIL_ADVERTISE_ETC2=0` only if
-video memory is what limits you.
+Hyprland.) The textures looked the same. While working on 1.0.4-plus.2 we
+counted the game's Vulkan calls in another place while the character stood
+still: in 20 seconds without ETC2, Roblox created about 156,000 uncompressed
+RGBA8 textures, 928,000 image copies and 929,000 buffers and ran at 33 fps;
+with ETC2 it created 88 textures and ran at 105 fps. Nothing on Mocktail's
+side explained it: with consistent format answers it still ran at 33 fps,
+without the performance preset's texture-compression flags at 37 and with
+the texture budget left to Roblox at 40. The slow path is inside Roblox's
+own code, so ETC2 stays advertised. To save video memory, keep
+[Compressed textures (BC)](#what-does-compressed-textures-bc-do-and-when-should-i-turn-it-off)
+on instead: it gives the low video memory while Roblox keeps its fast ETC2
+path. The README's [ETC2 textures](README.md#etc2-textures) section has the
+details.
 
 ## Which of my settings override Roblox's own in-game settings?
 
@@ -144,13 +199,12 @@ what is overridden and how to give it back. The **Advanced** page lists all
 of them under **What Mocktail decides and what Roblox decides** (the
 Performance page links there). Depending on your settings these are:
 
-- Roblox's **Graphics Quality** slider, while Mocktail's performance preset
-  forces a level (`engine.graphics_quality`, see the
-  [README](README.md#configuration)).
-- Anti-aliasing, textures and level of detail: the performance preset
+- Roblox's **Graphics Quality** slider, when `engine.graphics_quality`
+  sets a level (see the [README](README.md#configuration)).
+- Anti-aliasing and texture memory: the performance preset
   (`performance.physics_worker_mode: throughput`, the default, or `auto`
-  with `multithreaded_rendering`) turns MSAA off, caps the texture budget at
-  128 MB and uses low-end level of detail.
+  with `multithreaded_rendering`) turns MSAA off and caps the texture budget
+  at 128 MB.
 - Roblox's **Maximum Frame Rate**, when `graphics.frame_rate_limit` sets a
   target.
 - Roblox's **Theme**, when `appearance.theme` is not `roblox`.
@@ -163,6 +217,18 @@ Performance page links there). Depending on your settings these are:
 The same group shows what is left to Roblox (volume, camera, chat and
 anything not overridden) and the client settings Mocktail sets at every
 start, such as Roblox's crash uploads being off.
+
+Until 1.0.4-plus.2 the window also listed a forced quality level 3, a
+texture mip bias, low-end level of detail and fewer sound channels. The
+performance preset did send settings for those, but, judging by Roblox
+2.738's code, Roblox never read them: it looks a client setting up only
+under the prefix it registered it with (`F` or `DF`), and some of the names
+do not exist in it at all. The preset no longer sends these 33 settings,
+so the game behaves as before. It still sends the shadow-map setting
+behind plus.1's "simpler shadows" (`FIntTM2ShadowMapMaxMips`), whose effect
+in Roblox 2.738 is unknown. A quality level you choose in
+`engine.graphics_quality` is now sent under the name Roblox registers for
+it, so it should apply; that is not verified in a game yet.
 
 ## Can I run multiple Roblox instances?
 

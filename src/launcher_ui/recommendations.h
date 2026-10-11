@@ -41,8 +41,7 @@ BackendRecommendation RecommendGraphicsBackend(const MachineProfile& machine);
 // Mocktail's rendering preset (performance_policy.cc
 // MergePerformanceClientSettingsOverrides) is merged when physics workers
 // are "throughput" (the runtime default), or "auto" with multithreaded
-// rendering on; "latency" never merges it. The preset also forces Roblox's
-// graphics quality level (FIntDebugFRMQualityLevelOverride).
+// rendering on; "latency" never merges it.
 bool RenderingPresetActive(std::string_view physics_worker_mode,
                            std::string_view multithreaded_rendering);
 
@@ -50,42 +49,33 @@ bool RenderingPresetActive(std::string_view physics_worker_mode,
 std::optional<int> ParseQualityLevel(std::string_view value);
 
 enum class QualitySource {
-  // Nothing is forced: Roblox's own graphics setting decides.
+  // Nothing is forced: Roblox's own graphics setting decides ("default",
+  // "manual" and the variable's "auto" and "0").
   kRobloxSetting,
-  // "default" with the preset active: level 3, or 1 when direct Vulkan
-  // renders on Intel integrated graphics (graphics_launch_policy.cc).
-  kMocktailDefault,
-  // A level from config.yaml with the preset active.
+  // A level from config.yaml, forced through
+  // DFIntDebugFRMQualityLevelOverride whatever the preset does
+  // (performance_policy.cc).
   kConfiguredLevel,
 };
 
 struct QualityEffect {
   QualitySource source = QualitySource::kRobloxSetting;
   int level = 0;  // the forced level; 0 for kRobloxSetting
-  // A level is configured (or default) but the preset is off, so it does
-  // nothing.
-  bool ignored = false;
 };
 
-// `intel_integrated_vulkan`: direct Vulkan renders on Intel integrated
-// graphics (MachineProfile::RendersOnIntelIntegratedGraphics).
-QualityEffect ResolveGraphicsQuality(std::string_view graphics_quality,
-                                     bool preset_active,
-                                     bool intel_integrated_vulkan);
+QualityEffect ResolveGraphicsQuality(std::string_view graphics_quality);
 
 enum class QualityRecommendationReason {
-  // A discrete graphics card (GpuSummary::discrete): Roblox's own setting
-  // can go above level 3.
-  kCapableGraphics,
-  // Only integrated AMD or Intel graphics: Mocktail's low default.
-  kModestGraphics,
+  // A known graphics card: Roblox's own setting, which can be changed while
+  // playing, rather than a level fixed in advance.
+  kRobloxSetting,
   // Detection has not finished, or no known GPU was found: no
   // recommendation.
   kUnknown,
 };
 
 struct QualityRecommendation {
-  std::string value;  // "manual", "default", or empty for kUnknown
+  std::string value;  // "default", or empty for kUnknown
   QualityRecommendationReason reason = QualityRecommendationReason::kUnknown;
 };
 
@@ -121,7 +111,7 @@ std::optional<std::string> RecommendFrameRate(const MachineProfile& machine);
 // flag it sets), empty when there is none.
 std::string FrameRateFlagConflict(const launcher::FastFlagsDocument& flags,
                                   std::string_view frame_rate_limit);
-// The same for the quality level the preset forces.
+// The same for the quality level a configured level forces.
 std::string QualityFlagConflict(const launcher::FastFlagsDocument& flags,
                                 const QualityEffect& quality);
 

@@ -661,6 +661,125 @@ TEST_F(Etc2BcModeTest, UploadsFillBcAndFallbackImagesOfOneDevice) {
   }
 }
 
+// [CR-14] A mip move between a BC image and one BC cannot hold (storage)
+// would reach the host as a copy between BC1 blocks of 8 bytes and RGBA8
+// texels of 4 (VUID-vkCmdCopyImage-srcImage-01548): vkCmdCopyImage and
+// vkCmdCopyImage2 both leave it out, log it and count it. A copy between
+// two BC images of the device still moves the blocks.
+TEST_F(Etc2BcModeTest, CopiesBetweenBcAndFallbackImagesAreLeftOut) {
+  FakeVulkanDevice fake;
+  Etc2EmulationOptions options = Options(true);
+  options.frame_stats = true;
+  VulkanEtc2Emulation emulation(options);
+  ::testing::internal::CaptureStderr();
+  ASSERT_TRUE(Register(&emulation, &fake));
+  const VkDevice device = fake.device();
+  const VkQueue queue = fake.GetQueue(0, 0);
+  emulation.RegisterQueue(device, queue, 0, 0);
+  constexpr VkCommandPoolCreateFlags kPoolFlags =
+      VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+  const VkCommandPool pool = fake.CreateCommandPool(0, kPoolFlags);
+  emulation.RegisterCommandPool(device, pool, 0, kPoolFlags);
+  // One 32x32 ETC2 RGB8 texture: 64 blocks, 512 bytes.
+  const std::vector<std::uint8_t> bytes = SeededBytes(0xC0B1, 512);
+  VkBuffer source = VK_NULL_HANDLE;
+  VkDeviceMemory memory = VK_NULL_HANDLE;
+  ASSERT_EQ(fake.CreateBuffer(512, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &source),
+            VK_SUCCESS);
+  ASSERT_EQ(fake.AllocateMemory(512, 3, &memory), VK_SUCCESS);
+  ASSERT_EQ(emulation.BindBufferMemory(device, source, memory, 0), VK_SUCCESS);
+  void* data = nullptr;
+  ASSERT_EQ(emulation.MapMemory(device, memory, 0, VK_WHOLE_SIZE, 0, &data),
+            VK_SUCCESS);
+  std::memcpy(data, bytes.data(), bytes.size());
+  VkImageCreateInfo bc_info =
+      ImageInfo(VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK, 32, 32);
+  bc_info.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+  VkImageCreateInfo storage_info = bc_info;
+  storage_info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+  VkImageCreateInfo host{};
+  const VkImage uploaded = Create(&emulation, &fake, bc_info, &host);
+  EXPECT_EQ(host.format, VK_FORMAT_BC1_RGB_UNORM_BLOCK);
+  const VkImage moved = Create(&emulation, &fake, bc_info, &host);
+  const VkImage rgba = Create(&emulation, &fake, storage_info, &host);
+  EXPECT_EQ(host.format, VK_FORMAT_R8G8B8A8_UNORM);
+
+  const VkCommandBuffer command_buffer =
+      fake.AllocateCommandBuffer(pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY);
+  emulation.BeginCommandBuffer(command_buffer, pool,
+                               VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
+  fake.BeginCommandBuffer(command_buffer,
+                          VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
+  VkBufferImageCopy upload{};
+  upload.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  upload.imageExtent = {32, 32, 1};
+  emulation.CmdCopyBufferToImage(device, command_buffer, source, uploaded,
+                                 VK_IMAGE_LAYOUT_GENERAL, 1, &upload);
+  VkImageCopy copy{};
+  copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  copy.dstSubresource = copy.srcSubresource;
+  copy.extent = {32, 32, 1};
+  emulation.CmdCopyImage(device, command_buffer, uploaded,
+                         VK_IMAGE_LAYOUT_GENERAL, moved,
+                         VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+  emulation.CmdCopyImage(device, command_buffer, uploaded,
+                         VK_IMAGE_LAYOUT_GENERAL, rgba, VK_IMAGE_LAYOUT_GENERAL,
+                         1, &copy);
+  VkImageCopy2 copy2{};
+  copy2.sType = VK_STRUCTURE_TYPE_IMAGE_COPY_2;
+  copy2.srcSubresource = copy.srcSubresource;
+  copy2.dstSubresource = copy.dstSubresource;
+  copy2.extent = copy.extent;
+  VkCopyImageInfo2 info2{};
+  info2.sType = VK_STRUCTURE_TYPE_COPY_IMAGE_INFO_2;
+  info2.srcImage = rgba;
+  info2.srcImageLayout = VK_IMAGE_LAYOUT_GENERAL;
+  info2.dstImage = moved;
+  info2.dstImageLayout = VK_IMAGE_LAYOUT_GENERAL;
+  info2.regionCount = 1;
+  info2.pRegions = &copy2;
+  emulation.CmdCopyImage2(device, command_buffer, &info2);
+  fake.EndCommandBuffer(command_buffer);
+  VkSubmitInfo submit{};
+  submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+  submit.commandBufferCount = 1;
+  submit.pCommandBuffers = &command_buffer;
+  Etc2SubmitPlan plan;
+  emulation.PrepareSubmit(queue, 1, &submit, VK_NULL_HANDLE, &plan);
+  const VkResult result = fake.QueueSubmit(
+      queue, plan.count(1), plan.submits(&submit), plan.fence(VK_NULL_HANDLE));
+  EXPECT_EQ(result, VK_SUCCESS);
+  emulation.FinishSubmit(&plan, result, [&](VkFence fence) {
+    return fake.QueueSubmit(queue, 0, nullptr, fence);
+  });
+
+  const std::vector<std::uint8_t>* blocks = fake.ImageSubresource(moved, 0, 0);
+  ASSERT_NE(blocks, nullptr);
+  EXPECT_EQ(*blocks, reference::BcFromEtc(EtcFormat::kEtc2Rgb8, bytes.data(),
+                                          512, true));
+
+  emulation.ReleaseCommandBuffer(command_buffer);
+  fake.FreeCommandBuffer(command_buffer);
+  fake.DestroyCommandPool(pool);
+  emulation.ForgetCommandPool(device, pool);
+  for (const VkImage image : {uploaded, moved, rgba}) {
+    emulation.DestroyImage(device, image, nullptr);
+  }
+  emulation.UnmapMemory(device, memory);
+  emulation.DestroyBuffer(device, source, nullptr);
+  emulation.FreeMemory(device, memory, nullptr);
+  emulation.DestroyDevice(device);
+  const std::string log = ::testing::internal::GetCapturedStderr();
+  EXPECT_NE(log.find("skipped an image copy between a BC image and one kept "
+                     "RGBA8/R16"),
+            std::string::npos)
+      << log;
+  EXPECT_NE(log.find(" bc_images=2 bc_fallback=1 bc_mixed_copies=2 "),
+            std::string::npos)
+      << log;
+  EXPECT_TRUE(fake.errors().empty()) << fake.errors().front();
+}
+
 // DESIGN C3.4: a selftest whose BC part differs from the CPU encoder keeps
 // the CPU route for the session (decode included), and says which format
 // and block.
@@ -994,24 +1113,28 @@ const char* TeardownName(ScenarioTeardown teardown) {
 }
 
 // Every scenario with MOCKTAIL_ETC2_TO_BC=1 on the fake device (BC, no
-// ETC2), on the fast path and the legacy one, with every teardown: the
+// ETC2), with the host staging arena and with one-off staging buffers (its
+// fallback), with every teardown: the
 // host images are BC images of the app's extent (BC mode never upscales,
 // so the upscale scenarios run as plain uploads), their blocks equal the
 // references', every copy and blit is what the model expects, and the
 // emulation gives back everything it made.
 class Etc2BcScenarioTest
     : public ::testing::TestWithParam<
-          std::tuple<std::string, bool, ScenarioTeardown>> {};
+          std::tuple<std::string, bool, ScenarioTeardown>> {
+ protected:
+  void TearDown() override { Etc2EmulationTesting().no_host_staging = false; }
+};
 
 TEST_P(Etc2BcScenarioTest, MatchesModelAndGolden) {
-  const auto& [name, fast_path, teardown] = GetParam();
+  const auto& [name, arena, teardown] = GetParam();
+  Etc2EmulationTesting().no_host_staging = !arena;
   const Scenario* scenario = FindEtc2EmulationScenario(name);
   ASSERT_NE(scenario, nullptr);
   FakeVulkanDevice fake;
   FakeEmulationBackend backend(&fake);
   ScenarioOptions options;
   options.emulation.to_bc = true;
-  options.emulation.fast_path = fast_path;
   options.teardown = teardown;
   if (teardown == ScenarioTeardown::kOrderly) {
     options.fake = &fake;  // the image copies and blits too
@@ -1054,7 +1177,7 @@ INSTANTIATE_TEST_SUITE_P(
     [](const ::testing::TestParamInfo<
         std::tuple<std::string, bool, ScenarioTeardown>>& info) {
       return std::get<0>(info.param) +
-             (std::get<1>(info.param) ? "_Fast_" : "_Legacy_") +
+             (std::get<1>(info.param) ? "_Arena_" : "_OneOffStaging_") +
              TeardownName(std::get<2>(info.param));
     });
 
@@ -1100,7 +1223,7 @@ bool BcServesOnTheGpu(const Scenario& scenario) {
 enum class BcFill {
   kPass,    // the etc2_bc dispatches in front of the batch
   kRescue,  // [CR-7] no slot after the warm-up: CPU-encoded, copied in
-  kRescueLegacyStaging,  // the same through one-off staging buffers
+  kRescueOneOffStaging,  // the same through one-off staging buffers
 };
 
 // With the GPU route on as well (MOCKTAIL_ETC2_GPU's default) and ready
@@ -1110,10 +1233,15 @@ enum class BcFill {
 // with every teardown, everything the route made is given back.
 class Etc2BcGpuRouteTest : public ::testing::TestWithParam<std::string> {
  protected:
-  void TearDown() override { Etc2GpuTesting().fail_slot_acquire = false; }
+  void TearDown() override {
+    Etc2GpuTesting().fail_slot_acquire = false;
+    Etc2EmulationTesting().no_host_staging = false;
+  }
 
   void RunAndCheck(ScenarioTeardown teardown, bool frame_stats,
                    BcFill fill = BcFill::kPass) {
+    Etc2EmulationTesting().no_host_staging =
+        fill == BcFill::kRescueOneOffStaging;
     const Scenario* scenario = FindEtc2EmulationScenario(GetParam());
     ASSERT_NE(scenario, nullptr);
     FakeVulkanDevice fake;
@@ -1123,7 +1251,6 @@ class Etc2BcGpuRouteTest : public ::testing::TestWithParam<std::string> {
     options.emulation.to_bc = true;
     options.emulation.gpu = true;
     options.emulation.frame_stats = frame_stats;
-    options.emulation.fast_path = fill != BcFill::kRescueLegacyStaging;
     if (teardown == ScenarioTeardown::kOrderly) {
       options.fake = &fake;  // the image copies and blits too
     }
@@ -1206,7 +1333,7 @@ TEST_P(Etc2BcGpuRouteTest, RescueMatchesTheBcGoldens) {
 
 TEST_P(Etc2BcGpuRouteTest, RescueWithOneOffStagingReleasesEverything) {
   RunAndCheck(ScenarioTeardown::kDestroyPool, false,
-              BcFill::kRescueLegacyStaging);
+              BcFill::kRescueOneOffStaging);
 }
 
 INSTANTIATE_TEST_SUITE_P(Scenarios, Etc2BcGpuRouteTest,
@@ -1280,13 +1407,13 @@ TEST(Etc2BcOverrideTest, Rgb8A1OverridesArePunchedThroughAtAlpha128) {
   submit.kind = ScenarioStep::Kind::kSubmit;
   submit.batches = {{0}};
   scenario.steps = {override_step, copy, submit};
-  for (const bool fast_path : {true, false}) {
-    SCOPED_TRACE(fast_path ? "fast path" : "legacy path");
+  for (const bool arena : {true, false}) {
+    SCOPED_TRACE(arena ? "host staging arena" : "one-off staging");
+    Etc2EmulationTesting().no_host_staging = !arena;
     FakeVulkanDevice fake;
     FakeEmulationBackend backend(&fake);
     ScenarioOptions options;
     options.emulation.to_bc = true;
-    options.emulation.fast_path = fast_path;
     ::testing::internal::CaptureStderr();
     const ScenarioRun run = RunEtc2Scenario(scenario, &backend, options);
     const std::string log = ::testing::internal::GetCapturedStderr();
@@ -1297,6 +1424,7 @@ TEST(Etc2BcOverrideTest, Rgb8A1OverridesArePunchedThroughAtAlpha128) {
     EXPECT_NE(log.find("texture override loaded"), std::string::npos) << log;
     EXPECT_TRUE(fake.errors().empty()) << fake.errors().front();
   }
+  Etc2EmulationTesting().no_host_staging = false;
   // The emulation's blocks equal the reference encoding of the resampled
   // override (checked above against the model); what those blocks decode
   // to, by D3D10 rules:

@@ -43,6 +43,7 @@ Etc2EmulationOptions GpuOptions(std::uint32_t upscale = 1) {
   Etc2EmulationOptions options;
   options.gpu = true;
   options.upscale = upscale;
+  options.to_bc = false;  // RGBA/R16 hosts, as the goldens
   return options;
 }
 
@@ -113,18 +114,23 @@ enum class Fill {
   kDecodePass,  // the decode pass in front of the batch
   // [CR-7] No slot comes free after the warm-up: the reserved rescue slot
   // copies what the CPU decoded into host staging (the arena's, or a
-  // one-off buffer with MOCKTAIL_ETC2_FAST_PATH=0).
+  // one-off buffer, its fallback when the arena cannot grow).
   kRescue,
-  kRescueLegacyStaging,
+  kRescueOneOffStaging,
 };
 
 class Etc2GpuRouteScenarioTest
     : public ::testing::TestWithParam<std::string> {
  protected:
-  void TearDown() override { Etc2GpuTesting().fail_slot_acquire = false; }
+  void TearDown() override {
+    Etc2GpuTesting().fail_slot_acquire = false;
+    Etc2EmulationTesting().no_host_staging = false;
+  }
 
   void RunAndCheck(ScenarioTeardown teardown, bool frame_stats,
                    Fill fill = Fill::kDecodePass) {
+    Etc2EmulationTesting().no_host_staging =
+        fill == Fill::kRescueOneOffStaging;
     const Scenario* scenario = FindEtc2EmulationScenario(GetParam());
     ASSERT_NE(scenario, nullptr);
     FakeVulkanDevice fake;
@@ -133,7 +139,6 @@ class Etc2GpuRouteScenarioTest
     options.teardown = teardown;
     options.emulation.gpu = true;
     options.emulation.frame_stats = frame_stats;
-    options.emulation.fast_path = fill != Fill::kRescueLegacyStaging;
     options.fake = &fake;
     if (fill != Fill::kDecodePass) {
       options.after_warm_up = [] { Etc2GpuTesting().fail_slot_acquire = true; };
@@ -201,7 +206,7 @@ TEST_P(Etc2GpuRouteScenarioTest, RescueMatchesTheGoldenHashes) {
 
 TEST_P(Etc2GpuRouteScenarioTest, RescueWithOneOffStagingReleasesEverything) {
   RunAndCheck(ScenarioTeardown::kResetPool, false,
-              Fill::kRescueLegacyStaging);
+              Fill::kRescueOneOffStaging);
 }
 
 TEST_P(Etc2GpuRouteScenarioTest, RescueThenDestroyDeviceReleasesEverything) {
@@ -532,6 +537,7 @@ class FakeRig {
 class Etc2GpuRouteFakeTest : public ::testing::Test {
  protected:
   void TearDown() override {
+    Etc2EmulationTesting().no_host_staging = false;
     Etc2GpuTestHooks& hooks = Etc2GpuTesting();
     hooks.fail_slot_acquire = false;
     hooks.fail_rescue_slot = false;
@@ -823,6 +829,72 @@ TEST_F(Etc2GpuRouteFakeTest, AFailedSubmitLeavesTheSlotUnsubmitted) {
   EXPECT_TRUE(rig.fake().errors().empty()) << rig.fake().errors().front();
 }
 
+// A protected batch's decode pass goes first on its own; when that
+// vkQueueSubmit fails and Roblox's succeeds, the pass's uploads are
+// counted as dropped and logged, and the slot's timestamps, which no
+// submitted command wrote, are not waited for when the slot comes back
+// (MOCKTAIL_FRAME_STATS): the fake device reports such a wait, which the
+// spec lets hang or lose the device.
+TEST_F(Etc2GpuRouteFakeTest, AFailedPreSubmitDropsItsUploads) {
+  Etc2EmulationOptions options = GpuOptions();
+  options.frame_stats = true;
+  ::testing::internal::CaptureStderr();
+  {
+    FakeRig rig(options);
+    ASSERT_TRUE(rig.WarmUp());
+    const VkCommandPool pool = rig.Pool(0);
+    RigImage* image = rig.Image(VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK, 32, 32, 3);
+    RigSource* source = rig.Source(4096, 31);
+    const VkCommandBuffer command_buffer = rig.Begin(pool);
+    rig.Upload(command_buffer, *image, *source);
+    rig.End(command_buffer);
+    VkProtectedSubmitInfo protected_info{};
+    protected_info.sType = VK_STRUCTURE_TYPE_PROTECTED_SUBMIT_INFO;
+    protected_info.protectedSubmit = VK_TRUE;
+    VkSubmitInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    info.pNext = &protected_info;
+    info.commandBufferCount = 1;
+    info.pCommandBuffers = &command_buffer;
+    Etc2SubmitPlan plan;
+    rig.emulation().PrepareSubmit(rig.queue(), 1, &info, VK_NULL_HANDLE,
+                                  &plan);
+    ASSERT_EQ(plan.pre_submits().size(), 1U);
+    EXPECT_EQ(plan.pre_submits()[0].uploads, 3U);
+    // What the adapter does: each pre-submit's result goes to the plan.
+    rig.fake().FailNextSubmits({VK_ERROR_OUT_OF_DEVICE_MEMORY});
+    for (const Etc2PreSubmit& pre : plan.pre_submits()) {
+      plan.NotePreSubmitResult(
+          pre, rig.fake().QueueSubmit(rig.queue(), 1, &pre.info, pre.fence));
+    }
+    EXPECT_EQ(plan.failed_pre_submit_uploads, 3U);
+    const VkResult result =
+        rig.fake().QueueSubmit(rig.queue(), plan.count(1), plan.submits(&info),
+                               plan.fence(VK_NULL_HANDLE));
+    EXPECT_EQ(result, VK_SUCCESS);
+    rig.emulation().FinishSubmit(&plan, result, [&](VkFence fence) {
+      return rig.fake().QueueSubmit(rig.queue(), 0, nullptr, fence);
+    });
+    EXPECT_EQ(rig.gpu()->stats().pre_submits, 1U);
+    EXPECT_EQ(rig.gpu()->stats().dropped_uploads, 3U);
+
+    // The next call takes the slot back and reads what timing it has.
+    const VkCommandBuffer next = rig.Begin(pool);
+    const auto regions = rig.Upload(next, *image, *source);
+    rig.End(next);
+    ASSERT_EQ(rig.Submit(rig.queue(), {{next}}, VK_NULL_HANDLE), VK_SUCCESS);
+    rig.Check(*image, *source, regions);
+    EXPECT_EQ(rig.gpu()->stats().slots_created, 1U);
+    EXPECT_TRUE(rig.fake().errors().empty()) << rig.fake().errors().front();
+  }
+  const std::string log = ::testing::internal::GetCapturedStderr();
+  EXPECT_NE(log.find("a decode pass submitted on its own failed; its uploads "
+                     "read stale texels (VkResult -2)"),
+            std::string::npos)
+      << log;
+  EXPECT_NE(log.find("rescued=0 dropped=3"), std::string::npos) << log;
+}
+
 // Roblox's fence stays with its batches; the slot fence follows in a
 // fence-only submit. When that one fails the slot is given up, never
 // reset while it may be pending, and a new slot serves the next call.
@@ -940,17 +1012,63 @@ TEST_F(Etc2GpuRouteFakeTest, ARescueDecodesOnTheCpuIntoTheArena) {
   EXPECT_NE(log.find("rescued=6 dropped=3"), std::string::npos) << log;
 }
 
+// [CR-7] While the reserved rescue slot is still pending (the GPU is far
+// behind), the next rescue gets another rescue-only slot instead of a wait
+// without a bound inside Roblox's vkQueueSubmit; once the GPU has caught
+// up, the reserved one serves again.
+TEST_F(Etc2GpuRouteFakeTest, ARescueNeverWaitsForAPendingRescueSlot) {
+  FakeRig rig(GpuOptions());
+  ASSERT_TRUE(rig.WarmUp());
+  const VkCommandPool pool = rig.Pool(0);
+  RigImage* image = rig.Image(VK_FORMAT_EAC_R11_UNORM_BLOCK, 20, 20, 2);
+  RigSource* source = rig.Source(4096, 47);
+  const std::uint64_t slots = rig.gpu()->stats().slots_created;
+  const std::uint64_t waits = rig.fake().calls("vkWaitForFences");
+  Etc2GpuTesting().fail_slot_acquire = true;  // as if 32 calls were pending
+  rig.fake().HoldFences(true);
+  for (int call = 0; call < 3; ++call) {
+    const VkCommandBuffer command_buffer = rig.Begin(pool);
+    const auto regions = rig.Upload(command_buffer, *image, *source);
+    rig.End(command_buffer);
+    ASSERT_EQ(rig.Submit(rig.queue(), {{command_buffer}}, VK_NULL_HANDLE),
+              VK_SUCCESS);
+    rig.Check(*image, *source, regions);
+  }
+  Etc2GpuDevice::Stats stats = rig.gpu()->stats();
+  EXPECT_EQ(stats.rescues, 3U);
+  EXPECT_EQ(stats.rescued_uploads, 6U);
+  EXPECT_EQ(stats.dropped_uploads, 0U);
+  EXPECT_EQ(stats.slots_created, slots + 3) << "a rescue slot per pending call";
+  EXPECT_EQ(rig.fake().calls("vkWaitForFences"), waits);
+
+  rig.fake().HoldFences(false);
+  const VkCommandBuffer caught_up = rig.Begin(pool);
+  const auto regions = rig.Upload(caught_up, *image, *source);
+  rig.End(caught_up);
+  ASSERT_EQ(rig.Submit(rig.queue(), {{caught_up}}, VK_NULL_HANDLE),
+            VK_SUCCESS);
+  rig.Check(*image, *source, regions);
+  stats = rig.gpu()->stats();
+  EXPECT_EQ(stats.rescues, 4U);
+  EXPECT_EQ(stats.slots_created, slots + 3) << "the reserved one again";
+  EXPECT_EQ(rig.fake().calls("vkWaitForFences"), waits);
+  Etc2GpuTesting().fail_slot_acquire = false;
+  rig.Teardown();
+  ExpectEverythingReleased(rig.fake());
+  EXPECT_TRUE(rig.fake().errors().empty()) << rig.fake().errors().front();
+}
+
 // The CPU half reads Roblox's bytes where the decode pass would: rows and
 // layers apart (bufferRowLength, bufferImageHeight), from a source Roblox
 // does not keep mapped (mapped for the submit, as on the CPU route), in
-// formats of every texel size. With MOCKTAIL_ETC2_FAST_PATH=0 its staging
-// is a one-off buffer that goes with Roblox's command buffer.
+// formats of every texel size. Without the host staging arena (its
+// fallback) the staging is a one-off buffer that goes with Roblox's command
+// buffer.
 TEST_F(Etc2GpuRouteFakeTest, ARescueReadsStridedLayeredAndUnmappedSources) {
-  for (const bool fast_path : {true, false}) {
-    SCOPED_TRACE(fast_path ? "host staging arena" : "one-off staging");
-    Etc2EmulationOptions options = GpuOptions();
-    options.fast_path = fast_path;
-    FakeRig rig(options);
+  for (const bool arena : {true, false}) {
+    SCOPED_TRACE(arena ? "host staging arena" : "one-off staging");
+    Etc2EmulationTesting().no_host_staging = !arena;
+    FakeRig rig(GpuOptions());
     ASSERT_TRUE(rig.WarmUp());
     const VkCommandPool pool = rig.Pool(0);
     RigSource* source = rig.Source(64 * 1024, 37);
@@ -982,7 +1100,7 @@ TEST_F(Etc2GpuRouteFakeTest, ARescueReadsStridedLayeredAndUnmappedSources) {
       Etc2GpuTesting().fail_slot_acquire = false;
       EXPECT_EQ(rig.fake().calls("vkUnmapMemory"), unmaps + 1)
           << "the source was mapped for the submit only";
-      if (!fast_path) {
+      if (!arena) {
         EXPECT_EQ(rig.fake().counts().buffers.live(), buffers + 1)
             << "the rescue's one-off staging";
       }
@@ -1015,7 +1133,7 @@ TEST_F(Etc2GpuRouteFakeTest, ARescueReadsStridedLayeredAndUnmappedSources) {
       }
       // Roblox resets the command buffer: the staging goes with it.
       rig.emulation().ReleaseCommandBuffer(command_buffer);
-      if (!fast_path) {
+      if (!arena) {
         EXPECT_EQ(rig.fake().counts().buffers.live(), buffers);
       }
     }
@@ -1206,6 +1324,45 @@ TEST_F(Etc2GpuRouteFakeTest, FrameStatsReportGpuSubmits) {
       << log;
   EXPECT_EQ(Field(log, kTotals, "| gpu uploads="), "2");
   EXPECT_EQ(Field(log, kTotals, " gpu="), "6");
+}
+
+// DESIGN C3.6: once a loading burst's output chunks have been idle for 2 s,
+// all but 32 MiB of them go even when no GPU-route upload follows: the
+// housekeeping that runs at a present (at most once a second) trims the
+// arenas, not only a submit with GPU-route uploads.
+TEST_F(Etc2GpuRouteFakeTest, IdleOutputChunksGoWithoutAnotherUpload) {
+  constexpr VkDeviceSize kMebibyte = 1024 * 1024;
+  FakeRig rig(GpuOptions());
+  ASSERT_TRUE(rig.WarmUp());
+  const VkCommandPool pool = rig.Pool(0);
+  // Three 2048x2048 ETC2 RGB8 textures, 2 MiB compressed and 16 MiB
+  // decoded each: two fill the first 32 MiB chunk, the third a second one.
+  RigSource* source = rig.Source(6 * kMebibyte, 37);
+  const VkCommandBuffer command_buffer = rig.Begin(pool);
+  for (VkDeviceSize index = 0; index < 3; ++index) {
+    RigImage* image =
+        rig.Image(VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK, 2048, 2048, 1);
+    VkBufferImageCopy region{};
+    region.bufferOffset = index * 2 * kMebibyte;
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = {2048, 2048, 1};
+    rig.Upload(command_buffer, *image, *source, {region});
+  }
+  rig.End(command_buffer);
+  ASSERT_EQ(rig.Submit(rig.queue(), {{command_buffer}}, VK_NULL_HANDLE),
+            VK_SUCCESS);
+  EXPECT_EQ(rig.gpu()->stats().passes, 1U);
+  // Roblox resets its command buffer: both chunks are idle from now on.
+  rig.emulation().ReleaseCommandBuffer(command_buffer);
+  EXPECT_EQ(rig.gpu()->stats().arena_bytes, 64 * kMebibyte);
+  rig.emulation().OnPresent();
+  EXPECT_EQ(rig.gpu()->stats().arena_bytes, 64 * kMebibyte)
+      << "idle for less than 2 s";
+  std::this_thread::sleep_for(std::chrono::milliseconds(2100));
+  rig.emulation().OnPresent();
+  EXPECT_EQ(rig.gpu()->stats().arena_bytes, 32 * kMebibyte)
+      << "32 MiB stay for the next burst";
+  EXPECT_TRUE(rig.fake().errors().empty()) << rig.fake().errors().front();
 }
 
 }  // namespace

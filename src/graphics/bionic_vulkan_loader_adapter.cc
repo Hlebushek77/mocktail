@@ -1266,24 +1266,11 @@ bool Etc2FeatureAdvertised(VkPhysicalDevice physical_device) {
 
 // Whether the format-property hooks answer for ETC2/EAC with the emulated
 // features. Only while the feature is advertised too, so that with
-// MOCKTAIL_ADVERTISE_ETC2=0 the formats report what the driver reports;
-// MOCKTAIL_ETC2_FORMAT_PROPS=legacy keeps plus.1's answer for the DXT probe.
+// MOCKTAIL_ADVERTISE_ETC2=0 the formats report what the driver reports.
 bool Etc2FormatsAdvertised(VkPhysicalDevice physical_device) {
-  const bool emulated = Etc2EmulatedPhysicalDevice(physical_device);
-  const bool advertised = mocktail::graphics::Etc2SupportAdvertised();
-  const mocktail::graphics::Etc2FormatPropsMode mode =
-      mocktail::graphics::Etc2FormatPropsModeFromEnvironment();
-  if (emulated && !advertised &&
-      mode == mocktail::graphics::Etc2FormatPropsMode::kLegacy) {
-    static std::atomic<bool> logged{false};
-    if (!logged.exchange(true, std::memory_order_relaxed)) {
-      std::fprintf(stderr,
-                   "  [vulkan] MOCKTAIL_ETC2_FORMAT_PROPS=legacy: ETC2/EAC "
-                   "formats report emulated features while "
-                   "textureCompressionETC2 is hidden\n");
-    }
-  }
-  return mocktail::graphics::Etc2FormatsAdvertised(emulated, advertised, mode);
+  return mocktail::graphics::Etc2FormatsAdvertised(
+      Etc2EmulatedPhysicalDevice(physical_device),
+      mocktail::graphics::Etc2SupportAdvertised());
 }
 
 // ETC2->BC mode on this physical device (MOCKTAIL_ETC2_TO_BC=1 and the
@@ -1326,15 +1313,18 @@ void ReleaseEtc2PoolCommandBuffers(VkDevice device,
 }
 
 // Mocktail-only batches go first, and always through the core
-// vkQueueSubmit, also inside the vkQueueSubmit2 hooks.
+// vkQueueSubmit, also inside the vkQueueSubmit2 hooks. The plan keeps the
+// results, so FinishEtc2Submit can count what a failed one left undone.
 void SubmitEtc2PreSubmits(VkQueue queue,
-                          const mocktail::graphics::Etc2SubmitPlan& plan) {
-  if (plan.pre_submits().empty()) {
+                          mocktail::graphics::Etc2SubmitPlan* plan) {
+  if (plan->pre_submits().empty()) {
     return;
   }
   const PFN_vkQueueSubmit submit = HostDispatchForQueue(queue).queue_submit;
-  for (const mocktail::graphics::Etc2PreSubmit& pre : plan.pre_submits()) {
-    State().text_overlay.QueueSubmit(queue, 1, &pre.info, pre.fence, submit);
+  for (const mocktail::graphics::Etc2PreSubmit& pre : plan->pre_submits()) {
+    plan->NotePreSubmitResult(
+        pre, State().text_overlay.QueueSubmit(queue, 1, &pre.info, pre.fence,
+                                              submit));
   }
 }
 
@@ -2267,7 +2257,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(
   }
   mocktail::graphics::Etc2SubmitPlan plan;
   State().etc2.PrepareSubmit(queue, submit_count, submits, fence, &plan);
-  SubmitEtc2PreSubmits(queue, plan);
+  SubmitEtc2PreSubmits(queue, &plan);
   const VkResult result = State().text_overlay.QueueSubmit(
       queue, plan.count(submit_count), plan.submits(submits), plan.fence(fence),
       host_submit);
@@ -2292,7 +2282,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit2(
   }
   mocktail::graphics::Etc2SubmitPlan plan;
   State().etc2.PrepareSubmit2(queue, submit_count, submits, fence, &plan);
-  SubmitEtc2PreSubmits(queue, plan);
+  SubmitEtc2PreSubmits(queue, &plan);
   const VkResult result = State().text_overlay.QueueSubmit2(
       queue, plan.count(submit_count), plan.submits2(submits),
       plan.fence(fence), host_submit);
@@ -2317,7 +2307,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit2KHR(
   }
   mocktail::graphics::Etc2SubmitPlan plan;
   State().etc2.PrepareSubmit2(queue, submit_count, submits, fence, &plan);
-  SubmitEtc2PreSubmits(queue, plan);
+  SubmitEtc2PreSubmits(queue, &plan);
   const VkResult result = State().text_overlay.QueueSubmit2(
       queue, plan.count(submit_count), plan.submits2(submits),
       plan.fence(fence), reinterpret_cast<PFN_vkQueueSubmit2>(host_submit));

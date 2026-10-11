@@ -80,10 +80,20 @@ bool RenderingPresetKnobsFromEnvironment(RenderingPresetKnobs* knobs,
 // What the knobs change, for the startup log; empty for the defaults.
 std::string DescribeRenderingPresetKnobs(const RenderingPresetKnobs& knobs);
 
+// The client setting that forces Roblox's graphics quality level (its frame
+// rate manager's level, 1 to 21) when engine.graphics_quality is a level.
+// Roblox 2.738.1397 registers DebugFRMQualityLevelOverride as a DFInt and
+// looks a key up only under the prefix it registered, so the FInt spelling
+// that Mocktail sent until 1.0.4-plus.2 never took effect.
+inline constexpr std::string_view kGraphicsQualityClientSetting =
+    "DFIntDebugFRMQualityLevelOverride";
+
 // Respects CPU affinity and falls back to the available logical count.
 int DetectAvailablePhysicalCoreCount();
 
-// Disabled policy preserves overrides; conflicting values fail.
+// Disabled policy preserves overrides; conflicting values fail. A graphics
+// quality level (MOCKTAIL_GRAPHICS_QUALITY) is merged whether or not the
+// rendering preset is.
 bool MergePerformanceClientSettingsOverrides(const PerformancePolicy& policy,
                                              std::string_view base_json,
                                              std::string* merged_json,

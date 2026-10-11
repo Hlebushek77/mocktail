@@ -883,7 +883,8 @@ guint Selftest::SaveStep() {
   expect("appearance.theme", "dark");
   expect("graphics.backend", "opengl");
   expect("window.width", "1366");
-  expect(kTextureCompressionKey, "true");
+  // The template turns it on; the switch above turned it off.
+  expect(kTextureCompressionKey, "false");
   if (saved.bytes().rfind("# Mocktail configuration.", 0) != 0) {
     Error("the template's comments did not survive Save");
   }
@@ -891,14 +892,14 @@ guint Selftest::SaveStep() {
   // engine: section, where Save edited it in place.
   const runtime::RuntimeConfigLoadResult loaded =
       runtime::LoadRuntimeConfig(EmptyEnvironment(), context_->config_file());
-  const bool etc2_to_bc = loaded && loaded.config.engine().etc2_to_bc;
+  const bool etc2_to_bc = !loaded || loaded.config.engine().etc2_to_bc;
   Note("saved_etc2_to_bc", etc2_to_bc ? "true" : "false");
   if (!loaded) {
     Error("the runtime cannot load the saved config.yaml: " + loaded.error);
-  } else if (!etc2_to_bc) {
-    Error("the runtime reads engine.etc2_to_bc as false after Save");
+  } else if (etc2_to_bc) {
+    Error("the runtime reads engine.etc2_to_bc as true after Save");
   }
-  if (saved.bytes().find("\n  etc2_to_bc: true\n") == std::string::npos) {
+  if (saved.bytes().find("\n  etc2_to_bc: false\n") == std::string::npos) {
     Error("engine.etc2_to_bc was not written in place of the template's line");
   }
   launcher::RememberedWindowState state;
