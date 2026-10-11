@@ -370,12 +370,54 @@ TEST(PlanRegionsTest, ClipsBlockRoundedExtentsOfBcImagesToTheMip) {
   EXPECT_EQ(plan.total, 64U + 16 + 16);
   EXPECT_FALSE(PlanAll(shape, {Region(0, 0, 0, 0, 0, 1, 8, 0, 4, 4)}).ok);
   EXPECT_FALSE(PlanAll(shape, {Region(0, 0, 0, 1, 0, 1, 0, 4, 4, 4)}).ok);
-  // The default mode keeps such regions as they are.
-  shape.bc = false;
-  const Plan rgba = PlanAll(shape, {Region(0, 0, 0, 0, 0, 1, 0, 0, 8, 8)});
-  ASSERT_TRUE(rgba.ok);
-  EXPECT_EQ(rgba.rewritten[0].imageExtent.width, 8U);
-  EXPECT_EQ(rgba.rewritten[0].bufferRowLength, 0U);
+}
+
+// The same block-rounded extents on an image that is not upscaled (EAC is
+// never; colour only up to 64x64) reach its RGBA8/R16 host clipped to the
+// mip too, reading the decoded rows of the extent given, as the GPU
+// route's copy does; past the edge the host copy would be out of bounds.
+TEST(PlanRegionsTest, ClipsBlockRoundedExtentsOfUnscaledImagesToTheMip) {
+  const Etc2ImageShape r16 = Shape(VK_FORMAT_EAC_R11_UNORM_BLOCK, 1, 6, 6);
+  // 8x8 on the 6x6 mip 0: 128 bytes of R16 texels; 4x4 on the 1x1 mip 2
+  // and 4x4 at 4,4 of mip 0: 32 bytes each; 4x4 at 0,0, inside the mip.
+  const Plan plan = PlanAll(r16, {Region(0, 0, 0, 0, 0, 1, 0, 0, 8, 8),
+                                  Region(32, 0, 0, 2, 0, 1, 0, 0, 4, 4),
+                                  Region(40, 0, 0, 0, 0, 1, 4, 4, 4, 4),
+                                  Region(48, 0, 0, 0, 0, 1, 0, 0, 4, 4)});
+  ASSERT_TRUE(plan.ok);
+  ASSERT_EQ(plan.rewritten.size(), 4U);
+  const std::uint32_t extents[][2] = {{6, 6}, {1, 1}, {2, 2}, {4, 4}};
+  const std::uint32_t pitches[][2] = {{8, 8}, {4, 4}, {4, 4}, {0, 0}};
+  const VkDeviceSize offsets[] = {0, 128, 160, 192};
+  for (std::size_t index = 0; index < 4; ++index) {
+    const VkBufferImageCopy& region = plan.rewritten[index];
+    EXPECT_EQ(region.imageExtent.width, extents[index][0]) << index;
+    EXPECT_EQ(region.imageExtent.height, extents[index][1]) << index;
+    EXPECT_EQ(region.bufferRowLength, pitches[index][0]) << index;
+    EXPECT_EQ(region.bufferImageHeight, pitches[index][1]) << index;
+    EXPECT_EQ(region.bufferOffset, offsets[index]) << index;
+    // The upload still decodes the region as given.
+    EXPECT_EQ(plan.uploads[index].target_bytes,
+              static_cast<VkDeviceSize>(plan.uploads[index].width) *
+                  plan.uploads[index].height * 2)
+        << index;
+  }
+  EXPECT_EQ(plan.rewritten[2].imageOffset.x, 4);
+  EXPECT_EQ(plan.total, 224U);
+  EXPECT_FALSE(PlanAll(r16, {Region(0, 0, 0, 0, 0, 1, 8, 0, 4, 4)}).ok);
+  EXPECT_FALSE(PlanAll(r16, {Region(0, 0, 0, 1, 0, 1, 0, 4, 4, 4)}).ok);
+
+  // A colour image above 64x64 is not upscaled: its 2x2 mip 6 gets a 4x4
+  // extent, 64 bytes of RGBA8 texels.
+  const Etc2ImageShape rgba =
+      Shape(VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK, 1, 128, 128);
+  const Plan small = PlanAll(rgba, {Region(0, 0, 0, 6, 0, 1, 0, 0, 4, 4)});
+  ASSERT_TRUE(small.ok);
+  EXPECT_EQ(small.rewritten[0].imageExtent.width, 2U);
+  EXPECT_EQ(small.rewritten[0].imageExtent.height, 2U);
+  EXPECT_EQ(small.rewritten[0].bufferRowLength, 4U);
+  EXPECT_EQ(small.rewritten[0].bufferImageHeight, 4U);
+  EXPECT_EQ(small.uploads[0].target_bytes, 64U);
 }
 
 TEST(PlanRegionsTest, ScalesRegionsOfAnUpscaledImage) {

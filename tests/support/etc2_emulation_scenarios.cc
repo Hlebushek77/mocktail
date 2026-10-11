@@ -1326,14 +1326,15 @@ struct Etc2EmulationModel::State {
   }
 
   // Staging holds the region tightly packed, in texel blocks of the host
-  // format (one texel for RGBA8/R16, 4x4 for BC). In BC mode the host copy
-  // takes the part of the region inside the mip (an extent rounded up to
-  // whole blocks past the edge), reading the same staging rows.
+  // format (one texel for RGBA8/R16, 4x4 for BC). The host copy of an
+  // emulated image takes the part of the region inside the mip (an extent
+  // rounded up to whole blocks past the edge), reading the same staging
+  // rows; an upscaled region is inside already.
   void WriteUpload(const Upload& upload) {
     Image& image = images[upload.image];
     std::uint32_t width = upload.target_width;
     std::uint32_t height = upload.target_height;
-    if (bc && image.emulated) {
+    if (image.emulated) {
       width = std::min(width, Mip(image.host.width, upload.mip) - upload.host_x);
       height =
           std::min(height, Mip(image.host.height, upload.mip) - upload.host_y);
