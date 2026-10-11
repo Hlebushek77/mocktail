@@ -224,12 +224,13 @@ std::string FormatEtc2DecodeTotalsDetail(const Etc2DecodeTotals& totals) {
          Count(totals.staging_fallbacks));
   Append(&out,
          " | record calls=%llu time=%.1f ms release=%.1f ms destroyed=%llu "
-         "bc_images=%llu bc_fallback=%llu copyimg=%llu aliasviews=%llu | ",
+         "bc_images=%llu bc_fallback=%llu bc_mixed_copies=%llu copyimg=%llu "
+         "aliasviews=%llu | ",
          Count(totals.record_calls), FractionalMilliseconds(totals.record_ns),
          FractionalMilliseconds(totals.release_ns),
          Count(totals.images_destroyed), Count(totals.bc_images),
-         Count(totals.bc_fallback_images), Count(totals.copy_image_calls),
-         Count(totals.alias_views));
+         Count(totals.bc_fallback_images), Count(totals.bc_mixed_copies),
+         Count(totals.copy_image_calls), Count(totals.alias_views));
   AppendUploadShape(totals, &out);
   return out;
 }

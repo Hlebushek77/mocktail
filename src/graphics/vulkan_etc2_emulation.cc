@@ -1120,6 +1120,32 @@ struct VulkanEtc2Emulation::State {
     return nullptr;
   }
 
+  // [CR-14] An image copy between a BC image of an ETC2->BC device and one
+  // of its images kept RGBA8/R16: a BC block is 8 or 16 bytes and a texel
+  // of those 2 to 4, so the host formats are not size-compatible
+  // (VUID-vkCmdCopyImage-srcImage-01548), and each side would read the
+  // extent in its own units. Such a copy is left out (the destination
+  // keeps what it held), logged and counted. True when it was.
+  bool SkipMixedBcCopy(const HostDevice& dev, VkImage source,
+                       VkImage destination) {
+    if (!dev.bc) {
+      return false;
+    }
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      const auto from = images.find(source);
+      const auto to = images.find(destination);
+      if (from == images.end() || to == images.end() ||
+          from->second.bc == to->second.bc) {
+        return false;
+      }
+    }
+    LogFailure("skipped an image copy between a BC image and one kept "
+               "RGBA8/R16");
+    CountTotals([](Etc2DecodeTotals& totals) { ++totals.bc_mixed_copies; });
+    return true;
+  }
+
   bool BlitScaledCopy(const HostDevice& dev, VkCommandBuffer command_buffer,
                       VkImage source, VkImageLayout source_layout,
                       VkImage destination, VkImageLayout destination_layout,
@@ -2751,6 +2777,9 @@ void VulkanEtc2Emulation::CmdCopyImage(
     return;
   }
   CountImageCopy(state_, *dev, source, destination);
+  if (state_->SkipMixedBcCopy(*dev, source, destination)) {
+    return;
+  }
   if (dev->emulated && state_->options.upscale > 1 &&
       state_->BlitScaledCopy(*dev, command_buffer, source, source_layout,
                              destination, destination_layout, region_count,
@@ -2769,6 +2798,9 @@ void VulkanEtc2Emulation::CmdCopyImage2(VkDevice device,
     return;
   }
   CountImageCopy(state_, *dev, info->srcImage, info->dstImage);
+  if (state_->SkipMixedBcCopy(*dev, info->srcImage, info->dstImage)) {
+    return;
+  }
   if (dev->emulated && state_->options.upscale > 1 &&
       info->pRegions != nullptr) {
     std::vector<VkImageCopy> regions;
