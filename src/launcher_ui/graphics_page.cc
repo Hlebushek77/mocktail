@@ -827,10 +827,10 @@ GtkWidget* BuildTextureCompressionRow(LauncherContext* context) {
         "switch to DXT itself (MOCKTAIL_ADVERTISE_ETC2=0) was much slower in "
         "a test on an RTX 3060.") +
       "\n\n" +
-      // work/plus2-live/L123-REPORT.md, Anime Vanguards (Roblox
-      // 2.738.1397), the Mocktail process's video memory: average 774 and
-      // 841 MiB, peak 907 and 1008 MiB in BC mode (P2B1, P2B2), against
-      // 1800 and 1934 MiB, peak 2406 and 2416 MiB unpacked (P2G1, P2G2).
+      // The live test in README's ETC2 textures section: Anime Vanguards
+      // (Roblox 2.738.1397), the Mocktail process's video memory: average
+      // 774 and 841 MiB, peak 907 and 1008 MiB in BC mode (two runs),
+      // against 1800 and 1934 MiB, peak 2406 and 2416 MiB unpacked.
       _("In a test on an RTX 3060 (driver 615), the same Roblox game used "
         "about 800 MiB of video memory on average with this setting on, "
         "against about 1900 MiB with it off, and at most about 1000 against "
@@ -847,10 +847,10 @@ GtkWidget* BuildTextureCompressionRow(LauncherContext* context) {
         "fourfold enlargement Mocktail gives them otherwise, so they look "
         "smoother but less crisp.") +
       "\n\n" +
-      // L123-REPORT.md: no ETC2 stall in any phase while the graphics card
-      // converts (P2B1, P2B2: longest frames 62 and 64 ms while moving);
+      // The same test: no ETC2 stall in any phase while the graphics card
+      // converts (two runs, longest frames 62 and 64 ms while moving);
       // stalls of up to 196 ms while a place loads when the processor
-      // converts (P2Bc1, MOCKTAIL_ETC2_GPU=0). vulkan_etc2_gpu.cc logs
+      // converts (one run, MOCKTAIL_ETC2_GPU=0). vulkan_etc2_gpu.cc logs
       // "ETC2 GPU decode ready" once the GPU route's selftest passed; until
       // then, and without it, uploads take the CPU route. Keep config.yaml's
       // template in step (runtime_config_bootstrap.cc).
@@ -903,7 +903,7 @@ GtkWidget* BuildTextureCompressionRow(LauncherContext* context) {
                : std::optional<std::string>();
   };
   spec.hint.recommend_reason = [](const MachineProfile&) {
-    // The L3 runs quoted in the details (L123-REPORT.md).
+    // The live test quoted in the details (README, ETC2 textures).
     return std::string(
         _("This card cannot read ETC2. With its textures kept compressed, "
           "the game used less than half the video memory in a test on an "

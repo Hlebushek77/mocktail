@@ -16,11 +16,11 @@ namespace runtime {
 namespace {
 
 // config/mocktail.example.yaml is a copy of this text (a test compares
-// them). engine.etc2_to_bc's loading sentence follows the L3 runs on an
-// RTX 3060 (work/plus2-live/L123-REPORT.md): converting on the graphics
-// card gave no stall at all (P2B1, P2B2), converting on the processor
-// stalls of up to 196 ms while a place loaded (P2Bc1). Keep it in step with
-// the Graphics page's hint for the key.
+// them). engine.etc2_to_bc's loading sentence follows the live test on an
+// RTX 3060 in README's ETC2 textures section: converting on the graphics
+// card gave no stall at all, converting on the processor stalls of up to
+// 196 ms while a place loaded. Keep it in step with the Graphics page's
+// hint for the key.
 constexpr std::string_view kDefaultRuntimeConfig =
     R"yaml(# Mocktail configuration.
 # The file is created once with mode 0600. Mocktail never replaces your edits.
