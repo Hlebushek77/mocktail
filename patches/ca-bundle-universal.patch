@@ -1,0 +1,33 @@
+--- /tmp/opencode/plus_libc_shim.orig	2026-10-16 04:17:56.603032080 +0200
++++ /tmp/opencode/plus_libc_shim.cc	2026-10-16 04:15:07.461886409 +0200
+@@ -26,10 +26,17 @@
+ std::atomic<GuestAllocator> g_guest_allocator{nullptr};
+ 
+ constexpr char kCaBundleOverride[] = "MOCKTAIL_CA_BUNDLE";
+-constexpr std::array<const char*, 2> kDefaultCaBundles = {
++// System bundle locations across distros: Alpine, Debian/Ubuntu/Arch,
++// openSUSE/SUSE, Fedora/RHEL. Symlinks are fine (ValidateHostCaBundle
++// resolves them via realpath); missing entries are simply skipped.
++constexpr std::array<const char*, 4> kDefaultCaBundles = {
+     "/etc/ssl/cert.pem",
+     "/etc/ssl/certs/ca-certificates.crt",
++    "/etc/ssl/ca-bundle.pem",
++    "/etc/pki/tls/certs/ca-bundle.crt",
+ };
++// Standard OpenSSL/curl fallback, honored when MOCKTAIL_CA_BUNDLE is unset.
++constexpr char kSystemCaBundleEnv[] = "SSL_CERT_FILE";
+ constexpr std::array<const char*, 8> kAndroidCaBundlePaths = {
+     "/data/user/0/com.roblox.client/files/exe/cacert.pem",
+     "/data/data/com.roblox.client/files/exe/cacert.pem",
+@@ -178,6 +185,11 @@
+ 
+ HostCaBundleResolution ResolveHostCaBundle() {
+   const char* override_path = std::getenv(kCaBundleOverride);
++  if (override_path == nullptr) {
++    // Standard OpenSSL/curl variable: lets any distro (or container)
++    // point at its bundle without Mocktail-specific config.
++    override_path = std::getenv(kSystemCaBundleEnv);
++  }
+   if (override_path != nullptr) {
+     HostCaBundleResolution resolution;
+     resolution.from_override = true;
