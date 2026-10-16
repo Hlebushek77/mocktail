@@ -15,6 +15,7 @@
 #include "launcher_ui/bindings.h"
 #include "launcher_ui/i18n.h"
 #include "launcher_ui/launcher_context.h"
+#include "launcher_ui/page_widgets.h"
 #include "launcher_ui/pages.h"
 
 #ifndef MOCKTAIL_CHANGELOG_PATH
@@ -83,13 +84,12 @@ std::vector<ChangelogEntry> LoadChangelog(std::string* error) {
     if (error != nullptr) *error = _("changelog.json cannot be read");
     return entries;
   }
-  nlohmann::json document;
-  try {
-    document = nlohmann::json::parse(file);
-  } catch (const std::exception& e) {
-    if (error != nullptr) {
-      *error = Format(_("changelog.json is not valid JSON: %s"), e.what());
-    }
+  // No exceptions in this codebase (-fno-exceptions): parse with
+  // exceptions disabled and detect the discarded result instead.
+  nlohmann::json document =
+      nlohmann::json::parse(file, nullptr, /*allow_exceptions=*/false);
+  if (document.is_discarded()) {
+    if (error != nullptr) *error = _("changelog.json is not valid JSON");
     return entries;
   }
   if (!document.is_array()) {
