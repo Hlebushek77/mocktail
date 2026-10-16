@@ -687,6 +687,7 @@ if(MOCKTAIL_BUILD_LAUNCHER_UI)
     src/launcher_ui/audio_page.cc
     src/launcher_ui/audio_page_devices.cc
     src/launcher_ui/bindings.cc
+    src/launcher_ui/changelog_page.cc
     src/launcher_ui/display_page.cc
     src/launcher_ui/graphics_page.cc
     src/launcher_ui/i18n.cc
@@ -708,6 +709,7 @@ if(MOCKTAIL_BUILD_LAUNCHER_UI)
     "MOCKTAIL_LAUNCHER_LINGUAS=\"${MOCKTAIL_LINGUAS_STRING}\""
     "MOCKTAIL_PROJECT_VERSION=\"${PROJECT_VERSION}\""
     "MOCKTAIL_BUILD_GIT_COMMIT=\"${MOCKTAIL_BUILD_GIT_COMMIT}\""
+    "MOCKTAIL_CHANGELOG_PATH=\"${CMAKE_SOURCE_DIR}/config/changelog.json\""
   )
   target_link_libraries(mocktail_launcher_ui PRIVATE
     mocktail_launcher_ui_model
@@ -1002,6 +1004,7 @@ install(FILES
     config/roblox_bootstrap_sources.json
     config/roblox_host_abi_reference.json
     config/roblox_signing_certificates.json
+    config/changelog.json
   DESTINATION "${MOCKTAIL_INSTALL_DATA_DIR}/metadata"
 )
 install(FILES packaging/space.bigrat.mocktail.desktop

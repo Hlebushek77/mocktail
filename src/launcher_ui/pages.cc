@@ -28,6 +28,8 @@ const std::array<SectionInfo, kSectionCount>& Sections() {
        "network-transmit-receive-symbolic", 1, BuildNetworkUpdatesPage},
       {Section::kAdvanced, "advanced", N_("Advanced"),
        "preferences-other-symbolic", 1, BuildAdvancedPage},
+      {Section::kChangelog, "changelog", N_("Changelog"),
+       "x-office-address-book-symbolic", 1, BuildChangelogPage},
       {Section::kAbout, "about", N_("About"), "help-about-symbolic", 2,
        BuildAboutPage},
   }};

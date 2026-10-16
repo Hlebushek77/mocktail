@@ -1,4 +1,6 @@
 #include <clocale>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -427,6 +429,59 @@ GtkWidget* BuildLogsRow(LauncherContext* context) {
   return DecorateRow(context, row, std::move(spec));
 }
 
+// P1: what the last start died of, in plain sight. Reads latest.log
+// (points at the newest session log) and shows the last FATAL/crash
+// line, if any. Computed when the page builds (every launcher start).
+std::string LastFatalLine(LauncherContext* context) {
+  std::error_code error;
+  const std::filesystem::path latest =
+      context->paths().logs_root() / "latest.log";
+  std::ifstream log(latest);
+  if (!log) return {};
+  std::string line, last;
+  while (std::getline(log, line)) {
+    if (line.find("[FATAL]") != std::string::npos ||
+        line.find("Segmentation fault") != std::string::npos ||
+        line.find("SIGSEGV") != std::string::npos ||
+        line.find("Aborted") != std::string::npos) {
+      last = line;
+    }
+  }
+  if (last.size() > 220) last.resize(220);
+  // Strip leading whitespace/timestamps noise is left as-is: the raw
+  // line is what grep finds in the log.
+  return last;
+}
+
+GtkWidget* BuildCrashRow(LauncherContext* context) {
+  const std::string fatal = LastFatalLine(context);
+  GtkWidget* row = NewActionRow(
+      fatal.empty() ? "emblem-ok-symbolic" : "dialog-error-symbolic",
+      [context] {
+        std::error_code error;
+        std::filesystem::create_directories(context->paths().logs_root(),
+                                            error);
+        context->OpenPath(context->paths().logs_root());
+      });
+  RowSpec spec;
+  if (fatal.empty()) {
+    spec.title = _("Last start finished cleanly");
+    spec.keywords = {"crash", "fatal", "падение", "ошибка", "краш"};
+    spec.hint.subtitle = _("No errors in the latest log");
+    spec.hint.details =
+        _("Open the row to browse the logs folder anyway.");
+  } else {
+    spec.title = _("Last start failed");
+    spec.keywords = {"crash", "fatal", "падение", "ошибка", "краш"};
+    spec.hint.subtitle = fatal;
+    spec.hint.details =
+        _("This line comes from the newest session log. Open the row for "
+          "the logs folder, or copy it into a bug report together with "
+          "the diagnostic info above.");
+  }
+  return DecorateRow(context, row, std::move(spec));
+}
+
 }  // namespace
 
 void OpenAboutDialog(LauncherContext* context) {
@@ -485,6 +540,7 @@ GtkWidget* BuildAboutPage(LauncherContext* context) {
   GtkWidget* diagnostics =
       AddGroup(page, _("Diagnostics"),
                _("For reporting a problem to Mocktail's authors"));
+  AddRow(diagnostics, BuildCrashRow(context));
   AddRow(diagnostics, BuildCopyRow(context));
   AddRow(diagnostics, BuildLogsRow(context));
   return page;

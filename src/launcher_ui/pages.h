@@ -24,10 +24,11 @@ enum class Section {
   kIntegrations,
   kNetworkUpdates,
   kAdvanced,
+  kChangelog,
   kAbout,
 };
 
-inline constexpr std::size_t kSectionCount = 9;
+inline constexpr std::size_t kSectionCount = 10;
 
 struct SectionInfo {
   Section section;
@@ -56,6 +57,7 @@ GtkWidget* BuildIntegrationsPage(LauncherContext* context);
 GtkWidget* BuildNetworkUpdatesPage(LauncherContext* context);
 GtkWidget* BuildAdvancedPage(LauncherContext* context);
 GtkWidget* BuildAboutPage(LauncherContext* context);
+GtkWidget* BuildChangelogPage(LauncherContext* context);
 
 // The account chip at the left of the launch bar (accounts_page.cc): a
 // GtkMenuButton with the selected account's avatar and names and a popover
