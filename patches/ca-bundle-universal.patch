@@ -1,5 +1,5 @@
---- /tmp/opencode/plus_libc_shim.orig	2026-10-16 04:17:56.603032080 +0200
-+++ /tmp/opencode/plus_libc_shim.cc	2026-10-16 04:15:07.461886409 +0200
+--- a/src/libc_shim/libc_shim.cc
++++ b/src/libc_shim/libc_shim.cc
 @@ -26,10 +26,17 @@
  std::atomic<GuestAllocator> g_guest_allocator{nullptr};
  
