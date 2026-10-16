@@ -4,6 +4,7 @@
 // Usage: mocktail_launch_monitor <sessions-dir>
 #include <adwaita.h>
 #include <gio/gio.h>
+#include <gio/gstdio.h>
 
 #include <cstdio>
 #include <cstring>
@@ -162,7 +163,7 @@ struct MonitorState {
 
 void PollSessions(gpointer data);
 
-void OnDirChanged(GFileMonitor*, GFile*, GFile*, GFileMonitorEventType,
+void OnDirChanged(GFileMonitor*, GFile*, GFile*, GFileMonitorEvent,
                   gpointer data) {
   PollSessions(data);
 }
