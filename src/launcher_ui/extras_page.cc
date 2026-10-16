@@ -217,12 +217,13 @@ GtkWidget* BuildTabsGroup(GtkWidget* page, LauncherContext* context) {
     adw_action_row_add_suffix(ADW_ACTION_ROW(line), box);
     RowSpec spec;
     spec.keywords = {"tabs", "sidebar", "вкладки", "порядок", "скрыть"};
-    g_signal_connect(up, "clicked", G_CALLBACK(OnTabUp),
-                     new TabCtl{context, row});
-    g_signal_connect(down, "clicked", G_CALLBACK(OnTabDown),
-                     new TabCtl{context, row});
+    auto* up_ctl = new TabCtl{context, row};
+    auto* down_ctl = new TabCtl{context, row};
+    auto* hide_ctl = new HideCtl{context, info.id};
+    g_signal_connect(up, "clicked", G_CALLBACK(OnTabUp), up_ctl);
+    g_signal_connect(down, "clicked", G_CALLBACK(OnTabDown), down_ctl);
     g_signal_connect(toggle, "notify::active", G_CALLBACK(OnTabToggled),
-                     new HideCtl{context, info.id});
+                     hide_ctl);
     AddRow(group, DecorateRow(context, line, std::move(spec)));
   }
   return group;
