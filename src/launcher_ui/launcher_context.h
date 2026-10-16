@@ -292,6 +292,9 @@ class LauncherContext {
   // A change the draft refused, named by its row's title.
   void ToastRefusedChange(std::string_view key, const std::string& error);
   void ShowCloseDialog();
+  // P1: "Starting Roblox…" dialog with the previous session tail.
+  // Returns the dialog (owned by the window) or nullptr without one.
+  GtkWidget* ShowLaunchDialog();
   bool SaveInternal(bool quiet);
   void Finish(runtime::LauncherUiResult outcome);
   static void OnMachineDetected(GObject* source, GAsyncResult* result,
