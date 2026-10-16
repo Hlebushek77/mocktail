@@ -628,8 +628,10 @@ void LauncherContext::Play() {
         const char* argv[] = {monitor.c_str(), sessions.c_str(), nullptr};
         GError* error = nullptr;
         if (!g_spawn_async(nullptr, const_cast<char**>(argv), nullptr,
-                           G_SPAWN_SEARCH_PATH | G_SPAWN_STDOUT_TO_DEV_NULL |
-                               G_SPAWN_STDERR_TO_DEV_NULL,
+                           static_cast<GSpawnFlags>(
+                               G_SPAWN_SEARCH_PATH |
+                               G_SPAWN_STDOUT_TO_DEV_NULL |
+                               G_SPAWN_STDERR_TO_DEV_NULL),
                            nullptr, nullptr, nullptr, &error)) {
           if (error != nullptr) g_error_free(error);
         }
