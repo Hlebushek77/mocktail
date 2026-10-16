@@ -4,7 +4,7 @@
 // Usage: mocktail_launch_monitor <sessions-dir>
 #include <adwaita.h>
 #include <gio/gio.h>
-#include <gio/gstdio.h>
+#include <glib/gstdio.h>
 
 #include <cstdio>
 #include <cstring>
