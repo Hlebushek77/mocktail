@@ -2,6 +2,8 @@
 
 #include <adwaita.h>
 
+#include "launcher_ui/ui_prefs.h"
+
 namespace mocktail::launcher_ui {
 namespace {
 
@@ -78,8 +80,9 @@ popover.hint-popover > contents {
 }  // namespace
 
 void ApplyLauncherStyle() {
-  AdwStyleManager* style = adw_style_manager_get_default();
-  adw_style_manager_set_color_scheme(style, ADW_COLOR_SCHEME_FORCE_DARK);
+  // P1 Extras: theme + accent come from launcher.json (was: forced dark).
+  ApplyUiTheme();
+  ApplyUiAccent();
   GtkCssProvider* provider = gtk_css_provider_new();
   gtk_css_provider_load_from_string(provider, kStyle);
   gtk_style_context_add_provider_for_display(

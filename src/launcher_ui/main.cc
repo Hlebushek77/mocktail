@@ -21,6 +21,7 @@
 #include "launcher_ui/launcher_context.h"
 #include "launcher_ui/selftest.h"
 #include "launcher_ui/style.h"
+#include "launcher_ui/ui_prefs.h"
 #include "launcher_ui/window.h"
 #include "runtime/launcher_ui_launch.h"
 
@@ -180,6 +181,15 @@ int main(int argc, char** argv) {
     }
   }
   mocktail::launcher_ui::InitTranslations(argv[0]);
+  // P1 Extras: interface language from launcher.json (needs to be set
+  // before any translated string is resolved; takes effect on restart).
+  {
+    const std::string language =
+        mocktail::launcher_ui::LoadUiPrefs().language;
+    if (!language.empty()) {
+      setenv("LANGUAGE", language.c_str(), 1);
+    }
+  }
   // Settle the theme before libadwaita starts (KDE sets this and libadwaita
   // warns about it, as in the failure dialog).
   if (!gtk_init_check()) {

@@ -689,6 +689,7 @@ if(MOCKTAIL_BUILD_LAUNCHER_UI)
     src/launcher_ui/bindings.cc
     src/launcher_ui/changelog_page.cc
     src/launcher_ui/display_page.cc
+    src/launcher_ui/extras_page.cc
     src/launcher_ui/graphics_page.cc
     src/launcher_ui/i18n.cc
     src/launcher_ui/integrations_page.cc
@@ -700,6 +701,7 @@ if(MOCKTAIL_BUILD_LAUNCHER_UI)
     src/launcher_ui/roblox_decides.cc
     src/launcher_ui/selftest.cc
     src/launcher_ui/style.cc
+    src/launcher_ui/ui_prefs.cc
     src/launcher_ui/window.cc
   )
   target_include_directories(mocktail_launcher_ui PRIVATE include src)

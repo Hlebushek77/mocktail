@@ -120,7 +120,8 @@ GtkWidget* LauncherWindow::BuildSidebar() {
                                   adw_sidebar_section_new()};
   guint index = 0;
   for (int group = 0; group < 3; ++group) {
-    for (const SectionInfo& info : Sections()) {
+    for (Section section : VisibleSectionsOrdered()) {
+      const SectionInfo& info = GetSectionInfo(section);
       if (info.sidebar_group != group) continue;
       sidebar_titles_.emplace_back(_(info.title));
       AdwSidebarItem* item = adw_sidebar_item_new(_(info.title));
@@ -236,7 +237,8 @@ void LauncherWindow::FitSidebarWidth() {
 void LauncherWindow::OnSidebarActivated(AdwSidebar*, guint index,
                                         gpointer data) {
   auto* self = static_cast<LauncherWindow*>(data);
-  for (const SectionInfo& info : Sections()) {
+  for (Section section : VisibleSectionsOrdered()) {
+    const SectionInfo& info = GetSectionInfo(section);
     if (self->sidebar_index_[static_cast<std::size_t>(info.section)] == index) {
       if (self->searching_) {
         gtk_search_bar_set_search_mode(GTK_SEARCH_BAR(self->search_bar_),
@@ -255,7 +257,8 @@ void LauncherWindow::OnSidebarActivated(AdwSidebar*, guint index,
 
 GtkWidget* LauncherWindow::BuildContent() {
   stack_ = adw_view_stack_new();
-  for (const SectionInfo& info : Sections()) {
+  for (Section section : VisibleSectionsOrdered()) {
+    const SectionInfo& info = GetSectionInfo(section);
     context_->BeginSection(info.section);
     GtkWidget* page = info.build(context_);
     pages_[static_cast<std::size_t>(info.section)] = page;

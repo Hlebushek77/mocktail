@@ -3,6 +3,7 @@
 #include <cstring>
 
 #include "launcher_ui/i18n.h"
+#include "launcher_ui/ui_prefs.h"
 
 namespace mocktail::launcher_ui {
 
@@ -30,6 +31,8 @@ const std::array<SectionInfo, kSectionCount>& Sections() {
        "preferences-other-symbolic", 1, BuildAdvancedPage},
       {Section::kChangelog, "changelog", N_("Changelog"),
        "accessories-dictionary-symbolic", 1, BuildChangelogPage},
+      {Section::kExtras, "extras", N_("Extras"),
+       "emblem-system-symbolic", 1, BuildExtrasPage},
       {Section::kAbout, "about", N_("About"), "help-about-symbolic", 2,
        BuildAboutPage},
   }};
@@ -46,6 +49,40 @@ const SectionInfo* FindSection(const char* id) {
     if (std::strcmp(info.id, id) == 0) return &info;
   }
   return nullptr;
+}
+
+std::vector<Section> VisibleSectionsOrdered() {
+  const UiPrefs prefs = LoadUiPrefs();
+  std::vector<Section> ordered;
+  std::vector<bool> used(Sections().size(), false);
+  auto find = [&](const std::string& id) -> const SectionInfo* {
+    for (std::size_t i = 0; i < Sections().size(); ++i) {
+      if (!used[i] && Sections()[i].id == id) {
+        used[i] = true;
+        return &Sections()[i];
+      }
+    }
+    return nullptr;
+  };
+  auto hidden = [&](const char* id) {
+    if (std::string(id) == "extras") return false;
+    for (const std::string& h : prefs.hidden_tabs) {
+      if (h == id) return true;
+    }
+    return false;
+  };
+  for (const std::string& id : prefs.tab_order) {
+    if (const SectionInfo* info = find(id)) {
+      if (!hidden(info->id)) ordered.push_back(info->section);
+    }
+  }
+  for (std::size_t i = 0; i < Sections().size(); ++i) {
+    if (!used[i] && !hidden(Sections()[i].id)) {
+      used[i] = true;
+      ordered.push_back(Sections()[i].section);
+    }
+  }
+  return ordered;
 }
 
 }  // namespace mocktail::launcher_ui

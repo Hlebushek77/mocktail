@@ -3729,3 +3729,75 @@ msgstr "Последний запуск упал"
 
 msgid "This line comes from the newest session log. Open the row for the logs folder, or copy it into a bug report together with the diagnostic info above."
 msgstr "Эта строка — из новейшего session-лога. Откройте строку, чтобы попасть в папку логов, или скопируйте её в баг-репорт вместе с диагностикой выше."
+
+msgid "Extras"
+msgstr "Дополнительно"
+
+msgid "Look, language and sidebar"
+msgstr "Внешний вид, язык и боковая панель"
+
+msgid "Look"
+msgstr "Внешний вид"
+
+msgid "Theme and accent, applied immediately"
+msgstr "Тема и акцент, применяются сразу"
+
+msgid "Accent color"
+msgstr "Акцентный цвет"
+
+msgid "Default"
+msgstr "По умолчанию"
+
+msgid "Blue"
+msgstr "Синий"
+
+msgid "Green"
+msgstr "Зелёный"
+
+msgid "Orange"
+msgstr "Оранжевый"
+
+msgid "Purple"
+msgstr "Фиолетовый"
+
+msgid "Red"
+msgstr "Красный"
+
+msgid "Applies immediately"
+msgstr "Применяется сразу"
+
+msgid "Language"
+msgstr "Язык"
+
+msgid "System language"
+msgstr "Язык системы"
+
+msgid "English"
+msgstr "Английский"
+
+msgid "Interface language"
+msgstr "Язык интерфейса"
+
+msgid "Applies on restart"
+msgstr "Применится после перезапуска"
+
+msgid "Restart the launcher to apply the language"
+msgstr "Перезапустите лаунчер, чтобы применить язык"
+
+msgid "Sidebar tabs"
+msgstr "Вкладки боковой панели"
+
+msgid "Show, hide and reorder sections. Applies on restart."
+msgstr "Показ, скрытие и порядок разделов. Применяется после перезапуска."
+
+msgid "Move up"
+msgstr "Выше"
+
+msgid "Move down"
+msgstr "Ниже"
+
+msgid "Show in sidebar"
+msgstr "Показывать в панели"
+
+msgid "Tab order saved, applies on restart"
+msgstr "Порядок вкладок сохранён, применится после перезапуска"

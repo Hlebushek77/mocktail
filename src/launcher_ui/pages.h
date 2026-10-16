@@ -4,6 +4,7 @@
 #include <gtk/gtk.h>
 
 #include <array>
+#include <vector>
 
 // The sections of the settings window and the function that builds each
 // page. Every page lives in its own file (graphics_page.cc, ...); the
@@ -25,10 +26,11 @@ enum class Section {
   kNetworkUpdates,
   kAdvanced,
   kChangelog,
+  kExtras,
   kAbout,
 };
 
-inline constexpr std::size_t kSectionCount = 10;
+inline constexpr std::size_t kSectionCount = 11;
 
 struct SectionInfo {
   Section section;
@@ -47,6 +49,9 @@ const std::array<SectionInfo, kSectionCount>& Sections();
 const SectionInfo& GetSectionInfo(Section section);
 // nullptr for an unknown id.
 const SectionInfo* FindSection(const char* id);
+// Sidebar/pages order + visibility from Extras prefs (Extras itself and
+// unknown ids always stay). Falls back to canonical order.
+std::vector<Section> VisibleSectionsOrdered();
 
 GtkWidget* BuildGraphicsPage(LauncherContext* context);
 GtkWidget* BuildDisplayPage(LauncherContext* context);
@@ -58,6 +63,7 @@ GtkWidget* BuildNetworkUpdatesPage(LauncherContext* context);
 GtkWidget* BuildAdvancedPage(LauncherContext* context);
 GtkWidget* BuildAboutPage(LauncherContext* context);
 GtkWidget* BuildChangelogPage(LauncherContext* context);
+GtkWidget* BuildExtrasPage(LauncherContext* context);
 
 // The account chip at the left of the launch bar (accounts_page.cc): a
 // GtkMenuButton with the selected account's avatar and names and a popover
