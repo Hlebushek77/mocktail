@@ -171,7 +171,7 @@ GtkWidget* BuildChangelogPage(LauncherContext* context) {
         page, _("Changelog"),
         error.empty() ? _("Nothing here yet") : error.c_str());
     GtkWidget* row =
-        NewActionRow("book-symbolic", [] {});
+        NewActionRow("accessories-dictionary-symbolic", [] {});
     RowSpec spec;
     spec.title = _("No release notes found");
     spec.keywords = {"changelog", "changes", "новости", "изменения",

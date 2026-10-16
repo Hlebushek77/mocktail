@@ -35,6 +35,7 @@ readonly -a PROJECT_ARTIFACTS=(
   mocktail_updater
   mocktail_failure_dialog
   mocktail_launcher_ui
+  mocktail_launch_monitor
   mocktail_webview_helper
   libmocktail_audio_sdl.so
   libc.so
