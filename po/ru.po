@@ -3687,3 +3687,45 @@ msgstr "• Как в Roblox (по умолчанию): Mocktail не задаё
 
 msgid "• Throughput (default): Roblox's worker pools may use every physical core, and Mocktail's performance preset is on; among other things it sets a 128 MB texture budget and turns anti-aliasing (MSAA) off."
 msgstr "• Пропускная способность (по умолчанию): рабочие потоки Roblox могут занять все физические ядра, и включён пресет производительности Mocktail; среди прочего он задаёт бюджет текстур 128 МБ и выключает сглаживание (MSAA)."
+
+msgid "Changelog"
+msgstr "Журнал изменений"
+
+msgid "What changed in Mocktail"
+msgstr "Что изменилось в Mocktail"
+
+msgid "Release notes"
+msgstr "Заметки о выпуске"
+
+msgid "changelog.json was not found"
+msgstr "changelog.json не найден"
+
+msgid "changelog.json cannot be read"
+msgstr "changelog.json не читается"
+
+msgid "changelog.json is not valid JSON"
+msgstr "changelog.json — невалидный JSON"
+
+msgid "changelog.json must hold an array"
+msgstr "changelog.json должен содержать массив"
+
+msgid "No release notes found"
+msgstr "Заметки о выпуске не найдены"
+
+msgid "Ask the maintainer to ship a changelog.json with the build"
+msgstr "Попросите мейнтейнера приложить changelog.json к сборке"
+
+msgid "Last start finished cleanly"
+msgstr "Последний запуск завершился чисто"
+
+msgid "No errors in the latest log"
+msgstr "В последнем логе ошибок нет"
+
+msgid "Open the row to browse the logs folder anyway."
+msgstr "Всё равно откройте строку для перехода к папке логов."
+
+msgid "Last start failed"
+msgstr "Последний запуск упал"
+
+msgid "This line comes from the newest session log. Open the row for the logs folder, or copy it into a bug report together with the diagnostic info above."
+msgstr "Эта строка — из новейшего session-лога. Откройте строку, чтобы попасть в папку логов, или скопируйте её в баг-репорт вместе с диагностикой выше."

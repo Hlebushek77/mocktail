@@ -733,6 +733,18 @@ if(MOCKTAIL_BUILD_LAUNCHER_UI)
   target_link_libraries(mocktail_launcher_ui PRIVATE
     mocktail_launcher_ui_page_rules
   )
+  # P1: detached launch monitor (own window + progress + Logs). Spawned by
+  # the launcher on Play, outlives it, tails the game session log.
+  add_executable(mocktail_launch_monitor
+    src/launcher_ui/launch_monitor.cc
+  )
+  target_link_libraries(mocktail_launch_monitor PRIVATE
+    PkgConfig::MOCKTAIL_LAUNCHER_ADWAITA
+  )
+  mocktail_apply_compile_options(mocktail_launch_monitor)
+  install(TARGETS mocktail_launch_monitor
+    RUNTIME DESTINATION "${MOCKTAIL_INSTALL_RUNTIME_DIR}"
+  )
   # The Discord application the runtime falls back to (its default for
   # integrations.discord_rpc.application_id), shown on the Integrations page.
   target_compile_definitions(mocktail_launcher_ui PRIVATE

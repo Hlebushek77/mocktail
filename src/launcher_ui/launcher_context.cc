@@ -604,18 +604,36 @@ void LauncherContext::Play() {
   if (unsaved_count() > 0 && !SaveInternal(true)) {
     return;
   }
-  // P1: "Starting…" dialog with the previous session tail stays up while
-  // the play hooks run; it dies with the window on Finish.
-  GtkWidget* launch_dialog = ShowLaunchDialog();
   for (const auto& hook : play_hooks_) {
     std::string error;
     if (!hook(&error)) {
-      if (launch_dialog != nullptr) {
-        adw_dialog_close(ADW_DIALOG(launch_dialog));
-      }
       Toast(error.empty() ? std::string(_("Roblox could not be started"))
                           : error);
       return;
+    }
+  }
+  // P1: detached launch monitor (own window + icon + progress + Logs).
+  // It outlives this window (instance lock is released on Finish), so
+  // the startup stays visible while the game boots.
+  {
+    char exe[4096] = {};
+    ssize_t len = ::readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (len > 0) {
+      std::string monitor(exe, static_cast<size_t>(len));
+      const size_t slash = monitor.find_last_of('/');
+      if (slash != std::string::npos) {
+        monitor = monitor.substr(0, slash + 1) + "mocktail_launch_monitor";
+        const std::string sessions =
+            (paths().logs_root() / "sessions").string();
+        const char* argv[] = {monitor.c_str(), sessions.c_str(), nullptr};
+        GError* error = nullptr;
+        if (!g_spawn_async(nullptr, const_cast<char**>(argv), nullptr,
+                           G_SPAWN_SEARCH_PATH | G_SPAWN_STDOUT_TO_DEV_NULL |
+                               G_SPAWN_STDERR_TO_DEV_NULL,
+                           nullptr, nullptr, nullptr, &error)) {
+          if (error != nullptr) g_error_free(error);
+        }
+      }
     }
   }
   Finish(ignore_environment_
@@ -627,51 +645,6 @@ void LauncherContext::Play() {
 // log (GTK theme noise skipped). Shown during the play hooks; the game
 // itself starts after this window closes (instance lock), so a live game
 // log needs the phase-2 monitor — this dialog covers the launch phase.
-GtkWidget* LauncherContext::ShowLaunchDialog() {
-  if (window() == nullptr) return nullptr;
-  std::vector<std::string> tail;
-  {
-    std::ifstream log(paths().logs_root() / "latest.log");
-    std::string line;
-    while (std::getline(log, line)) {
-      if (line.find("Gtk-WARNING") != std::string::npos) continue;
-      tail.push_back(line);
-      if (tail.size() > 30) tail.erase(tail.begin());
-    }
-  }
-  AdwDialog* dialog = adw_alert_dialog_new(
-      _("Starting Roblox…"),
-      _("Preparing the launch; the game window opens next."));
-  AdwAlertDialog* alert = ADW_ALERT_DIALOG(dialog);
-  GtkWidget* box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
-  GtkWidget* top = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-  GtkWidget* spinner = gtk_spinner_new();
-  gtk_spinner_start(GTK_SPINNER(spinner));
-  gtk_box_append(GTK_BOX(top), spinner);
-  GtkWidget* status = gtk_label_new(_("Checking accounts and settings…"));
-  gtk_label_set_xalign(GTK_LABEL(status), 0.0);
-  gtk_box_append(GTK_BOX(top), status);
-  gtk_box_append(GTK_BOX(box), top);
-  GtkWidget* scrolled = gtk_scrolled_window_new();
-  gtk_scrolled_window_set_min_content_height(GTK_SCROLLED_WINDOW(scrolled),
-                                             180);
-  gtk_widget_set_vexpand(scrolled, TRUE);
-  GtkWidget* view = gtk_text_view_new();
-  gtk_text_view_set_editable(GTK_TEXT_VIEW(view), FALSE);
-  gtk_text_view_set_cursor_visible(GTK_TEXT_VIEW(view), FALSE);
-  gtk_text_view_set_monospace(GTK_TEXT_VIEW(view), TRUE);
-  GtkTextBuffer* buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(view));
-  for (const std::string& entry : tail) {
-    gtk_text_buffer_insert_at_cursor(buffer, entry.c_str(), -1);
-    gtk_text_buffer_insert_at_cursor(buffer, "\n", -1);
-  }
-  gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scrolled), view);
-  gtk_box_append(GTK_BOX(box), scrolled);
-  adw_alert_dialog_set_extra_child(alert, box);
-  adw_dialog_present(dialog, GTK_WIDGET(window()));
-  return GTK_WIDGET(dialog);
-}
-
 void LauncherContext::Finish(runtime::LauncherUiResult outcome) {
   outcome_ = outcome;
   closing_ = true;
